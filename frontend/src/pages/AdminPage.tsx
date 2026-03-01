@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import type { ProviderInfo, SettingsResponse } from '../api/types';
 import { api } from '../api/client';
+import { ConfirmModal } from '../components/ConfirmModal';
 
 interface AdminPageProps {
   showToast: (message: string, type: 'success' | 'error') => void;
@@ -170,6 +171,8 @@ function ProviderCard({
 export function AdminPage({ showToast }: AdminPageProps) {
   const [settings, setSettings] = useState<SettingsResponse | null>(null);
   const [isLoading, setIsLoading] = useState(true);
+  const [showReindexModal, setShowReindexModal] = useState(false);
+  const [isReindexing, setIsReindexing] = useState(false);
 
   useEffect(() => {
     loadSettings();
@@ -240,6 +243,19 @@ export function AdminPage({ showToast }: AdminPageProps) {
     }
   };
 
+  const handleReindex = async () => {
+    setIsReindexing(true);
+    try {
+      const result = await api.reindex();
+      setShowReindexModal(false);
+      showToast(`Reindex complete: ${result.indexed} documents indexed`, 'success');
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : 'Reindex failed', 'error');
+    } finally {
+      setIsReindexing(false);
+    }
+  };
+
   return (
     <div className="max-w-4xl mx-auto p-6">
       <h2 className="text-xl font-semibold text-gray-200 mb-6">Settings</h2>
@@ -261,9 +277,38 @@ export function AdminPage({ showToast }: AdminPageProps) {
               onSetEmbedding={handleSetEmbedding}
             />
           ))}
+
+          {/* Maintenance */}
+          <div className="bg-card border border-border rounded-lg p-6 mt-4">
+            <h3 className="text-lg font-semibold text-gray-200 mb-2">Maintenance</h3>
+            <p className="text-sm text-muted mb-4">
+              Rebuild the vector search index from stored documents. Use this after
+              changing the embedding provider or if search results seem incorrect.
+            </p>
+            <button
+              className="px-4 py-2 bg-primary text-white rounded-lg hover:bg-primary-hover transition-colors"
+              onClick={() => setShowReindexModal(true)}
+            >
+              Reindex All Documents
+            </button>
+          </div>
         </div>
       ) : (
         <div className="text-center text-muted py-8">Failed to load settings</div>
+      )}
+
+      {showReindexModal && (
+        <ConfirmModal
+          title="Reindex All Documents"
+          description={
+            'All stored documents will be re-embedded and re-indexed into the vector database.\n\n' +
+            'This may take a while depending on the number of documents and will consume embedding API credits.'
+          }
+          confirmLabel="Reindex"
+          isLoading={isReindexing}
+          onConfirm={handleReindex}
+          onCancel={() => !isReindexing && setShowReindexModal(false)}
+        />
       )}
     </div>
   );

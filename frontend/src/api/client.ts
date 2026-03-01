@@ -104,4 +104,10 @@ export const api = {
     request<{ valid: boolean; message?: string }>(`/api/settings/models/${provider}/test`, {
       method: 'POST',
     }),
+
+  // Reindex
+  reindex: () =>
+    request<{ indexed: number }>('/api/reindex', {
+      method: 'POST',
+    }),
 };
