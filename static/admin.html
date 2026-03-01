@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Maia - Admin</title>
+    <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+    <nav class="navbar">
+        <div class="nav-brand">Maia</div>
+        <div class="nav-links">
+            <a href="/">Add</a>
+            <a href="/search.html">Search</a>
+            <a href="/browse.html">Browse</a>
+            <a href="/admin.html" class="active">Admin</a>
+        </div>
+    </nav>
+
+    <main class="container">
+        <h1>Settings</h1>
+        <p class="subtitle">Configure AI providers and API keys.</p>
+
+        <section class="settings-section">
+            <h2>AI Providers</h2>
+            <div id="providers" class="providers-grid">
+                <p class="empty-state">Loading...</p>
+            </div>
+        </section>
+
+        <section class="settings-section">
+            <h2>Model Selection</h2>
+            <div class="model-selection">
+                <div class="model-select-item">
+                    <label for="parsingProvider">Parsing (Summary/Tags)</label>
+                    <select id="parsingProvider" disabled>
+                        <option value="">Select provider...</option>
+                    </select>
+                </div>
+                <div class="model-select-item">
+                    <label for="embeddingProvider">Embedding (Search)</label>
+                    <select id="embeddingProvider" disabled>
+                        <option value="">Select provider...</option>
+                    </select>
+                </div>
+            </div>
+            <button id="saveModelBtn" class="save-btn" disabled>Save Model Settings</button>
+        </section>
+
+        <div id="toast" class="toast" style="display:none;"></div>
+    </main>
+
+    <script src="/app.js"></script>
+    <script>
+        const providersContainer = document.getElementById('providers');
+        const parsingSelect = document.getElementById('parsingProvider');
+        const embeddingSelect = document.getElementById('embeddingProvider');
+        const saveModelBtn = document.getElementById('saveModelBtn');
+        const toast = document.getElementById('toast');
+
+        function showToast(message, isError = false) {
+            toast.textContent = message;
+            toast.className = 'toast' + (isError ? ' error' : ' success');
+            toast.style.display = 'block';
+            setTimeout(() => { toast.style.display = 'none'; }, 3000);
+        }
+
+        async function loadSettings() {
+            try {
+                const response = await fetch('/api/settings');
+                const data = await response.json();
+                renderProviders(data.providers);
+                renderModelSelects(data);
+            } catch (err) {
+                providersContainer.innerHTML = '<p class="empty-state">Failed to load settings</p>';
+            }
+        }
+
+        function renderProviders(providers) {
+            providersContainer.innerHTML = providers.map(p => `
+                <div class="provider-card" data-provider="${p.provider}">
+                    <div class="provider-header">
+                        <h3>${p.provider.charAt(0).toUpperCase() + p.provider.slice(1)}</h3>
+                        <span class="provider-status ${p.has_api_key ? 'active' : 'inactive'}">
+                            ${p.has_api_key ? 'Configured' : 'Not Set'}
+                        </span>
+                    </div>
+                    ${p.has_api_key ? `<p class="api-key-preview">Key: ${p.api_key_preview}</p>` : ''}
+                    <div class="provider-actions">
+                        <input type="password" placeholder="Enter API Key" class="api-key-input" id="key-${p.provider}">
+                        <button onclick="setApiKey('${p.provider}')" class="btn-small">Set Key</button>
+                        ${p.has_api_key ? `
+                            <button onclick="testApiKey('${p.provider}')" class="btn-small btn-test">Test</button>
+                            <button onclick="deleteApiKey('${p.provider}')" class="btn-small btn-danger">Remove</button>
+                        ` : ''}
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        function renderModelSelects(data) {
+            [parsingSelect, embeddingSelect].forEach(select => {
+                select.innerHTML = '<option value="">Not configured</option>' +
+                    data.providers.map(p => {
+                        const label = p.provider.charAt(0).toUpperCase() + p.provider.slice(1);
+                        const disabled = p.has_api_key ? '' : 'disabled';
+                        const suffix = p.has_api_key ? '' : ' (no key)';
+                        return `<option value="${p.provider}" ${disabled}>${label}${suffix}</option>`;
+                    }).join('');
+                select.disabled = false;
+            });
+
+            parsingSelect.value = data.parsing_provider || '';
+            embeddingSelect.value = data.embedding_provider || '';
+            saveModelBtn.disabled = false;
+        }
+
+        async function setApiKey(provider) {
+            const input = document.getElementById(`key-${provider}`);
+            const apiKey = input.value.trim();
+            if (!apiKey) {
+                showToast('Please enter an API key', true);
+                return;
+            }
+
+            try {
+                const response = await fetch(`/api/settings/models/${provider}/key`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ api_key: apiKey })
+                });
+
+                if (!response.ok) throw new Error('Failed to set API key');
+
+                input.value = '';
+                showToast(`${provider} API key saved`);
+                loadSettings();
+            } catch (err) {
+                showToast(err.message, true);
+            }
+        }
+
+        async function deleteApiKey(provider) {
+            if (!confirm(`Remove ${provider} API key?`)) return;
+
+            try {
+                const response = await fetch(`/api/settings/models/${provider}/key`, {
+                    method: 'DELETE'
+                });
+
+                if (!response.ok) throw new Error('Failed to remove API key');
+
+                showToast(`${provider} API key removed`);
+                loadSettings();
+            } catch (err) {
+                showToast(err.message, true);
+            }
+        }
+
+        async function testApiKey(provider) {
+            try {
+                const response = await fetch(`/api/settings/models/${provider}/test`, {
+                    method: 'POST'
+                });
+                const data = await response.json();
+
+                if (data.valid) {
+                    showToast(`${provider} API key is valid`);
+                } else {
+                    showToast(`${provider}: ${data.message}`, true);
+                }
+            } catch (err) {
+                showToast(err.message, true);
+            }
+        }
+
+        saveModelBtn.addEventListener('click', async () => {
+            const parsing = parsingSelect.value;
+            const embedding = embeddingSelect.value;
+
+            try {
+                const body = {};
+                if (parsing) body.parsing_provider = parsing;
+                if (embedding) body.embedding_provider = embedding;
+
+                const response = await fetch('/api/settings', {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body)
+                });
+
+                if (!response.ok) {
+                    const text = await response.text();
+                    throw new Error(text);
+                }
+
+                showToast('Model settings saved');
+            } catch (err) {
+                showToast(err.message, true);
+            }
+        });
+
+        loadSettings();
+    </script>
+</body>
+</html>

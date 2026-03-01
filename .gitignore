@@ -1,0 +1,9 @@
+/target
+/data
+/frontend/node_modules
+/frontend/dist
+/nginx/certs
+/nginx/certbot
+.DS_Store
+.env
+.qdrant-initialized

@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Maia - Add Info</title>
+    <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+    <nav class="navbar">
+        <div class="nav-brand">Maia</div>
+        <div class="nav-links">
+            <a href="/" class="active">Add</a>
+            <a href="/search.html">Search</a>
+            <a href="/browse.html">Browse</a>
+            <a href="/admin.html">Admin</a>
+        </div>
+    </nav>
+
+    <main class="container">
+        <h1>Add Information</h1>
+        <p class="subtitle">Enter any information in natural language. AI will automatically structure and index it.</p>
+
+        <form id="ingestForm" class="form-card">
+            <textarea
+                id="content"
+                placeholder="e.g., 'Had an interview with Company A today, offered 80k salary. Good atmosphere but legacy tech stack.'"
+                rows="6"
+            ></textarea>
+            <button type="submit" id="submitBtn">
+                <span class="btn-text">Add Information</span>
+                <span class="btn-loading" style="display:none;">Processing...</span>
+            </button>
+        </form>
+
+        <div id="result" class="result-card" style="display:none;">
+            <h3>Saved Successfully</h3>
+            <div class="result-content">
+                <div class="result-item">
+                    <label>Summary</label>
+                    <p id="resultSummary"></p>
+                </div>
+                <div class="result-item">
+                    <label>Tags</label>
+                    <div id="resultTags" class="tags"></div>
+                </div>
+                <div class="result-item">
+                    <label>Entities</label>
+                    <div id="resultEntities" class="entities"></div>
+                </div>
+            </div>
+        </div>
+
+        <div id="error" class="error-card" style="display:none;">
+            <p id="errorMessage"></p>
+        </div>
+
+        <section class="recent-section">
+            <h2>Recent Entries</h2>
+            <div id="recentList" class="recent-list">
+                <p class="empty-state">Loading...</p>
+            </div>
+        </section>
+    </main>
+
+    <script src="/app.js"></script>
+    <script>
+        const form = document.getElementById('ingestForm');
+        const submitBtn = document.getElementById('submitBtn');
+        const resultCard = document.getElementById('result');
+        const errorCard = document.getElementById('error');
+
+        form.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const content = document.getElementById('content').value.trim();
+            if (!content) return;
+
+            submitBtn.disabled = true;
+            submitBtn.querySelector('.btn-text').style.display = 'none';
+            submitBtn.querySelector('.btn-loading').style.display = 'inline';
+            resultCard.style.display = 'none';
+            errorCard.style.display = 'none';
+
+            try {
+                const response = await fetch('/ingest', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ content })
+                });
+
+                if (!response.ok) {
+                    const text = await response.text();
+                    throw new Error(text || 'Failed to ingest');
+                }
+
+                const data = await response.json();
+
+                document.getElementById('resultSummary').textContent = data.summary;
+                document.getElementById('resultTags').innerHTML = data.tags.map(t => `<span class="tag">${t}</span>`).join('');
+                document.getElementById('resultEntities').innerHTML = data.entities.map(e =>
+                    `<span class="entity entity-${e.entity_type}">${e.value}</span>`
+                ).join('');
+
+                resultCard.style.display = 'block';
+                document.getElementById('content').value = '';
+                loadRecent();
+            } catch (err) {
+                document.getElementById('errorMessage').textContent = err.message;
+                errorCard.style.display = 'block';
+            } finally {
+                submitBtn.disabled = false;
+                submitBtn.querySelector('.btn-text').style.display = 'inline';
+                submitBtn.querySelector('.btn-loading').style.display = 'none';
+            }
+        });
+
+        async function loadRecent() {
+            try {
+                const response = await fetch('/recent?limit=5');
+                const docs = await response.json();
+                const list = document.getElementById('recentList');
+
+                if (docs.length === 0) {
+                    list.innerHTML = '<p class="empty-state">No entries yet</p>';
+                    return;
+                }
+
+                list.innerHTML = docs.map(doc => `
+                    <div class="recent-item">
+                        <p class="recent-summary">${doc.summary}</p>
+                        <div class="recent-meta">
+                            <span class="recent-date">${new Date(doc.created_at).toLocaleDateString()}</span>
+                            ${doc.tags.slice(0, 3).map(t => `<span class="tag small">${t}</span>`).join('')}
+                        </div>
+                    </div>
+                `).join('');
+            } catch (err) {
+                document.getElementById('recentList').innerHTML = '<p class="empty-state">Failed to load</p>';
+            }
+        }
+
+        loadRecent();
+    </script>
+</body>
+</html>

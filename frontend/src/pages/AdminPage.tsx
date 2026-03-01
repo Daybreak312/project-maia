@@ -1,0 +1,270 @@
+import { useState, useEffect } from 'react';
+import type { ProviderInfo, SettingsResponse } from '../api/types';
+import { api } from '../api/client';
+
+interface AdminPageProps {
+  showToast: (message: string, type: 'success' | 'error') => void;
+}
+
+function ProviderCard({
+  provider,
+  parsingProvider,
+  embeddingProvider,
+  onSetKey,
+  onDeleteKey,
+  onTestKey,
+  onSetParsing,
+  onSetEmbedding,
+}: {
+  provider: ProviderInfo;
+  parsingProvider: string | null;
+  embeddingProvider: string | null;
+  onSetKey: (provider: string, key: string) => Promise<void>;
+  onDeleteKey: (provider: string) => Promise<void>;
+  onTestKey: (provider: string) => Promise<void>;
+  onSetParsing: (provider: string) => Promise<void>;
+  onSetEmbedding: (provider: string) => Promise<void>;
+}) {
+  const [apiKey, setApiKey] = useState('');
+  const [isSettingKey, setIsSettingKey] = useState(false);
+  const [isTesting, setIsTesting] = useState(false);
+  const [showKeyInput, setShowKeyInput] = useState(false);
+
+  const handleSetKey = async () => {
+    if (!apiKey.trim()) return;
+    setIsSettingKey(true);
+    try {
+      await onSetKey(provider.provider, apiKey.trim());
+      setApiKey('');
+      setShowKeyInput(false);
+    } finally {
+      setIsSettingKey(false);
+    }
+  };
+
+  const handleTest = async () => {
+    setIsTesting(true);
+    try {
+      await onTestKey(provider.provider);
+    } finally {
+      setIsTesting(false);
+    }
+  };
+
+  const isParsing = parsingProvider === provider.provider;
+  const isEmbedding = embeddingProvider === provider.provider;
+
+  return (
+    <div className="bg-card border border-border rounded-lg p-6">
+      <div className="flex justify-between items-start mb-4">
+        <div>
+          <h3 className="text-lg font-semibold text-gray-200 capitalize">
+            {provider.provider}
+          </h3>
+          <p className="text-sm text-muted">
+            {provider.has_api_key
+              ? `API Key: ${provider.api_key_preview || '••••••••'}`
+              : 'No API key configured'}
+          </p>
+        </div>
+        <div className="flex gap-2">
+          {isParsing && (
+            <span className="text-xs bg-primary/20 text-primary px-2 py-1 rounded">
+              Parsing
+            </span>
+          )}
+          {isEmbedding && (
+            <span className="text-xs bg-success/20 text-success px-2 py-1 rounded">
+              Embedding
+            </span>
+          )}
+        </div>
+      </div>
+
+      {/* API Key Management */}
+      {showKeyInput ? (
+        <div className="flex gap-2 mb-4">
+          <input
+            type="password"
+            className="flex-1 bg-bg border border-border rounded px-3 py-2 text-sm text-gray-200 focus:outline-none focus:border-primary"
+            placeholder="Enter API key..."
+            value={apiKey}
+            onChange={(e) => setApiKey(e.target.value)}
+          />
+          <button
+            className="px-4 py-2 bg-primary text-white text-sm rounded hover:bg-primary-hover transition-colors disabled:opacity-50"
+            onClick={handleSetKey}
+            disabled={isSettingKey || !apiKey.trim()}
+          >
+            {isSettingKey ? 'Saving...' : 'Save'}
+          </button>
+          <button
+            className="px-4 py-2 bg-border text-gray-200 text-sm rounded hover:bg-muted transition-colors"
+            onClick={() => {
+              setShowKeyInput(false);
+              setApiKey('');
+            }}
+          >
+            Cancel
+          </button>
+        </div>
+      ) : (
+        <div className="flex gap-2 mb-4">
+          <button
+            className="px-4 py-2 bg-border text-gray-200 text-sm rounded hover:bg-muted transition-colors"
+            onClick={() => setShowKeyInput(true)}
+          >
+            {provider.has_api_key ? 'Update Key' : 'Set Key'}
+          </button>
+          {provider.has_api_key && (
+            <>
+              <button
+                className="px-4 py-2 bg-border text-gray-200 text-sm rounded hover:bg-muted transition-colors disabled:opacity-50"
+                onClick={handleTest}
+                disabled={isTesting}
+              >
+                {isTesting ? 'Testing...' : 'Test'}
+              </button>
+              <button
+                className="px-4 py-2 bg-error text-white text-sm rounded hover:bg-red-700 transition-colors"
+                onClick={() => onDeleteKey(provider.provider)}
+              >
+                Delete Key
+              </button>
+            </>
+          )}
+        </div>
+      )}
+
+      {/* Provider Selection */}
+      {provider.has_api_key && (
+        <div className="flex gap-2">
+          <button
+            className={`px-4 py-2 text-sm rounded transition-colors ${
+              isParsing
+                ? 'bg-primary text-white'
+                : 'bg-border text-gray-200 hover:bg-muted'
+            }`}
+            onClick={() => onSetParsing(provider.provider)}
+            disabled={isParsing}
+          >
+            Use for Parsing
+          </button>
+          <button
+            className={`px-4 py-2 text-sm rounded transition-colors ${
+              isEmbedding
+                ? 'bg-success text-white'
+                : 'bg-border text-gray-200 hover:bg-muted'
+            }`}
+            onClick={() => onSetEmbedding(provider.provider)}
+            disabled={isEmbedding}
+          >
+            Use for Embedding
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+export function AdminPage({ showToast }: AdminPageProps) {
+  const [settings, setSettings] = useState<SettingsResponse | null>(null);
+  const [isLoading, setIsLoading] = useState(true);
+
+  useEffect(() => {
+    loadSettings();
+  }, []);
+
+  const loadSettings = async () => {
+    try {
+      const data = await api.getSettings();
+      setSettings(data);
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : 'Failed to load settings', 'error');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const handleSetKey = async (provider: string, apiKey: string) => {
+    try {
+      await api.setApiKey(provider, apiKey);
+      showToast(`API key set for ${provider}`, 'success');
+      await loadSettings();
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : 'Failed to set API key', 'error');
+    }
+  };
+
+  const handleDeleteKey = async (provider: string) => {
+    if (!confirm(`Delete API key for ${provider}?`)) return;
+    try {
+      await api.deleteApiKey(provider);
+      showToast(`API key deleted for ${provider}`, 'success');
+      await loadSettings();
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : 'Failed to delete API key', 'error');
+    }
+  };
+
+  const handleTestKey = async (provider: string) => {
+    try {
+      const result = await api.testApiKey(provider);
+      if (result.valid) {
+        showToast(`${provider} API key is valid`, 'success');
+      } else {
+        showToast(result.message || `${provider} API key is invalid`, 'error');
+      }
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : 'Test failed', 'error');
+    }
+  };
+
+  const handleSetParsing = async (provider: string) => {
+    try {
+      await api.updateSettings({ parsing_provider: provider });
+      showToast(`Parsing provider set to ${provider}`, 'success');
+      await loadSettings();
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : 'Failed to update', 'error');
+    }
+  };
+
+  const handleSetEmbedding = async (provider: string) => {
+    try {
+      await api.updateSettings({ embedding_provider: provider });
+      showToast(`Embedding provider set to ${provider}`, 'success');
+      await loadSettings();
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : 'Failed to update', 'error');
+    }
+  };
+
+  return (
+    <div className="max-w-4xl mx-auto p-6">
+      <h2 className="text-xl font-semibold text-gray-200 mb-6">Settings</h2>
+
+      {isLoading ? (
+        <div className="text-center text-muted py-8">Loading...</div>
+      ) : settings ? (
+        <div className="flex flex-col gap-4">
+          {settings.providers.map((provider) => (
+            <ProviderCard
+              key={provider.provider}
+              provider={provider}
+              parsingProvider={settings.parsing_provider}
+              embeddingProvider={settings.embedding_provider}
+              onSetKey={handleSetKey}
+              onDeleteKey={handleDeleteKey}
+              onTestKey={handleTestKey}
+              onSetParsing={handleSetParsing}
+              onSetEmbedding={handleSetEmbedding}
+            />
+          ))}
+        </div>
+      ) : (
+        <div className="text-center text-muted py-8">Failed to load settings</div>
+      )}
+    </div>
+  );
+}
