@@ -10,12 +10,20 @@ pub struct Document {
     pub summary: String,
     pub tags: Vec<String>,
     pub entities: Vec<Entity>,
+    #[serde(default)]
+    pub facts: Vec<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
 
 impl Document {
-    pub fn new(raw_content: String, summary: String, tags: Vec<String>, entities: Vec<Entity>) -> Self {
+    pub fn new(
+        raw_content: String,
+        summary: String,
+        tags: Vec<String>,
+        entities: Vec<Entity>,
+        facts: Vec<String>,
+    ) -> Self {
         let now = Utc::now();
         Self {
             id: Uuid::new_v4(),
@@ -23,6 +31,7 @@ impl Document {
             summary,
             tags,
             entities,
+            facts,
             created_at: now,
             updated_at: now,
         }
@@ -56,6 +65,8 @@ pub struct ParsedContent {
     pub summary: String,
     pub tags: Vec<String>,
     pub entities: Vec<Entity>,
+    #[serde(default)]
+    pub facts: Vec<String>,
 }
 
 /// API Request/Response 타입들
@@ -73,6 +84,7 @@ pub mod api {
         pub summary: String,
         pub tags: Vec<String>,
         pub entities: Vec<Entity>,
+        pub facts: Vec<String>,
     }
 
     #[derive(Debug, Deserialize)]
@@ -121,6 +133,8 @@ pub mod api {
         pub summary: String,
         pub tags: Vec<String>,
         pub relevance_score: f32,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        pub matched_facts: Vec<String>,
     }
 
     #[derive(Debug, Serialize)]

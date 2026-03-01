@@ -89,6 +89,7 @@ impl LlmProvider for OpenAiChatProvider {
                     context: e.context,
                 })
                 .collect(),
+            facts: parsed.facts,
         })
     }
 
@@ -235,6 +236,8 @@ struct ParsedContentRaw {
     summary: String,
     tags: Vec<String>,
     entities: Vec<EntityRaw>,
+    #[serde(default)]
+    facts: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]

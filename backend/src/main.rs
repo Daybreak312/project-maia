@@ -1,4 +1,5 @@
 mod api;
+mod auth;
 mod config;
 mod core;
 mod llm;
@@ -9,6 +10,7 @@ mod storage;
 use std::sync::Arc;
 
 use axum::{
+    middleware,
     routing::{delete, get, post, put},
     Router,
 };
@@ -26,6 +28,7 @@ use storage::{DocumentStore, QdrantStorage};
 pub struct AppState {
     pub indexer: Indexer,
     pub settings: Arc<SettingsManager>,
+    pub api_key: Option<String>,
 }
 
 #[tokio::main]
@@ -54,11 +57,19 @@ async fn main() -> anyhow::Result<()> {
     let indexer = Indexer::new(settings.clone(), qdrant, documents);
 
     // AppState 생성
-    let state = Arc::new(AppState { indexer, settings });
+    if config.api_key.is_some() {
+        tracing::info!("API key authentication enabled");
+    } else {
+        tracing::warn!("API key not set (MAIA_API_KEY). All endpoints are open.");
+    }
+    let state = Arc::new(AppState {
+        indexer,
+        settings,
+        api_key: config.api_key,
+    });
 
-    // API 라우터
+    // 인증이 필요한 API 라우트
     let api_routes = Router::new()
-        // 기존 API
         .route("/ingest", post(api::ingest_handler))
         .route("/search", post(api::search_handler))
         .route("/documents/:id", get(api::get_document_handler))
@@ -67,7 +78,6 @@ async fn main() -> anyhow::Result<()> {
         .route("/recent", get(api::recent_handler))
         .route("/tags", get(api::tags_handler))
         .route("/api/reindex", post(api::reindex_handler))
-        // 설정 API
         .route("/api/settings", get(api::settings::get_settings))
         .route("/api/settings", put(api::settings::update_settings))
         .route(
@@ -82,7 +92,13 @@ async fn main() -> anyhow::Result<()> {
             "/api/settings/models/:provider/test",
             post(api::settings::test_api_key),
         )
-        // Health check
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_api_key,
+        ));
+
+    // 인증 불필요한 라우트
+    let public_routes = Router::new()
         .route("/health", get(health_handler));
 
     // 정적 파일 서빙 (환경변수 우선, 없으면 기본 경로)
@@ -91,6 +107,7 @@ async fn main() -> anyhow::Result<()> {
 
     let app = Router::new()
         .merge(api_routes)
+        .merge(public_routes)
         .fallback_service(ServeDir::new(&static_dir).append_index_html_on_directories(true))
         .layer(
             CorsLayer::new()

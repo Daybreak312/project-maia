@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useRef } from 'react';
 import type { Document, SearchResult, IngestResponse } from '../api/types';
 import { api } from '../api/client';
 import { AccordionItem } from '../components/AccordionItem';
@@ -21,6 +21,7 @@ interface SearchResultWithDoc extends SearchResult {
 const PAGE_SIZE = 10;
 
 export function SearchPage({ showToast }: SearchPageProps) {
+  const inputRef = useRef<HTMLInputElement>(null);
   const [query, setQuery] = useState('');
   const [mode, setMode] = useState<SearchMode>('hybrid');
   const [selectedTags, setSelectedTags] = useState<string[]>([]);
@@ -69,6 +70,7 @@ export function SearchPage({ showToast }: SearchPageProps) {
       setTotal(0);
     } finally {
       setIsSearching(false);
+      inputRef.current?.focus();
     }
   };
 
@@ -109,6 +111,7 @@ export function SearchPage({ showToast }: SearchPageProps) {
         <h2 className="text-xl font-semibold text-gray-200 mb-4">Search</h2>
         <div className="flex gap-3 mb-4">
           <input
+            ref={inputRef}
             type="text"
             className="flex-1 bg-card border border-border rounded-lg px-4 py-3 text-gray-200 focus:outline-none focus:border-primary"
             placeholder="Search your entries..."

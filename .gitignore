@@ -1,9 +1,17 @@
-/target
-/data
-/frontend/node_modules
-/frontend/dist
-/nginx/certs
-/nginx/certbot
+# Backend
+backend/target
+backend/data
+frontend/node_modules
+frontend/dist
+backend/nginx/certs
+backend/nginx/certbot
+backend/.qdrant-initialized
+backend/.env
+
+# MCP
+mcp/node_modules
+mcp/dist
+mcp/.env
+
+# General
 .DS_Store
-.env
-.qdrant-initialized

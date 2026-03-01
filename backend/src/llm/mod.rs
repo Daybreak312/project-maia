@@ -105,6 +105,9 @@ pub fn build_parse_prompt(content: &str) -> String {
       "value": "원본에 명시된 값 그대로",
       "context": "원본에서 해당 값이 언급된 맥락"
     }}
+  ],
+  "facts": [
+    "원문에서 추출한 독립적 사실 문장"
   ]
 }}
 
@@ -112,6 +115,7 @@ pub fn build_parse_prompt(content: &str) -> String {
 - summary: 원본 키워드 보존, 나중에 검색될 수 있도록 핵심어 포함
 - tags: 면접, 연봉협상, 이직 등 일반적 분류
 - entities: 회사명, 금액, 날짜, 기술스택 등 구체적 고유명사/값
+- facts: 원문을 독립적으로 이해 가능한 사실 문장(atomic fact)으로 분해. 각 문장은 주어/목적어를 생략하지 않고 단독으로 의미가 통해야 함. 원문이 1-2문장으로 짧으면 빈 배열 허용
 - JSON만 출력, 다른 텍스트 없이"#
     )
 }

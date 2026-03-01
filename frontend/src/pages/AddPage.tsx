@@ -78,9 +78,15 @@ export function AddPage({ showToast }: AddPageProps) {
         <h2 className="text-xl font-semibold text-gray-200 mb-4">Add New Entry</h2>
         <textarea
           className="w-full min-h-[200px] bg-card border border-border rounded-lg p-4 text-gray-200 resize-y focus:outline-none focus:border-primary mb-4"
-          placeholder="Enter information to store... (anything you want to remember)"
+          placeholder="Enter information to store... (anything you want to remember)&#10;&#10;Ctrl+Enter (⌘+Enter) to submit"
           value={content}
           onChange={(e) => setContent(e.target.value)}
+          onKeyDown={(e) => {
+            if ((e.ctrlKey || e.metaKey) && e.key === 'Enter' && content.trim() && !isSubmitting) {
+              e.preventDefault();
+              handleSubmit(e);
+            }
+          }}
           disabled={isSubmitting}
         />
         <button

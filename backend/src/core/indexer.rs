@@ -1,18 +1,28 @@
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::sync::Arc;
+use uuid::Uuid;
 
 use crate::core::search::{BM25Scorer, SearchMode, reciprocal_rank_fusion};
 use crate::llm::{create_llm_provider, create_embedding_provider, LlmProvider, EmbeddingProvider};
-use crate::models::{Document, api::{IngestResponse, SearchResponse, SearchResult}};
+use crate::models::{Document, ParsedContent, api::{IngestResponse, SearchResponse, SearchResult}};
 use crate::settings::SettingsManager;
-use crate::storage::{DocumentStore, QdrantStorage, SearchHit};
+use crate::storage::{DocumentStore, QdrantStorage, SearchHit, ChunkData};
 
 /// RRF 상수 (일반적으로 60 사용)
 const RRF_K: f32 = 60.0;
 
-/// 최소 유사도 임계값
-const MIN_VECTOR_SCORE: f32 = 0.5;
+/// Qdrant 검색 시 사전 필터 (이 이하는 후보에서 제외)
+const MIN_VECTOR_SCORE: f32 = 0.3;
+
+/// 최종 결과에 포함할 최소 관련도 (raw cosine similarity 기준)
+const MIN_RELEVANCE_SCORE: f32 = 0.5;
+
+/// 연속 결과 간 점수 차이가 이 값을 넘으면 하위 결과 제거
+const SCORE_DROP_THRESHOLD: f32 = 0.15;
+
+/// 단일 검색의 최대 결과 수
+const MAX_RESULTS: usize = 5;
 
 /// 모든 핵심 로직을 오케스트레이션하는 인덱서
 pub struct Indexer {
@@ -62,6 +72,44 @@ impl Indexer {
         Ok(create_embedding_provider(provider_type, api_key))
     }
 
+    /// ParsedContent + summary 텍스트로부터 ChunkData 벡터를 생성
+    async fn build_chunks(
+        &self,
+        embedder: &dyn EmbeddingProvider,
+        summary: &str,
+        facts: &[String],
+    ) -> Result<Vec<ChunkData>> {
+        let mut chunks = Vec::new();
+
+        // summary chunk (항상 생성)
+        let summary_embedding = embedder.embed(summary).await?;
+        chunks.push(ChunkData {
+            chunk_type: "summary".to_string(),
+            chunk_index: 0,
+            chunk_text: summary.to_string(),
+            embedding: summary_embedding,
+        });
+
+        // fact chunks
+        for (i, fact) in facts.iter().enumerate() {
+            match embedder.embed(fact).await {
+                Ok(embedding) => {
+                    chunks.push(ChunkData {
+                        chunk_type: "fact".to_string(),
+                        chunk_index: i + 1,
+                        chunk_text: fact.clone(),
+                        embedding,
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to embed fact[{}], skipping: {}", i, e);
+                }
+            }
+        }
+
+        Ok(chunks)
+    }
+
     /// 자연어 입력 → 파싱 → 임베딩 → 저장
     pub async fn ingest(&self, raw_content: String) -> Result<IngestResponse> {
         // 1. LLM으로 파싱
@@ -75,28 +123,36 @@ impl Indexer {
             parsed.summary.clone(),
             parsed.tags.clone(),
             parsed.entities.clone(),
+            parsed.facts.clone(),
         );
 
-        // 3. 임베딩 생성 (summary 기반)
-        tracing::info!("Generating embedding...");
+        // 3. 임베딩 생성 (summary + facts)
+        tracing::info!("Generating embeddings for {} chunks...", 1 + parsed.facts.len());
         let embedder = self.get_embedding_provider().await?;
-        let embedding = embedder.embed(&parsed.summary).await?;
+        let chunks = self.build_chunks(embedder.as_ref(), &parsed.summary, &parsed.facts).await?;
 
         // 4. 파일 시스템에 원본 저장
         tracing::info!("Saving document...");
         self.documents.save(&doc).await?;
 
-        // 5. Qdrant에 벡터 저장
-        tracing::info!("Indexing to Qdrant...");
-        self.qdrant.upsert(&doc, embedding).await?;
+        // 5. Qdrant에 chunk 벡터 저장
+        tracing::info!("Indexing {} chunks to Qdrant...", chunks.len());
+        self.qdrant.upsert_chunks(
+            doc.id,
+            &doc.summary,
+            &doc.tags,
+            &doc.created_at.to_rfc3339(),
+            chunks,
+        ).await?;
 
-        tracing::info!("Ingested document: {}", doc.id);
+        tracing::info!("Ingested document: {} ({} facts)", doc.id, doc.facts.len());
 
         Ok(IngestResponse {
             id: doc.id,
             summary: doc.summary,
             tags: doc.tags,
             entities: doc.entities,
+            facts: doc.facts,
         })
     }
 
@@ -122,8 +178,12 @@ impl Indexer {
             SearchMode::Hybrid => self.hybrid_search(&query, limit + offset, tags_filter.clone()).await?,
         };
 
+        // 관련성 기반 동적 필터링
+        let filtered = filter_by_relevance(results);
+        let filtered_total = filtered.len();
+
         // 페이지네이션 적용
-        let paginated: Vec<_> = results
+        let paginated: Vec<_> = filtered
             .into_iter()
             .skip(offset)
             .take(limit)
@@ -134,12 +194,12 @@ impl Indexer {
         Ok(SearchResponse {
             results: paginated,
             sources_used,
-            total,
+            total: filtered_total,
             mode: format!("{:?}", search_mode).to_lowercase(),
         })
     }
 
-    /// 벡터 검색
+    /// 벡터 검색 — chunk 단위 검색 후 document_id 기준 그룹핑
     async fn vector_search(
         &self,
         query: &str,
@@ -149,33 +209,63 @@ impl Indexer {
         let embedder = self.get_embedding_provider().await?;
         let query_embedding = embedder.embed(query).await?;
 
-        let hits = self.qdrant.search(query_embedding, tags_filter, limit * 2).await?;
+        // over-fetch: 같은 문서의 여러 chunk가 히트할 수 있으므로
+        let hits = self.qdrant.search(query_embedding, tags_filter, limit * 5).await?;
 
-        let results: Vec<SearchResult> = hits
+        // document_id 기준 그룹핑
+        let mut groups: HashMap<Uuid, DocumentGroup> = HashMap::new();
+
+        for hit in hits {
+            if hit.score < MIN_VECTOR_SCORE {
+                continue;
+            }
+
+            let group = groups.entry(hit.id).or_insert_with(|| DocumentGroup {
+                summary: hit.summary.clone(),
+                tags: hit.tags.clone(),
+                best_score: 0.0,
+                matched_facts: Vec::new(),
+            });
+
+            if hit.score > group.best_score {
+                group.best_score = hit.score;
+            }
+
+            if hit.chunk_type == "fact" {
+                group.matched_facts.push(hit.chunk_text);
+            }
+        }
+
+        // 최고 점수 기준 정렬
+        let mut sorted: Vec<_> = groups.into_iter().collect();
+        sorted.sort_by(|a, b| b.1.best_score.partial_cmp(&a.1.best_score).unwrap_or(std::cmp::Ordering::Equal));
+
+        let total = sorted.len();
+
+        let results: Vec<SearchResult> = sorted
             .into_iter()
-            .filter(|h| h.score >= MIN_VECTOR_SCORE)
             .take(limit)
-            .map(|hit| SearchResult {
-                id: hit.id,
-                summary: hit.summary,
-                tags: hit.tags,
-                relevance_score: hit.score,
+            .map(|(id, group)| SearchResult {
+                id,
+                summary: group.summary,
+                tags: group.tags,
+                relevance_score: group.best_score,
+                matched_facts: group.matched_facts,
             })
             .collect();
 
-        let total = results.len();
         Ok((results, total))
     }
 
-    /// 키워드 검색 (BM25)
+    /// 키워드 검색 (BM25) — summary chunk만 대상
     async fn keyword_search(
         &self,
         query: &str,
         limit: usize,
         tags_filter: Option<Vec<String>>,
     ) -> Result<(Vec<SearchResult>, usize)> {
-        // 모든 문서 가져오기
-        let all_docs = self.qdrant.scroll_all(tags_filter).await?;
+        // summary chunk만 가져오기
+        let all_docs = self.qdrant.scroll_all(tags_filter, Some("summary")).await?;
 
         if all_docs.is_empty() {
             return Ok((vec![], 0));
@@ -187,11 +277,10 @@ impl Indexer {
 
         for doc in all_docs {
             let id_str = doc.id.to_string();
-            // raw_content + summary + tags를 결합하여 검색
+            // chunk_text(summary) + tags를 결합하여 검색
             let search_text = format!(
-                "{} {} {}",
-                doc.raw_content,
-                doc.summary,
+                "{} {}",
+                doc.chunk_text,
                 doc.tags.join(" ")
             );
             scorer.add_document(&id_str, &search_text);
@@ -215,6 +304,7 @@ impl Indexer {
                     summary: doc.summary.clone(),
                     tags: doc.tags.clone(),
                     relevance_score: (score / max_score).min(1.0),
+                    matched_facts: vec![],
                 })
             })
             .collect();
@@ -238,13 +328,19 @@ impl Indexer {
         let vector_results = vector_results.unwrap_or((vec![], 0)).0;
         let keyword_results = keyword_results.unwrap_or((vec![], 0)).0;
 
-        // 문서 정보 맵 구축
+        // 벡터 검색의 raw cosine similarity 보존 (정직한 점수 표시용)
+        let mut vector_scores: HashMap<String, f32> = HashMap::new();
+        for r in &vector_results {
+            vector_scores.insert(r.id.to_string(), r.relevance_score);
+        }
+
+        // 문서 정보 맵 구축 (vector 결과의 matched_facts 보존)
         let mut doc_map: HashMap<String, SearchResult> = HashMap::new();
         for r in vector_results.iter().chain(keyword_results.iter()) {
             doc_map.entry(r.id.to_string()).or_insert_with(|| r.clone());
         }
 
-        // RRF 결합
+        // RRF로 순서 결정 (점수가 아닌 순서만 사용)
         let vector_ranking: Vec<_> = vector_results
             .iter()
             .map(|r| (r.id.to_string(), r.relevance_score))
@@ -258,20 +354,21 @@ impl Indexer {
         let fused = reciprocal_rank_fusion(vec![vector_ranking, keyword_ranking], RRF_K);
         let total = fused.len();
 
-        // 최종 결과 구성
-        let max_rrf_score = fused.first().map(|(_, s)| *s).unwrap_or(1.0).max(0.001);
-
+        // RRF 순서를 유지하되, 점수는 raw cosine similarity 사용
         let results: Vec<SearchResult> = fused
             .into_iter()
             .take(limit)
-            .filter_map(|(id, rrf_score)| {
+            .filter_map(|(id, _rrf_score)| {
                 let doc = doc_map.get(&id)?;
+                // 벡터 검색에 있었으면 raw cosine, 키워드 전용이면 BM25 정규화 점수의 절반
+                let score = vector_scores.get(&id).copied()
+                    .unwrap_or(doc.relevance_score * 0.5);
                 Some(SearchResult {
                     id: doc.id,
                     summary: doc.summary.clone(),
                     tags: doc.tags.clone(),
-                    // RRF 스코어를 0-1 범위로 정규화
-                    relevance_score: (rrf_score / max_rrf_score).min(1.0),
+                    relevance_score: score,
+                    matched_facts: doc.matched_facts.clone(),
                 })
             })
             .collect();
@@ -320,38 +417,47 @@ impl Indexer {
             summary: parsed.summary.clone(),
             tags: parsed.tags.clone(),
             entities: parsed.entities.clone(),
+            facts: parsed.facts.clone(),
             created_at: existing.created_at,
             updated_at: now,
         };
 
-        // 3. 임베딩 생성
-        tracing::info!("Re-generating embedding...");
+        // 3. 임베딩 생성 (summary + facts)
+        tracing::info!("Re-generating embeddings...");
         let embedder = self.get_embedding_provider().await?;
-        let embedding = embedder.embed(&parsed.summary).await?;
+        let chunks = self.build_chunks(embedder.as_ref(), &parsed.summary, &parsed.facts).await?;
 
         // 4. 파일 덮어쓰기
         tracing::info!("Saving updated document...");
         self.documents.save(&doc).await?;
 
-        // 5. Qdrant 업데이트 (upsert)
+        // 5. 기존 chunk 전부 삭제 후 새 chunk 저장
         tracing::info!("Updating Qdrant index...");
-        self.qdrant.upsert(&doc, embedding).await?;
+        self.qdrant.delete_by_document_id(id).await?;
+        self.qdrant.upsert_chunks(
+            id,
+            &doc.summary,
+            &doc.tags,
+            &doc.created_at.to_rfc3339(),
+            chunks,
+        ).await?;
 
-        tracing::info!("Updated document: {}", doc.id);
+        tracing::info!("Updated document: {} ({} facts)", doc.id, doc.facts.len());
 
         Ok(IngestResponse {
             id: doc.id,
             summary: doc.summary,
             tags: doc.tags,
             entities: doc.entities,
+            facts: doc.facts,
         })
     }
 
     /// 문서 삭제
     pub async fn delete(&self, id: uuid::Uuid) -> Result<()> {
-        // 1. Qdrant에서 삭제
-        tracing::info!("Deleting from Qdrant...");
-        self.qdrant.delete(id).await?;
+        // 1. Qdrant에서 해당 문서의 모든 chunk 삭제
+        tracing::info!("Deleting chunks from Qdrant...");
+        self.qdrant.delete_by_document_id(id).await?;
 
         // 2. 파일 삭제
         tracing::info!("Deleting document file...");
@@ -362,6 +468,7 @@ impl Indexer {
     }
 
     /// 파일 시스템의 모든 문서를 Qdrant에 재인덱싱
+    /// 컬렉션을 완전히 재생성하여 구 스키마 데이터도 정리
     pub async fn reindex_all(&self) -> Result<usize> {
         let docs = self.documents.list_recent(10000).await?;
         let total = docs.len();
@@ -370,17 +477,28 @@ impl Indexer {
             return Ok(0);
         }
 
+        // 컬렉션 재생성 (구 스키마 orphan 포인트 정리)
+        self.qdrant.recreate_collection().await?;
+
         let embedder = self.get_embedding_provider().await?;
         let mut indexed = 0;
 
         for doc in docs {
-            match embedder.embed(&doc.summary).await {
-                Ok(embedding) => {
-                    if let Err(e) = self.qdrant.upsert(&doc, embedding).await {
+            // summary + facts 임베딩 (facts가 비어있으면 summary chunk만)
+            match self.build_chunks(embedder.as_ref(), &doc.summary, &doc.facts).await {
+                Ok(chunks) => {
+                    let chunk_count = chunks.len();
+                    if let Err(e) = self.qdrant.upsert_chunks(
+                        doc.id,
+                        &doc.summary,
+                        &doc.tags,
+                        &doc.created_at.to_rfc3339(),
+                        chunks,
+                    ).await {
                         tracing::error!("Failed to index {}: {}", doc.id, e);
                     } else {
                         indexed += 1;
-                        tracing::info!("Reindexed {}/{}: {}", indexed, total, doc.id);
+                        tracing::info!("Reindexed {}/{}: {} ({} chunks)", indexed, total, doc.id, chunk_count);
                     }
                 }
                 Err(e) => {
@@ -395,7 +513,8 @@ impl Indexer {
 
     /// 모든 고유 태그 목록 조회
     pub async fn get_all_tags(&self) -> Result<Vec<String>> {
-        let docs = self.qdrant.scroll_all(None).await?;
+        // summary chunk만 가져와서 태그 중복 방지
+        let docs = self.qdrant.scroll_all(None, Some("summary")).await?;
         let mut tags: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         for doc in docs {
@@ -408,4 +527,49 @@ impl Indexer {
         tags_vec.sort();
         Ok(tags_vec)
     }
+}
+
+/// 검색 결과를 관련성 기준으로 동적 필터링
+///
+/// 세 가지 조건 중 가장 먼저 걸리는 것에서 잘라냄:
+/// 1. 절대 임계값: MIN_RELEVANCE_SCORE 미만은 제거
+/// 2. 점수 드롭: 연속 결과 간 차이가 SCORE_DROP_THRESHOLD를 넘으면 거기서 컷
+/// 3. 상한: MAX_RESULTS 초과 제거
+fn filter_by_relevance(results: Vec<SearchResult>) -> Vec<SearchResult> {
+    if results.is_empty() {
+        return results;
+    }
+
+    let mut filtered: Vec<SearchResult> = Vec::new();
+
+    for (i, result) in results.into_iter().enumerate() {
+        // 상한 도달
+        if i >= MAX_RESULTS {
+            break;
+        }
+
+        // 절대 임계값
+        if result.relevance_score < MIN_RELEVANCE_SCORE {
+            break;
+        }
+
+        // 점수 드롭 감지 (두 번째 결과부터)
+        if let Some(prev) = filtered.last() {
+            if prev.relevance_score - result.relevance_score > SCORE_DROP_THRESHOLD {
+                break;
+            }
+        }
+
+        filtered.push(result);
+    }
+
+    filtered
+}
+
+/// 벡터 검색 그룹핑을 위한 내부 구조체
+struct DocumentGroup {
+    summary: String,
+    tags: Vec<String>,
+    best_score: f32,
+    matched_facts: Vec<String>,
 }

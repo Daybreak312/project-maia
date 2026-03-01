@@ -5,6 +5,7 @@ pub struct Config {
     pub server_port: u16,
     pub qdrant_url: String,
     pub data_dir: String,
+    pub api_key: Option<String>,
 }
 
 impl Config {
@@ -20,6 +21,7 @@ impl Config {
                 .unwrap_or_else(|_| "http://localhost:6333".to_string()),
             data_dir: std::env::var("DATA_DIR")
                 .unwrap_or_else(|_| "./data".to_string()),
+            api_key: std::env::var("MAIA_API_KEY").ok().filter(|k| !k.is_empty()),
         })
     }
 }

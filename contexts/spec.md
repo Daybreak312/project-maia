@@ -1,6 +1,6 @@
 # Feature Specification
 
-## Phase 1: MVP (현재)
+## Phase 1: MVP
 
 ### 1.1 정보 입력 (Ingest)
 
@@ -11,83 +11,99 @@
 ```
 
 **Process**:
-1. 원본 저장 (raw)
-2. LLM으로 파싱 (선택된 모델 사용)
+1. 원본 저장 (raw JSON 파일)
+2. LLM으로 파싱 (선택된 Provider 사용)
    - 개요(summary) 생성
    - 태그 추출
-   - 엔티티 추출 (회사명, 금액, 날짜 등)
+   - 엔티티 추출 (회사명, 금액, 날짜, 스킬 등)
 3. 임베딩 생성 (summary 기반)
-4. Qdrant에 인덱싱
+4. Qdrant에 벡터 인덱싱
 
 **Output**: 저장 완료 + 추출된 메타데이터 반환
 
 ### 1.2 검색 (Search)
 
-**Input**: 자연어 쿼리
-```
-"작년에 면접 봤던 회사들 연봉 비교해줘"
-```
+**Input**: 자연어 쿼리 + 검색 모드 선택
 
-**Process**:
-1. 쿼리 임베딩 생성
-2. Qdrant에서 하이브리드 검색
-3. 결과 반환 + 사용된 소스 명시
+**Search Modes**:
+- `hybrid` (기본): 벡터 + 키워드 검색 결과를 RRF로 결합
+- `vector`: 쿼리 임베딩 → Qdrant 코사인 유사도 검색
+- `keyword`: 전체 문서 BM25 스코어링
 
 **Output**:
 ```json
 {
-  "results": [...],
-  "sources_used": ["doc_001", "doc_003"]
+  "results": [{ "id": "...", "summary": "...", "tags": [...], "relevance_score": 0.85 }],
+  "sources_used": ["doc_001", "doc_003"],
+  "total": 15,
+  "mode": "hybrid"
 }
 ```
 
 ### 1.3 AI 모델 추상화
 
 **지원 모델**:
-- Gemini (구현 완료)
-- Claude (스텁)
-- GPT (스텁)
+| Provider | 파싱 모델 | 임베딩 모델 | 임베딩 차원 |
+|----------|-----------|-------------|-------------|
+| Gemini | gemini-2.5-flash | gemini-embedding-001 | 768 |
+| Claude | claude-sonnet-4-20250514 | (OpenAI 폴백) | - |
+| OpenAI | gpt-4o-mini | text-embedding-3-small | 1536 |
 
-**용도별 모델 선택**:
-- `parsing`: 정보 입력 시 개요 요약/태그/엔티티 추출
-- `embedding`: 벡터 임베딩 생성
+- API Key는 `data/settings.json`에 파일 기반 저장
+- 런타임에 Provider 변경 가능
+- Provider 변경 시 임베딩 차원이 다르면 `POST /api/reindex` 필요
 
-**설정 저장**:
-- API Key는 파일 기반 저장 (`data/settings.json`)
-- 런타임에 모델 변경 가능
-
-### 1.4 프론트엔드 UI
+### 1.4 프론트엔드 UI (React + Vite)
 
 **페이지 구성**:
-1. **정보 추가** (`/`) - 메인 페이지, 자연어 입력
-2. **검색** (`/search`) - 검색 UI
-3. **어드민** (`/admin`) - 설정 관리
-   - AI 모델별 API Key 등록
-   - 용도별 모델 선택
-   - (향후) 프로젝트 관리
+1. **Add** (`/`) — 자연어 입력으로 정보 추가
+2. **Search** (`/search`) — 하이브리드 검색, 모드 선택
+3. **Browse** (`/browse`) — 전체 문서 브라우징
+4. **Admin** (`/admin`) — API Key 관리, Provider 선택
 
-**기술 스택**: 정적 HTML + Vanilla JS (MVP)
+### 1.5 MCP 서버
+
+로컬 MCP 서버(TypeScript, STDIO transport)가 원격 Maia 백엔드의 REST API를 호출하는 브릿지 구조.
+
+**등록 Tool**:
+| Tool | 트리거 예시 | Maia API |
+|------|-------------|----------|
+| `search_context` | "내 면접 경험 알려줘" | `POST /search` |
+| `ingest_information` | "이거 기억해둬" | `POST /ingest` |
+| `get_document` | 검색 결과 원문 조회 | `GET /documents/{id}` |
+| `list_recent_documents` | "최근에 뭘 저장했지?" | `GET /recent` |
+| `get_tags` | 태그 목록 확인 | `GET /tags` |
+
+**호환 AI 도구**: Claude Desktop, Claude Code, Cursor, VS Code Copilot, Gemini CLI
+
+### 1.6 API 인증
+
+- `MAIA_API_KEY` 환경변수로 Bearer 토큰 인증
+- 미설정 시 인증 비활성화 (로컬 개발)
+- `/health`만 인증 불필요
 
 ---
 
 ## API Endpoints
 
 ```
-# 기존 API
-POST /ingest
-POST /search
-GET  /documents/{id}
-GET  /recent
+# 인증 필요 (MAIA_API_KEY 설정 시)
+POST   /ingest                          — 정보 저장
+POST   /search                          — 검색
+GET    /documents/{id}                  — 문서 조회
+PUT    /documents/{id}                  — 문서 수정 (재파싱 + 재임베딩)
+DELETE /documents/{id}                  — 문서 삭제
+GET    /recent?limit=20&offset=0        — 최근 문서 목록
+GET    /tags                            — 전체 태그 목록
+POST   /api/reindex                     — 전체 문서 재인덱싱
+GET    /api/settings                    — 설정 조회
+PUT    /api/settings                    — Provider 변경
+POST   /api/settings/models/{provider}/key   — API Key 설정
+DELETE /api/settings/models/{provider}/key   — API Key 삭제
+POST   /api/settings/models/{provider}/test  — API Key 유효성 검증
 
-# 설정 API
-GET  /api/settings              - 현재 설정 조회
-PUT  /api/settings              - 설정 변경
-GET  /api/settings/models       - 등록된 모델 목록
-POST /api/settings/models/{provider}/test - API Key 유효성 검증
-
-# 정적 파일
-GET  /                          - 프론트엔드 UI
-GET  /static/*                  - 정적 자원
+# 인증 불필요
+GET    /health                          — 헬스체크
 ```
 
 ---
@@ -96,36 +112,35 @@ GET  /static/*                  - 정적 자원
 
 ### Docker Compose 구성
 ```
-nginx (443/80)
-  ├── / → Frontend (dist)
-  └── /api → Backend (Rust)
-
 services:
-  - qdrant
-  - backend (maia)
-  - nginx + certbot (HTTPS)
+  qdrant       — 벡터 DB
+  app (maia)   — Rust 백엔드 (:8080)
+  nginx        — 리버스 프록시 (HTTPS, :443)
 ```
 
-### 프론트엔드
-- 현재: 정적 HTML
-- 배포 시: Vite 빌드 → dist 폴더
-- 백엔드에서 dist 서빙
-
-### 라우팅
-- `/api/*` → Backend API
-- `/admin` → Admin UI
-- `/` → Main UI (정보 추가/검색)
-
-### HTTPS
-- nginx reverse proxy
-- certbot (Let's Encrypt)
+### MCP 클라이언트 설정 (claude_desktop_config.json)
+```json
+{
+  "mcpServers": {
+    "maia": {
+      "command": "node",
+      "args": ["/path/to/project-maia/mcp/dist/index.js"],
+      "env": {
+        "MAIA_URL": "https://your-server:8080",
+        "MAIA_API_KEY": "your-secret-key"
+      }
+    }
+  }
+}
+```
 
 ---
 
 ## Phase 2: 확장 (Future)
 
-### 2.1 MCP 서버
-- Claude Code 등 외부 도구에서 접근
+### 2.1 웹 AI 연동
+- ChatGPT GPT Actions (OpenAPI spec)
+- Gemini Google Extensions
 
 ### 2.2 자동 수집
 - Threads, GeekNews 등 크롤링

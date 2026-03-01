@@ -10,7 +10,10 @@ const links = [
 export function Navbar() {
   return (
     <nav className="flex justify-between items-center px-8 py-4 bg-card border-b border-border">
-      <div className="text-xl font-bold text-primary">Maia</div>
+      <div className="flex items-center gap-2 text-xl font-bold text-primary">
+        <img src="/logo.svg" alt="Maia" className="h-7 w-7" />
+        Maia
+      </div>
       <div className="flex gap-6">
         {links.map((link) => (
           <NavLink
