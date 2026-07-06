@@ -16,6 +16,14 @@ import type {
   ConnectorInstance,
   RegisterConnectorRequest,
   SyncTriggerRequest,
+  ReviewItem,
+  ReviewStatus,
+  DetectorKind,
+  ReviewDecision,
+  JudgeResponse,
+  PatrolRun,
+  PatrolState,
+  DailyRollup,
 } from './types';
 
 const API_BASE = '';
@@ -222,4 +230,38 @@ export const api = {
     request<ConnectorView>(
       `/api/connectors/${encodeURIComponent(id)}/status?workspace=${encodeURIComponent(workspace)}`,
     ),
+
+  // ─── Patrol · 거버넌스 (현재 워크스페이스 대상) ───────────────
+  runPatrol: () =>
+    request<PatrolRun>(withWorkspace('/api/patrol/run'), { method: 'POST' }),
+
+  getPatrolHistory: () => request<PatrolState>(withWorkspace('/api/patrol/history')),
+
+  listReviews: (status?: ReviewStatus, kind?: DetectorKind) => {
+    const params = new URLSearchParams();
+    if (status) params.set('status', status);
+    if (kind) params.set('kind', kind);
+    const qs = params.toString();
+    return request<ReviewItem[]>(withWorkspace(`/api/review${qs ? `?${qs}` : ''}`));
+  },
+
+  judgeReviews: (ids: string[], decision: ReviewDecision) =>
+    request<JudgeResponse>(withWorkspace('/api/review/judge'), {
+      method: 'POST',
+      body: JSON.stringify({ ids, decision }),
+    }),
+
+  submitFeedback: (query: string, documentId: string) =>
+    request<void>(withWorkspace('/api/feedback'), {
+      method: 'POST',
+      body: JSON.stringify({ query, document_id: documentId }),
+    }),
+
+  getMetrics: (from?: string, until?: string) => {
+    const params = new URLSearchParams();
+    if (from) params.set('from', from);
+    if (until) params.set('until', until);
+    const qs = params.toString();
+    return request<DailyRollup[]>(withWorkspace(`/api/metrics${qs ? `?${qs}` : ''}`));
+  },
 };
