@@ -229,7 +229,9 @@ export function ApiKeysSection({
   };
 
   const create = async () => {
-    if (!label.trim()) return;
+    // 영속 키는 반드시 1개 이상의 워크스페이스로 스코프되어야 한다 (fail-closed).
+    // 스코프 없는 키는 백엔드가 400으로 거부한다.
+    if (!label.trim() || selectedWs.length === 0) return;
     setCreating(true);
     try {
       const res = await api.createKey({
@@ -295,7 +297,7 @@ export function ApiKeysSection({
               <span className="text-gray-200 font-medium">{k.label}</span>{' '}
               <span className="text-xs text-muted font-mono">({k.key_id})</span>
               <div className="text-xs text-muted">
-                {k.permissions} · ws: {k.workspaces.length ? k.workspaces.join(', ') : 'all'} ·
+                {k.permissions} · ws: {k.workspaces.length ? k.workspaces.join(', ') : 'none'} ·
                 last used: {k.last_used_at ? new Date(k.last_used_at).toLocaleString() : 'never'}
               </div>
             </div>
@@ -330,7 +332,7 @@ export function ApiKeysSection({
           <button
             className="px-4 py-2 bg-primary text-white text-sm rounded hover:bg-primary-hover transition-colors disabled:opacity-50"
             onClick={create}
-            disabled={creating || !label.trim()}
+            disabled={creating || !label.trim() || selectedWs.length === 0}
           >
             {creating ? 'Issuing...' : 'Issue Key'}
           </button>
@@ -348,8 +350,13 @@ export function ApiKeysSection({
                 {ws.id}
               </label>
             ))}
-            <span className="text-xs">(none selected = all workspaces)</span>
+            <span className="text-xs">(select at least one workspace — required)</span>
           </div>
+        )}
+        {workspaces.length === 0 && (
+          <p className="text-xs text-muted">
+            No workspaces available to scope — create a workspace first (or check your permissions).
+          </p>
         )}
       </div>
     </div>
