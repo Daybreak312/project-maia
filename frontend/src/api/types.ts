@@ -23,6 +23,28 @@ export interface IngestResponse {
   id: string;
   summary: string;
   entities: Entity[];
+  // Phase 2 에이전트 전략 메타데이터 (구버전 응답엔 없음 — 모두 옵셔널)
+  strategy?: string;
+  document_ids?: string[];
+  edges_created?: number;
+  fallback?: boolean;
+  reason?: string;
+}
+
+/** 그래프 이웃 조회 결과의 한 항목. */
+export interface NeighborView {
+  id: string;
+  summary: string;
+  depth: number;
+  relation: string;
+  via: string;
+  weight: number;
+}
+
+export interface NeighborsResponse {
+  start: string;
+  depth: number;
+  neighbors: NeighborView[];
 }
 
 export interface SearchResult {

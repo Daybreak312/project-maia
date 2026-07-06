@@ -24,7 +24,7 @@ use auth::ApiKeyManager;
 use config::Config;
 use core::Indexer;
 use settings::SettingsManager;
-use storage::{DocumentStore, QdrantStorage};
+use storage::{DocumentStore, QdrantStorage, VersionStore};
 use workspace::WorkspaceManager;
 
 /// 애플리케이션 상태
@@ -69,9 +69,11 @@ async fn main() -> anyhow::Result<()> {
     // (WorkspaceManager와 동일 루트 — 경로 정합성 보장).
     let qdrant = Arc::new(QdrantStorage::new(&config.qdrant_url).await?);
     let documents = Arc::new(DocumentStore::new(&config.data_dir).await?);
+    // 업데이트 시 이전 문서 상태를 보관하는 버전 저장소 (동일 data_dir 루트 공유).
+    let versions = Arc::new(VersionStore::new(&config.data_dir));
 
     // Indexer 초기화
-    let indexer = Indexer::new(settings.clone(), qdrant, documents);
+    let indexer = Indexer::new(settings.clone(), qdrant, documents, versions);
 
     // AppState 생성
     if config.api_key.is_some() {
@@ -94,6 +96,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/documents/:id", get(api::get_document_handler))
         .route("/documents/:id", put(api::update_document_handler))
         .route("/documents/:id", delete(api::delete_document_handler))
+        // 그래프: 이웃 조회 + 수동 엣지 추가/제거
+        .route("/documents/:id/neighbors", get(api::neighbors_handler))
+        .route("/documents/:id/edges", post(api::add_edge_handler))
+        .route("/documents/:id/edges/:target", delete(api::remove_edge_handler))
         .route("/recent", get(api::recent_handler))
         .route("/api/reindex", post(api::reindex_handler))
         .route("/api/settings", get(api::settings::get_settings))

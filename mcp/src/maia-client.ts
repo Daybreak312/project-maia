@@ -26,6 +26,27 @@ export interface IngestResponse {
   summary: string;
   entities: Entity[];
   facts?: string[];
+  // Phase 2 에이전트 전략 메타데이터 (구버전 서버는 미포함 — 모두 옵셔널)
+  strategy?: string;
+  document_ids?: string[];
+  edges_created?: number;
+  fallback?: boolean;
+  reason?: string;
+}
+
+export interface NeighborView {
+  id: string;
+  summary: string;
+  depth: number;
+  relation: string;
+  via: string;
+  weight: number;
+}
+
+export interface NeighborsResponse {
+  start: string;
+  depth: number;
+  neighbors: NeighborView[];
 }
 
 export interface Entity {
@@ -75,6 +96,17 @@ export class MaiaClient {
 
   async getDocument(id: string, workspace?: string): Promise<DocumentResponse> {
     return this.get(this.withWorkspace(`/documents/${id}`, workspace));
+  }
+
+  /** 지식 그래프에서 시작 문서의 이웃을 depth 상한과 함께 조회한다. */
+  async neighbors(
+    id: string,
+    depth: number = 1,
+    workspace?: string,
+  ): Promise<NeighborsResponse> {
+    return this.get(
+      this.withWorkspace(`/documents/${id}/neighbors?depth=${depth}`, workspace),
+    );
   }
 
   async listRecent(limit: number = 10, workspace?: string): Promise<ListResponse> {

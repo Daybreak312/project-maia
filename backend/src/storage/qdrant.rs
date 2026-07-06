@@ -5,11 +5,14 @@ use qdrant_client::qdrant::{
     SearchPointsBuilder, VectorParamsBuilder, VectorsConfig, Condition,
     PointId, Value, UpsertPointsBuilder, DeletePointsBuilder,
     ScrollPointsBuilder, CreateFieldIndexCollectionBuilder,
-    FieldType, Filter,
+    FieldType, Filter, SetPayloadPointsBuilder,
 };
 use std::collections::{HashMap, HashSet};
+use chrono::{DateTime, Utc};
 use tokio::sync::RwLock;
 use uuid::Uuid;
+
+use crate::models::Edge;
 
 const VECTOR_SIZE: u64 = 3072; // Gemini embedding-001 dimension
 
@@ -135,29 +138,37 @@ impl QdrantStorage {
         Ok(())
     }
 
-    /// 문서의 모든 chunk를 한 번에 upsert
+    /// 문서의 모든 chunk를 한 번에 upsert.
+    ///
+    /// `edges`는 문서의 그래프 간선으로, summary chunk payload에만 JSON 문자열로
+    /// 비정규화된다(문서당 1곳). raw JSON이 SSoT이고 payload는 파생물이므로,
+    /// reindex 시 raw의 `edges`가 다시 이 경로로 복원된다.
     pub async fn upsert_chunks(
         &self,
         workspace_id: &str,
         document_id: Uuid,
         summary: &str,
         created_at: &str,
+        edges: &[Edge],
         chunks: Vec<ChunkData>,
     ) -> Result<()> {
         self.ensure_collection(workspace_id).await?;
         let col_name = collection_name(workspace_id);
 
+        let edges_json = edges_to_payload(edges);
+
         let points: Vec<PointStruct> = chunks
             .into_iter()
             .map(|chunk| {
-                let mut payload: HashMap<String, Value> = HashMap::new();
-                payload.insert("document_id".to_string(), Value::from(document_id.to_string()));
-                payload.insert("chunk_type".to_string(), Value::from(chunk.chunk_type));
-                payload.insert("chunk_index".to_string(), Value::from(chunk.chunk_index as i64));
-                payload.insert("chunk_text".to_string(), Value::from(chunk.chunk_text));
-                payload.insert("summary".to_string(), Value::from(summary.to_string()));
-                payload.insert("created_at".to_string(), Value::from(created_at.to_string()));
-
+                let payload = build_chunk_payload(
+                    document_id,
+                    summary,
+                    created_at,
+                    &edges_json,
+                    &chunk.chunk_type,
+                    chunk.chunk_index,
+                    &chunk.chunk_text,
+                );
                 let point_id = Uuid::new_v4();
                 PointStruct::new(
                     PointId::from(point_id.to_string()),
@@ -173,6 +184,40 @@ impl QdrantStorage {
                 .await
                 .context("Failed to upsert chunk points")?;
         }
+
+        Ok(())
+    }
+
+    /// 문서의 summary chunk payload에 있는 엣지만 재동기화한다(재임베딩 없음).
+    ///
+    /// 엣지 추가/제거 시 raw JSON을 먼저 갱신한 뒤 호출된다. `set_payload`로
+    /// summary chunk의 `edges` 필드만 덮어써 벡터를 다시 계산하지 않는다(저비용).
+    pub async fn update_edges_payload(
+        &self,
+        workspace_id: &str,
+        document_id: Uuid,
+        edges: &[Edge],
+    ) -> Result<()> {
+        self.ensure_collection(workspace_id).await?;
+        let col_name = collection_name(workspace_id);
+
+        let mut payload: HashMap<String, Value> = HashMap::new();
+        payload.insert("edges".to_string(), Value::from(edges_to_payload(edges)));
+
+        // 대상: 해당 문서의 summary chunk (document_id AND chunk_type=summary)
+        let filter = Filter::must(vec![
+            Condition::matches("document_id", document_id.to_string()),
+            Condition::matches("chunk_type", "summary".to_string()),
+        ]);
+
+        self.client
+            .set_payload(
+                SetPayloadPointsBuilder::new(&col_name, payload)
+                    .points_selector(filter)
+                    .wait(true),
+            )
+            .await
+            .context("Failed to update edges payload")?;
 
         Ok(())
     }
@@ -223,6 +268,10 @@ impl QdrantStorage {
                 let chunk_type = extract_string(&payload, "chunk_type").unwrap_or_default();
                 let chunk_text = extract_string(&payload, "chunk_text").unwrap_or_default();
                 let summary = extract_string(&payload, "summary").unwrap_or_default();
+                let edges = extract_string(&payload, "edges")
+                    .map(|s| edges_from_payload(&s))
+                    .unwrap_or_default();
+                let created_at = parse_created_at(&payload);
 
                 Some(SearchHit {
                     id,
@@ -230,6 +279,8 @@ impl QdrantStorage {
                     chunk_type,
                     chunk_text,
                     score: point.score,
+                    edges,
+                    created_at,
                 })
             })
             .collect();
@@ -346,6 +397,10 @@ impl QdrantStorage {
                 let chunk_type = extract_string(payload, "chunk_type").unwrap_or_default();
                 let chunk_text = extract_string(payload, "chunk_text").unwrap_or_default();
                 let summary = extract_string(payload, "summary").unwrap_or_default();
+                let edges = extract_string(payload, "edges")
+                    .map(|s| edges_from_payload(&s))
+                    .unwrap_or_default();
+                let created_at = parse_created_at(payload);
 
                 all_hits.push(SearchHit {
                     id,
@@ -353,6 +408,8 @@ impl QdrantStorage {
                     chunk_type,
                     chunk_text,
                     score: 0.0,
+                    edges,
+                    created_at,
                 });
             }
 
@@ -364,6 +421,33 @@ impl QdrantStorage {
 
         Ok(all_hits)
     }
+}
+
+/// 하나의 chunk에 대한 Qdrant point payload를 구성한다.
+///
+/// 엣지는 summary chunk에만 포함된다(문서당 1곳). 순수 함수로 분리해 "summary엔
+/// edges, fact엔 없음" 불변식을 Qdrant 없이 단위 테스트로 고정한다 — 이것이
+/// reindex 엣지 생존의 payload 측 절반이다(나머지 절반은 raw JSON의 edges 보존).
+fn build_chunk_payload(
+    document_id: Uuid,
+    summary: &str,
+    created_at: &str,
+    edges_json: &str,
+    chunk_type: &str,
+    chunk_index: usize,
+    chunk_text: &str,
+) -> HashMap<String, Value> {
+    let mut payload: HashMap<String, Value> = HashMap::new();
+    payload.insert("document_id".to_string(), Value::from(document_id.to_string()));
+    payload.insert("chunk_type".to_string(), Value::from(chunk_type.to_string()));
+    payload.insert("chunk_index".to_string(), Value::from(chunk_index as i64));
+    payload.insert("chunk_text".to_string(), Value::from(chunk_text.to_string()));
+    payload.insert("summary".to_string(), Value::from(summary.to_string()));
+    payload.insert("created_at".to_string(), Value::from(created_at.to_string()));
+    if chunk_type == "summary" {
+        payload.insert("edges".to_string(), Value::from(edges_json.to_string()));
+    }
+    payload
 }
 
 /// payload에서 문자열 추출 헬퍼
@@ -384,6 +468,32 @@ pub struct SearchHit {
     pub chunk_type: String,
     pub chunk_text: String,
     pub score: f32,
+    /// summary chunk payload에서 파싱한 비정규화 엣지 (fact chunk에서는 빈 벡터).
+    pub edges: Vec<Edge>,
+    /// payload의 created_at (rfc3339) 파싱값. 시간 인식 검색용. 파싱 불가 시 None.
+    pub created_at: Option<DateTime<Utc>>,
+}
+
+/// payload의 created_at 문자열(rfc3339)을 UTC DateTime으로 파싱한다.
+fn parse_created_at(payload: &HashMap<String, Value>) -> Option<DateTime<Utc>> {
+    extract_string(payload, "created_at")
+        .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+        .map(|dt| dt.with_timezone(&Utc))
+}
+
+/// 엣지 목록을 payload 저장용 JSON 문자열로 직렬화한다.
+///
+/// 직렬화가 실패해도(사실상 불가능) 빈 배열로 폴백해 인덱싱을 막지 않는다 —
+/// payload는 파생물이므로 최악의 경우에도 raw JSON에서 reindex로 복원된다.
+pub fn edges_to_payload(edges: &[Edge]) -> String {
+    serde_json::to_string(edges).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// payload의 edges JSON 문자열을 엣지 목록으로 역직렬화한다.
+///
+/// 파싱 실패 시 빈 목록으로 폴백한다(raw JSON이 SSoT이므로 안전).
+pub fn edges_from_payload(s: &str) -> Vec<Edge> {
+    serde_json::from_str(s).unwrap_or_default()
 }
 
 /// 교차 워크스페이스 검색 결과를 RRF로 결합
@@ -446,5 +556,91 @@ mod tests {
     fn test_collection_name_prefix() {
         let name = collection_name("any");
         assert!(name.starts_with("documents_"));
+    }
+
+    // ──── 엣지 payload 직렬화 왕복 (비정규화 불변식) ────
+
+    #[test]
+    fn test_edges_payload_roundtrip() {
+        use crate::models::{Edge, RelationType};
+        let target = Uuid::new_v4();
+        let edges = vec![
+            Edge::new(target, RelationType::Updates, 0.8),
+            Edge::new(Uuid::new_v4(), RelationType::RelatedTo, 0.5),
+        ];
+        let json = edges_to_payload(&edges);
+        let restored = edges_from_payload(&json);
+
+        assert_eq!(restored.len(), 2);
+        assert_eq!(restored[0].target, target);
+        assert_eq!(restored[0].relation, RelationType::Updates);
+        assert!((restored[0].weight - 0.8).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_edges_payload_empty() {
+        let json = edges_to_payload(&[]);
+        assert_eq!(json, "[]");
+        assert!(edges_from_payload(&json).is_empty());
+    }
+
+    #[test]
+    fn test_edges_from_payload_malformed_is_empty() {
+        // 손상된/빈 payload는 빈 목록으로 폴백한다 (raw JSON이 SSoT라 안전).
+        assert!(edges_from_payload("not valid json").is_empty());
+        assert!(edges_from_payload("").is_empty());
+        assert!(edges_from_payload("{}").is_empty());
+    }
+
+    // ──── payload 빌드 (reindex 생존의 payload 측 불변식) ────
+
+    #[test]
+    fn test_build_chunk_payload_summary_includes_edges() {
+        use crate::models::{Edge, RelationType};
+        let doc_id = Uuid::new_v4();
+        let target = Uuid::new_v4();
+        let edges_json = edges_to_payload(&[Edge::new(target, RelationType::Updates, 0.5)]);
+
+        let payload = build_chunk_payload(
+            doc_id, "sum", "2026-01-01T00:00:00Z", &edges_json, "summary", 0, "text",
+        );
+
+        let stored = extract_string(&payload, "edges").expect("summary chunk엔 edges 있어야");
+        let restored = edges_from_payload(&stored);
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].target, target);
+        assert_eq!(restored[0].relation, RelationType::Updates);
+    }
+
+    #[test]
+    fn test_build_chunk_payload_fact_omits_edges() {
+        // fact chunk엔 edges 키가 없어야 한다 (문서당 1곳 원칙).
+        let doc_id = Uuid::new_v4();
+        let payload = build_chunk_payload(
+            doc_id, "sum", "2026-01-01T00:00:00Z", "[]", "fact", 1, "a fact",
+        );
+        assert!(extract_string(&payload, "edges").is_none(), "fact chunk엔 edges가 없어야 한다");
+        assert_eq!(extract_string(&payload, "chunk_type").as_deref(), Some("fact"));
+        assert_eq!(
+            extract_string(&payload, "document_id").as_deref(),
+            Some(doc_id.to_string().as_str())
+        );
+    }
+
+    #[test]
+    fn test_build_chunk_payload_reindex_survival() {
+        // reindex 생존의 payload 측: raw의 edges가 그대로 payload로 매핑되어야 한다.
+        // (이진 정확 가중치로 f32 왕복 이슈를 배제한다.)
+        use crate::models::{Edge, RelationType};
+        let edges = vec![
+            Edge::new(Uuid::new_v4(), RelationType::RelatedTo, 0.5),
+            Edge::new(Uuid::new_v4(), RelationType::PartOf, 0.25),
+        ];
+        let edges_json = edges_to_payload(&edges);
+
+        let payload = build_chunk_payload(Uuid::new_v4(), "s", "t", &edges_json, "summary", 0, "c");
+        let restored = edges_from_payload(&extract_string(&payload, "edges").unwrap());
+
+        assert_eq!(restored, edges, "raw edges가 payload 왕복 후에도 동일해야 한다(reindex 생존)");
     }
 }

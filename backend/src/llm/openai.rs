@@ -4,7 +4,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
 use crate::models::{Entity, ParsedContent};
-use super::{LlmProvider, EmbeddingProvider, ProviderType, build_parse_prompt, extract_json, parse_entity_type};
+use super::{LlmProvider, EmbeddingProvider, ProviderType, build_http_client, build_parse_prompt, extract_json, parse_entity_type};
 
 const OPENAI_API_BASE: &str = "https://api.openai.com/v1";
 
@@ -18,7 +18,7 @@ pub struct OpenAiChatProvider {
 impl OpenAiChatProvider {
     pub fn new(api_key: String) -> Self {
         Self {
-            client: Client::new(),
+            client: build_http_client(),
             api_key,
             model: "gpt-4o-mini".to_string(),
         }
@@ -92,6 +92,47 @@ impl LlmProvider for OpenAiChatProvider {
         })
     }
 
+    async fn complete(&self, prompt: &str) -> Result<String> {
+        let request = ChatRequest {
+            model: self.model.clone(),
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: prompt.to_string(),
+            }],
+            // 자유 형식 응답 (json_object 강제하지 않음).
+            response_format: None,
+        };
+
+        let response = self
+            .client
+            .post(format!("{}/chat/completions", OPENAI_API_BASE))
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("Content-Type", "application/json")
+            .json(&request)
+            .send()
+            .await
+            .context("Failed to call OpenAI API")?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let error_text = response.text().await.unwrap_or_default();
+            anyhow::bail!("OpenAI API error ({}): {}", status, error_text);
+        }
+
+        let response: ChatResponse = response
+            .json()
+            .await
+            .context("Failed to parse OpenAI response")?;
+
+        let text = response
+            .choices
+            .first()
+            .map(|c| c.message.content.clone())
+            .unwrap_or_default();
+
+        Ok(text)
+    }
+
     async fn validate_api_key(&self) -> Result<bool> {
         let response = self
             .client
@@ -114,7 +155,7 @@ pub struct OpenAiEmbeddingProvider {
 impl OpenAiEmbeddingProvider {
     pub fn new(api_key: String) -> Self {
         Self {
-            client: Client::new(),
+            client: build_http_client(),
             api_key,
             model: "text-embedding-3-small".to_string(),
         }

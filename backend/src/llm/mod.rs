@@ -8,9 +8,43 @@ pub use openai::{OpenAiChatProvider, OpenAiEmbeddingProvider};
 
 use anyhow::Result;
 use async_trait::async_trait;
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 use crate::models::ParsedContent;
+
+/// 외부 LLM/임베딩 HTTP 요청의 전체 타임아웃(초).
+///
+/// reqwest 기본값은 **타임아웃 없음**이라, 프로바이더가 연결을 열어둔 채 무응답하면
+/// `parse`/`complete`/`embed` future가 영원히 pending → ingest 요청이 무한 hang된다.
+/// 이 상한이 있어야 지연이 `Err`로 귀결되고, 상위의 raw 폴백 경로(정보 유실 0)가
+/// 비로소 발동한다(PRD 인수 조건 "타임아웃 시 폴백").
+const HTTP_TIMEOUT_SECS: u64 = 60;
+
+/// 연결 수립 타임아웃(초). 도달 불가 호스트에서 빠르게 실패하도록 한다.
+const HTTP_CONNECT_TIMEOUT_SECS: u64 = 10;
+
+/// 타임아웃이 설정된 공용 reqwest 클라이언트를 만든다(모든 provider 공용).
+///
+/// 모든 provider가 이 한 곳을 거쳐 클라이언트를 만들어, "무한 hang 방지"라는
+/// 안전 불변식이 단일 지점에서 보장된다.
+pub fn build_http_client() -> Client {
+    build_http_client_with(
+        Duration::from_secs(HTTP_TIMEOUT_SECS),
+        Duration::from_secs(HTTP_CONNECT_TIMEOUT_SECS),
+    )
+}
+
+/// 타임아웃을 파라미터로 받는 내부 빌더(테스트에서 짧은 타임아웃으로 검증한다).
+/// 빌더가 실패하는 극단적 상황에서만 무타임아웃 기본 클라이언트로 폴백한다.
+fn build_http_client_with(timeout: Duration, connect_timeout: Duration) -> Client {
+    Client::builder()
+        .timeout(timeout)
+        .connect_timeout(connect_timeout)
+        .build()
+        .unwrap_or_else(|_| Client::new())
+}
 
 /// LLM Provider 종류
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -39,6 +73,15 @@ pub trait LlmProvider: Send + Sync {
 
     /// 자연어 텍스트를 파싱하여 구조화된 데이터 반환
     async fn parse(&self, content: &str) -> Result<ParsedContent>;
+
+    /// 자유 형식 프롬프트에 대한 원문 텍스트 응답을 생성한다 (에이전트 판단용).
+    ///
+    /// `parse`가 고정 스키마(summary/entities/facts)를 강제하는 것과 달리,
+    /// `complete`는 임의 프롬프트에 대한 응답 문자열을 그대로 반환한다. 호출
+    /// 측(IngestAgent 등)이 응답을 구조화 파싱하고, 실패 시 폴백을 책임진다.
+    /// 이 메서드는 `LlmProvider`를 mock으로 대체해 에이전트 로직을 테스트하는
+    /// 확장점이기도 하다.
+    async fn complete(&self, prompt: &str) -> Result<String>;
 
     /// API Key 유효성 검증
     async fn validate_api_key(&self) -> Result<bool>;
@@ -140,5 +183,50 @@ pub fn parse_entity_type(s: &str) -> crate::models::EntityType {
         "project" => EntityType::Project,
         "location" => EntityType::Location,
         _ => EntityType::Other(s.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_build_http_client_ok() {
+        // 공용 클라이언트가 패닉/실패 없이 생성되어야 한다(타임아웃 설정 경로).
+        let _client = build_http_client();
+    }
+
+    /// 무응답(블랙홀) 서버에 대한 요청이 타임아웃으로 실패하는지 검증한다.
+    ///
+    /// reqwest 기본 `Client::new()`는 타임아웃이 없어 이 상황에서 영원히 hang된다.
+    /// 이 테스트는 `build_http_client_with`가 실제로 타임아웃을 걸어, 지연이 `Err`로
+    /// 귀결됨을 고정한다 — 상위 raw 폴백이 발동할 수 있는 전제 조건이다.
+    /// 루프백(127.0.0.1)만 사용하므로 외부 의존이 없고 결정적이다.
+    #[tokio::test]
+    async fn test_http_client_times_out_on_unresponsive_server() {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // 연결은 수락하되 응답을 절대 보내지 않는 블랙홀 서버. 수락한 소켓을 붙들어
+        // 연결이 닫히지 않게 유지한다(닫히면 타임아웃이 아닌 다른 에러가 난다).
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+
+        let client =
+            build_http_client_with(Duration::from_millis(200), Duration::from_millis(200));
+        let start = std::time::Instant::now();
+        let result = client.get(format!("http://{addr}/")).send().await;
+
+        assert!(result.is_err(), "무응답 서버 요청은 타임아웃으로 실패해야 한다");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "타임아웃이 상한 내에 발동해야 한다(무한 hang 금지)"
+        );
     }
 }

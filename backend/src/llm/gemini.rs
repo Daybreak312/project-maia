@@ -4,7 +4,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
 use crate::models::{Entity, ParsedContent};
-use super::{LlmProvider, EmbeddingProvider, ProviderType, build_parse_prompt, extract_json, parse_entity_type};
+use super::{LlmProvider, EmbeddingProvider, ProviderType, build_http_client, build_parse_prompt, extract_json, parse_entity_type};
 
 const GEMINI_API_BASE: &str = "https://generativelanguage.googleapis.com/v1beta";
 
@@ -18,7 +18,7 @@ pub struct GeminiProvider {
 impl GeminiProvider {
     pub fn new(api_key: String) -> Self {
         Self {
-            client: Client::new(),
+            client: build_http_client(),
             api_key,
             model: "gemini-2.5-flash".to_string(),
         }
@@ -95,6 +95,52 @@ impl LlmProvider for GeminiProvider {
         })
     }
 
+    async fn complete(&self, prompt: &str) -> Result<String> {
+        let url = format!(
+            "{}/models/{}:generateContent?key={}",
+            GEMINI_API_BASE, self.model, self.api_key
+        );
+
+        let request = GeminiRequest {
+            contents: vec![Content {
+                parts: vec![Part { text: prompt.to_string() }],
+            }],
+            // 자유 형식 응답 (JSON MIME 강제하지 않음). 판단은 저온도로 안정화.
+            generation_config: Some(GenerationConfig {
+                temperature: Some(0.1),
+                response_mime_type: None,
+            }),
+        };
+
+        let response = self
+            .client
+            .post(&url)
+            .json(&request)
+            .send()
+            .await
+            .context("Failed to call Gemini API")?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let error_text = response.text().await.unwrap_or_default();
+            anyhow::bail!("Gemini API error ({}): {}", status, error_text);
+        }
+
+        let response: GeminiResponse = response
+            .json()
+            .await
+            .context("Failed to parse Gemini response")?;
+
+        let text = response
+            .candidates
+            .first()
+            .and_then(|c| c.content.parts.first())
+            .map(|p| p.text.clone())
+            .unwrap_or_default();
+
+        Ok(text)
+    }
+
     async fn validate_api_key(&self) -> Result<bool> {
         let url = format!(
             "{}/models?key={}",
@@ -116,7 +162,7 @@ pub struct GeminiEmbeddingProvider {
 impl GeminiEmbeddingProvider {
     pub fn new(api_key: String) -> Self {
         Self {
-            client: Client::new(),
+            client: build_http_client(),
             api_key,
             model: "gemini-embedding-001".to_string(),
         }
