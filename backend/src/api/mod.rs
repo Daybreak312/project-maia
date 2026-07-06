@@ -86,3 +86,46 @@ pub fn require_write(ctx: &AuthContext) -> Result<(), (StatusCode, String)> {
         ))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::Permission;
+
+    fn ctx(perm: Permission) -> AuthContext {
+        AuthContext {
+            key_id: "t".to_string(),
+            permissions: perm,
+            workspaces: vec!["default".to_string()],
+            is_master: false,
+        }
+    }
+
+    #[test]
+    fn test_require_admin_only_admin_passes() {
+        assert!(require_admin(&ctx(Permission::Admin)).is_ok());
+        assert!(require_admin(&ctx(Permission::ReadWrite)).is_err());
+        assert!(require_admin(&ctx(Permission::ReadOnly)).is_err());
+        // 마스터키는 admin
+        assert!(require_admin(&AuthContext::master()).is_ok());
+    }
+
+    #[test]
+    fn test_require_admin_returns_403() {
+        let (status, _) = require_admin(&ctx(Permission::ReadOnly)).unwrap_err();
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn test_require_write_readwrite_and_admin_pass() {
+        assert!(require_write(&ctx(Permission::ReadWrite)).is_ok());
+        assert!(require_write(&ctx(Permission::Admin)).is_ok());
+        assert!(require_write(&ctx(Permission::ReadOnly)).is_err());
+    }
+
+    #[test]
+    fn test_require_write_returns_403() {
+        let (status, _) = require_write(&ctx(Permission::ReadOnly)).unwrap_err();
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+}
