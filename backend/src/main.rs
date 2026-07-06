@@ -1,6 +1,7 @@
 mod api;
 mod auth;
 mod config;
+mod connectors;
 mod core;
 mod llm;
 mod models;
@@ -22,6 +23,9 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use auth::ApiKeyManager;
 use config::Config;
+use connectors::runner::ConnectorRunner;
+use connectors::scheduler::ConnectorScheduler;
+use connectors::sync_state::SyncStateStore;
 use core::Indexer;
 use settings::SettingsManager;
 use storage::{DocumentStore, QdrantStorage, SearchLogStore, VersionStore};
@@ -29,7 +33,8 @@ use workspace::WorkspaceManager;
 
 /// 애플리케이션 상태
 pub struct AppState {
-    pub indexer: Indexer,
+    /// 인덱싱·검색 오케스트레이터. 커넥터 유입 실행기(ConnectorIngest)로도 공유되므로 Arc.
+    pub indexer: Arc<Indexer>,
     pub settings: Arc<SettingsManager>,
     /// 마스터 API 키 (MAIA_API_KEY). None이면 인증 비활성(개발 모드).
     pub api_key: Option<String>,
@@ -39,6 +44,10 @@ pub struct AppState {
     pub api_keys: Arc<ApiKeyManager>,
     /// 검색 로그 저장소 (워크스페이스별 일 단위 JSONL 축적)
     pub search_logs: Arc<SearchLogStore>,
+    /// 커넥터 동기화 실행기 (수동 트리거·상태 조회가 공유)
+    pub connector_runner: Arc<ConnectorRunner>,
+    /// 커넥터 동기화 상태 저장소 (상태 조회·삭제)
+    pub sync_state: Arc<SyncStateStore>,
 }
 
 #[tokio::main]
@@ -75,9 +84,26 @@ async fn main() -> anyhow::Result<()> {
     let versions = Arc::new(VersionStore::new(&config.data_dir));
     // 검색 로그 저장소 (동일 data_dir 루트 공유, 워크스페이스별 일 단위 JSONL).
     let search_logs = Arc::new(SearchLogStore::new(&config.data_dir));
+    // 커넥터 동기화 상태 저장소 (동일 data_dir 루트 공유).
+    let sync_state = Arc::new(SyncStateStore::new(&config.data_dir));
 
-    // Indexer 초기화
-    let indexer = Indexer::new(settings.clone(), qdrant, documents, versions);
+    // Indexer 초기화 — 커넥터 유입 실행기로도 공유되므로 Arc로 감싼다.
+    let indexer = Arc::new(Indexer::new(settings.clone(), qdrant, documents, versions));
+
+    // 커넥터 실행기 — Indexer를 ConnectorIngest로 주입. 스케줄러/API가 공유한다.
+    let connector_runner = Arc::new(ConnectorRunner::new(
+        workspaces.clone(),
+        indexer.clone(),
+        sync_state.clone(),
+    ));
+
+    // 커넥터 스케줄러 기동 — 백그라운드 태스크. 실행 오류는 격리되어 서버를 죽이지 않는다.
+    let scheduler = Arc::new(ConnectorScheduler::new(
+        connector_runner.clone(),
+        workspaces.clone(),
+        sync_state.clone(),
+    ));
+    scheduler.start();
 
     // AppState 생성
     if config.api_key.is_some() {
@@ -92,6 +118,8 @@ async fn main() -> anyhow::Result<()> {
         workspaces,
         api_keys,
         search_logs,
+        connector_runner,
+        sync_state,
     });
 
     // 인증이 필요한 API 라우트
@@ -126,6 +154,12 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/workspaces", post(api::create_workspace_handler))
         .route("/api/workspaces/:id", get(api::get_workspace_handler))
         .route("/api/workspaces/:id", delete(api::delete_workspace_handler))
+        // 커넥터 관리 (목록·상태는 워크스페이스 접근, 등록·삭제·실행은 admin — 핸들러에서 강제)
+        .route("/api/connectors", get(api::list_connectors_handler))
+        .route("/api/connectors", post(api::register_connector_handler))
+        .route("/api/connectors/:id", delete(api::delete_connector_handler))
+        .route("/api/connectors/:id/status", get(api::connector_status_handler))
+        .route("/api/connectors/:id/sync", post(api::trigger_connector_handler))
         // API 키 관리 (admin 전용 — 핸들러에서 강제)
         .route("/api/keys", get(api::list_keys_handler))
         .route("/api/keys", post(api::create_key_handler))
