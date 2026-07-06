@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { api, getAuthKey, setAuthKey } from '../api/client';
 import type {
   WorkspaceSummary,
@@ -6,6 +6,7 @@ import type {
   ApiKeyInfo,
   Permission,
   CreateKeyResponse,
+  ConnectorView,
 } from '../api/types';
 
 type Toast = (message: string, type: 'success' | 'error') => void;
@@ -358,6 +359,230 @@ export function ApiKeysSection({
             No workspaces available to scope — create a workspace first (or check your permissions).
           </p>
         )}
+      </div>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// 커넥터 관리 (Phase 4) — 로컬 디렉토리 유입 파이프라인 등록/상태/즉시 실행
+// ─────────────────────────────────────────────────────────────────────
+function formatSummary(view: ConnectorView): string {
+  const r = view.state.last_result;
+  if (view.progress?.running) {
+    return `running… ${view.progress.processed}/${view.progress.total} (new ${view.progress.created}, upd ${view.progress.updated}, fail ${view.progress.failed})`;
+  }
+  if (!r) return 'never synced';
+  const when = view.state.last_run_at
+    ? new Date(view.state.last_run_at).toLocaleString()
+    : 'unknown';
+  return `${when} · processed ${r.processed}, new ${r.created}, upd ${r.updated}, skip ${r.skipped}, fail ${r.failed}`;
+}
+
+export function ConnectorsSection({
+  showToast,
+  workspaces,
+}: {
+  showToast: Toast;
+  workspaces: WorkspaceSummary[];
+}) {
+  const [selectedWs, setSelectedWs] = useState('default');
+  const [connectors, setConnectors] = useState<ConnectorView[]>([]);
+  // 등록 폼
+  const [newId, setNewId] = useState('');
+  const [dirs, setDirs] = useState('');
+  const [extensions, setExtensions] = useState('md, markdown, txt');
+  const [intervalMins, setIntervalMins] = useState(60);
+  const [creating, setCreating] = useState(false);
+
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  const load = useCallback(async () => {
+    try {
+      setConnectors(await api.listConnectors(selectedWs));
+    } catch {
+      // 권한 부족·워크스페이스 없음 등은 조용히 빈 목록.
+      setConnectors([]);
+    }
+  }, [selectedWs]);
+
+  // 선택 워크스페이스가 바뀌면 다시 로드하고, 5초 주기로 상태를 폴링한다(진행 관측).
+  useEffect(() => {
+    load();
+    pollRef.current = setInterval(load, 5000);
+    return () => {
+      if (pollRef.current) clearInterval(pollRef.current);
+    };
+  }, [load]);
+
+  const register = async () => {
+    const directories = dirs.split(',').map((s) => s.trim()).filter(Boolean);
+    if (!newId.trim() || directories.length === 0) return;
+    setCreating(true);
+    try {
+      await api.registerConnector(selectedWs, {
+        id: newId.trim(),
+        interval_secs: Math.max(1, intervalMins) * 60,
+        spec: {
+          type: 'local_directory',
+          directories,
+          extensions: extensions.split(',').map((s) => s.trim()).filter(Boolean),
+          exclude: [],
+          max_file_bytes: 1_048_576,
+        },
+      });
+      showToast(`Connector '${newId.trim()}' registered`, 'success');
+      setNewId('');
+      setDirs('');
+      await load();
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : 'Failed to register connector', 'error');
+    } finally {
+      setCreating(false);
+    }
+  };
+
+  const triggerSync = async (id: string, full: boolean, mode: 'parsed' | 'raw') => {
+    try {
+      await api.triggerConnectorSync(selectedWs, id, { full, mode });
+      showToast(`Sync started for '${id}'${full ? ' (full)' : ''}`, 'success');
+      // 잠시 뒤 진행이 반영되도록 즉시 한 번 새로고침.
+      setTimeout(load, 500);
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : 'Failed to start sync', 'error');
+    }
+  };
+
+  const remove = async (id: string) => {
+    if (!confirm(`Delete connector '${id}'? Ingested documents are kept; only the source link is removed.`))
+      return;
+    try {
+      await api.deleteConnector(selectedWs, id);
+      showToast(`Connector '${id}' deleted`, 'success');
+      await load();
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : 'Failed to delete connector', 'error');
+    }
+  };
+
+  return (
+    <div className="bg-card border border-border rounded-lg p-6">
+      <div className="flex justify-between items-center mb-4">
+        <h3 className="text-lg font-semibold text-gray-200">Connectors</h3>
+        <select
+          className="bg-bg border border-border rounded px-3 py-1.5 text-sm text-gray-200 focus:outline-none focus:border-primary"
+          value={selectedWs}
+          onChange={(e) => setSelectedWs(e.target.value)}
+        >
+          {workspaces.length === 0 && <option value="default">default</option>}
+          {workspaces.map((ws) => (
+            <option key={ws.id} value={ws.id}>
+              {ws.id}
+            </option>
+          ))}
+        </select>
+      </div>
+
+      <div className="flex flex-col gap-2 mb-4">
+        {connectors.length === 0 && (
+          <p className="text-sm text-muted">No connectors registered in this workspace.</p>
+        )}
+        {connectors.map((c) => (
+          <div key={c.instance.id} className="bg-bg border border-border rounded px-3 py-2">
+            <div className="flex justify-between items-start gap-2">
+              <div className="text-sm min-w-0">
+                <span className="text-gray-200 font-medium">{c.instance.id}</span>{' '}
+                <span className="text-xs text-muted">· {c.instance.spec.type}</span>{' '}
+                <span className="text-xs text-muted">
+                  · every {Math.round(c.instance.interval_secs / 60)}m
+                </span>{' '}
+                {!c.instance.enabled && (
+                  <span className="text-xs text-error">· disabled</span>
+                )}
+                <div className="text-xs text-muted truncate">
+                  dirs: {c.instance.spec.directories.join(', ')}
+                </div>
+                <div className="text-xs text-muted">{formatSummary(c)}</div>
+                {c.state.last_result && c.state.last_result.failures.length > 0 && (
+                  <div className="text-xs text-error">
+                    failures: {c.state.last_result.failures.length} (e.g.{' '}
+                    {c.state.last_result.failures[0].source_id})
+                  </div>
+                )}
+              </div>
+              <div className="flex flex-col gap-1 shrink-0">
+                <button
+                  className="px-3 py-1 bg-primary text-white text-xs rounded hover:bg-primary-hover transition-colors disabled:opacity-50"
+                  onClick={() => triggerSync(c.instance.id, false, 'parsed')}
+                  disabled={c.progress?.running}
+                >
+                  Sync
+                </button>
+                <button
+                  className="px-3 py-1 bg-border text-gray-200 text-xs rounded hover:bg-muted transition-colors disabled:opacity-50"
+                  onClick={() => triggerSync(c.instance.id, true, 'parsed')}
+                  disabled={c.progress?.running}
+                  title="Ignore cursor and rescan all files"
+                >
+                  Full
+                </button>
+                <button
+                  className="px-3 py-1 bg-error text-white text-xs rounded hover:bg-red-700 transition-colors"
+                  onClick={() => remove(c.instance.id)}
+                >
+                  Delete
+                </button>
+              </div>
+            </div>
+          </div>
+        ))}
+      </div>
+
+      {/* 등록 폼 (로컬 디렉토리) */}
+      <div className="border-t border-border pt-4 flex flex-col gap-2">
+        <div className="flex flex-wrap gap-2 items-center">
+          <input
+            className="w-32 bg-bg border border-border rounded px-3 py-2 text-sm text-gray-200 focus:outline-none focus:border-primary"
+            placeholder="id (e.g. notes)"
+            value={newId}
+            onChange={(e) => setNewId(e.target.value)}
+          />
+          <input
+            className="flex-1 min-w-[16rem] bg-bg border border-border rounded px-3 py-2 text-sm text-gray-200 focus:outline-none focus:border-primary"
+            placeholder="directories (comma-separated absolute paths)"
+            value={dirs}
+            onChange={(e) => setDirs(e.target.value)}
+          />
+        </div>
+        <div className="flex flex-wrap gap-2 items-center">
+          <input
+            className="w-48 bg-bg border border-border rounded px-3 py-2 text-sm text-gray-200 focus:outline-none focus:border-primary"
+            placeholder="extensions"
+            value={extensions}
+            onChange={(e) => setExtensions(e.target.value)}
+          />
+          <label className="text-xs text-muted flex items-center gap-1">
+            interval (min)
+            <input
+              type="number"
+              min={1}
+              className="w-20 bg-bg border border-border rounded px-2 py-2 text-sm text-gray-200 focus:outline-none focus:border-primary"
+              value={intervalMins}
+              onChange={(e) => setIntervalMins(Number(e.target.value) || 1)}
+            />
+          </label>
+          <button
+            className="px-4 py-2 bg-primary text-white text-sm rounded hover:bg-primary-hover transition-colors disabled:opacity-50"
+            onClick={register}
+            disabled={creating || !newId.trim() || !dirs.trim()}
+          >
+            {creating ? 'Registering...' : 'Register'}
+          </button>
+        </div>
+        <p className="text-xs text-muted">
+          Local directory connector: scans registered dirs for changed markdown/text and ingests
+          them (incremental, de-duplicated by source path).
+        </p>
       </div>
     </div>
   );

@@ -12,6 +12,10 @@ import type {
   ApiKeyInfo,
   CreateKeyRequest,
   CreateKeyResponse,
+  ConnectorView,
+  ConnectorInstance,
+  RegisterConnectorRequest,
+  SyncTriggerRequest,
 } from './types';
 
 const API_BASE = '';
@@ -191,4 +195,31 @@ export const api = {
     request<void>(`/api/keys/${encodeURIComponent(keyId)}`, {
       method: 'DELETE',
     }),
+
+  // ─── 커넥터 관리 (workspace 명시) ────────────────────────────
+  listConnectors: (workspace: string) =>
+    request<ConnectorView[]>(`/api/connectors?workspace=${encodeURIComponent(workspace)}`),
+
+  registerConnector: (workspace: string, body: RegisterConnectorRequest) =>
+    request<ConnectorInstance>(`/api/connectors?workspace=${encodeURIComponent(workspace)}`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+
+  deleteConnector: (workspace: string, id: string) =>
+    request<void>(
+      `/api/connectors/${encodeURIComponent(id)}?workspace=${encodeURIComponent(workspace)}`,
+      { method: 'DELETE' },
+    ),
+
+  triggerConnectorSync: (workspace: string, id: string, body: SyncTriggerRequest = {}) =>
+    request<{ status: string; workspace: string; connector_id: string }>(
+      `/api/connectors/${encodeURIComponent(id)}/sync?workspace=${encodeURIComponent(workspace)}`,
+      { method: 'POST', body: JSON.stringify(body) },
+    ),
+
+  getConnectorStatus: (workspace: string, id: string) =>
+    request<ConnectorView>(
+      `/api/connectors/${encodeURIComponent(id)}/status?workspace=${encodeURIComponent(workspace)}`,
+    ),
 };
