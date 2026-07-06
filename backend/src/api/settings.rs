@@ -105,11 +105,16 @@ pub struct TestApiKeyResponse {
     pub message: String,
 }
 
-/// POST /api/settings/models/{provider}/test - API Key 유효성 검증
+/// POST /api/settings/models/{provider}/test - API Key 유효성 검증 (admin)
+///
+/// 저장된 provider 키로 외부 validate 호출을 유발하므로(비용/레이트리밋 소진),
+/// 설정 mutating 형제 엔드포인트와 동일하게 admin 권한을 요구한다.
 pub async fn test_api_key(
     State(state): State<Arc<AppState>>,
+    Extension(ctx): Extension<AuthContext>,
     Path(provider): Path<ProviderType>,
 ) -> Result<Json<TestApiKeyResponse>, (StatusCode, String)> {
+    require_admin(&ctx)?;
     let api_key = state.settings.get_api_key(provider).await
         .ok_or((StatusCode::BAD_REQUEST, "API key not configured".to_string()))?;
 
