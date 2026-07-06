@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Result};
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -6,8 +7,12 @@ use uuid::Uuid;
 
 use crate::core::search::{BM25Scorer, SearchMode, reciprocal_rank_fusion};
 use crate::core::ingest_agent::{CandidateDoc, IngestAgent, IngestStrategy, DEFAULT_EDGE_WEIGHT};
+use crate::core::search_agent::{
+    expansion_score, DeepSearchParams, ExpandOrigin, SearchAgent, SearchBackend,
+    DEFAULT_DEEP_SEARCH_MAX_RESULTS,
+};
 use crate::llm::{create_llm_provider, create_embedding_provider, LlmProvider, EmbeddingProvider};
-use crate::models::{Document, Edge, RelationType, api::{IngestResponse, IngestOutcome, SearchResponse, SearchResult}};
+use crate::models::{Document, Edge, RelationType, api::{AgentSearchMeta, IngestResponse, IngestOutcome, SearchResponse, SearchResult}};
 use crate::settings::SettingsManager;
 use crate::storage::{DocumentStore, QdrantStorage, SearchHit, ChunkData, VersionStore};
 
@@ -638,6 +643,7 @@ impl Indexer {
             sources_used,
             total: filtered_total,
             mode: format!("{:?}", search_mode).to_lowercase(),
+            agent: None,
         })
     }
 
@@ -694,6 +700,7 @@ impl Indexer {
                 workspace: workspace_id.to_string(),
                 matched_facts: group.matched_facts,
                 created_at: group.created_at,
+                expanded_from: None,
             })
             .collect();
 
@@ -743,6 +750,7 @@ impl Indexer {
                     workspace: workspace_id.to_string(),
                     matched_facts: vec![],
                     created_at: doc.created_at,
+                    expanded_from: None,
                 })
             })
             .collect();
@@ -808,6 +816,7 @@ impl Indexer {
                     workspace: workspace_id.to_string(),
                     matched_facts: doc.matched_facts.clone(),
                     created_at: doc.created_at,
+                    expanded_from: None,
                 })
             })
             .collect();
@@ -1122,9 +1131,105 @@ impl Indexer {
             sources_used,
             total,
             mode: format!("{:?}", mode_label).to_lowercase(),
+            agent: None,
         })
     }
 
+    /// agent(deep) 검색 — Search Agent가 충분성 평가·쿼리 재작성·그래프 확장으로
+    /// 능동 탐색한다. 자기 자신을 `SearchBackend`로 주입해 실제 검색·확장 I/O를 제공하고,
+    /// LLM provider는 있으면 판단에 사용하되 없으면(미설정) 에이전트가 폴백한다.
+    ///
+    /// **에러를 삼키지 않되 결과로 귀결**: LLM 실패·미설정은 폴백(초기 결과 + 표시)으로
+    /// 흡수되어 항상 `SearchResponse`를 반환한다(agent 메타데이터에 폴백 사유 명시).
+    ///
+    /// `workspace_ids`는 호출 전에 접근 권한·존재 여부로 이미 필터링되어 있어야 한다
+    /// (교차 워크스페이스 조합 가능 — Phase 1 기능 위에서 동작).
+    pub async fn deep_search_across_workspaces(
+        &self,
+        query: String,
+        workspace_ids: &[String],
+        params: DeepSearchParams,
+    ) -> Result<SearchResponse> {
+        // LLM provider는 판단용 — 미확보 시 None으로 넘겨 에이전트가 폴백을 처리한다.
+        let llm = self.get_llm_provider().await.ok();
+        let agent = SearchAgent::new();
+
+        let outcome = agent
+            .deep_search(self, llm.as_deref(), &query, workspace_ids, params)
+            .await;
+
+        let sources_used: Vec<Uuid> = outcome.results.iter().map(|r| r.id).collect();
+        let total = outcome.results.len();
+
+        Ok(SearchResponse {
+            results: outcome.results,
+            sources_used,
+            total,
+            mode: "agent".to_string(),
+            agent: Some(AgentSearchMeta {
+                rounds: outcome.rounds,
+                queries: outcome.queries,
+                graph_expanded: outcome.graph_expanded,
+                expansion_count: outcome.expansion_count,
+                fallback: outcome.fallback,
+                reason: outcome.reason,
+            }),
+        })
+    }
+
+}
+
+/// Indexer를 Search Agent의 검색 백엔드로 노출한다. 에이전트 파이프라인이 Qdrant·
+/// DocumentStore에 직접 의존하지 않고 이 얇은 어댑터를 통해서만 I/O한다.
+#[async_trait]
+impl SearchBackend for Indexer {
+    /// 한 라운드 검색 — 기존 교차 워크스페이스 hybrid 검색 파이프라인을 그대로 재사용한다
+    /// (관련성 필터링·점수 부여가 이미 끝난 결과를 반환).
+    async fn run_search(&self, query: &str, workspaces: &[String]) -> Result<Vec<SearchResult>> {
+        let resp = self
+            .search_across_workspaces(
+                query.to_string(),
+                DEFAULT_DEEP_SEARCH_MAX_RESULTS,
+                0,
+                None, // 기본 모드(hybrid)
+                workspaces,
+                TimeSearchOptions::default(),
+            )
+            .await?;
+        Ok(resp.results)
+    }
+
+    /// 출처 문서들의 그래프 이웃을 확장한다. 각 출처를 그 워크스페이스에서 개별
+    /// 탐색해 유래(`expanded_from`)를 명확히 하고, 점수는 출처 점수와 엣지 가중치에서
+    /// 파생한다. 한 출처의 이웃 조회 실패는 전체를 막지 않는다(best-effort).
+    async fn expand(&self, origins: &[ExpandOrigin], depth: usize) -> Result<Vec<SearchResult>> {
+        let mut out: Vec<SearchResult> = Vec::new();
+        for origin in origins {
+            let nodes = match self
+                .documents
+                .neighbors(origin.id, depth, &origin.workspace)
+                .await
+            {
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::warn!("그래프 확장 이웃 조회 실패({}): {}", origin.id, e);
+                    continue;
+                }
+            };
+            for node in nodes {
+                out.push(SearchResult {
+                    id: node.document.id,
+                    summary: node.document.summary.clone(),
+                    relevance_score: expansion_score(origin.score, node.weight),
+                    workspace: origin.workspace.clone(),
+                    matched_facts: Vec::new(),
+                    created_at: Some(node.document.created_at),
+                    expanded_from: Some(origin.id),
+                });
+            }
+        }
+        Ok(out)
+    }
 }
 
 /// 교차 검색 대상 워크스페이스 집합을 계산한다.
@@ -1429,6 +1534,7 @@ mod tests {
             workspace: "default".to_string(),
             matched_facts: vec![],
             created_at,
+            expanded_from: None,
         }
     }
 

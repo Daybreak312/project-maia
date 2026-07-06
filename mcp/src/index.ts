@@ -114,6 +114,102 @@ INTERPRETING RESULTS:
   },
 );
 
+// ─── Tool: deep_search ───────────────────────────────────────────────
+server.tool(
+  "deep_search",
+  `Deeply recall everything related to a topic from the user's knowledge base (Maia).
+
+Unlike search_context (a single-shot lookup), this runs the server's Search Agent:
+it evaluates whether the initial results are sufficient, rewrites the query to cover
+missed angles (bounded rounds), walks the knowledge graph to pull in connected
+documents, then de-duplicates and re-ranks into one broader result set.
+
+USE THIS (instead of search_context) when:
+- The user wants EVERYTHING about a topic/entity ("all about company A", "이사 관련 전부")
+- A first search felt incomplete and you suspect related context exists
+- You need the full cluster of connected knowledge, not just the top matches
+
+INTERPRETING RESULTS:
+- Results are a synthesized cluster (no duplicates, ranked by relevance).
+- expanded_from marks a result pulled in via the graph (neighbor of another result).
+- The exploration summary reports rounds, the queries tried, and whether the graph was
+  walked. If fallback is true, the LLM was unavailable and these are the initial results
+  (still valid — just not agent-expanded).
+- If nothing is found, the tried queries are shown — treat as a genuine knowledge gap,
+  do NOT fabricate an answer.`,
+  {
+    query: z.string().describe("Natural language topic to recall broadly"),
+    workspace: workspaceArg,
+  },
+  async ({ query, workspace }) => {
+    const res = await client.deepSearch(query, resolveWorkspace(workspace));
+    const meta = res.agent;
+
+    // 탐색 과정 요약 라인 (관측성 — 어떻게 회상했는지).
+    const summaryLines: string[] = [];
+    if (meta) {
+      summaryLines.push(
+        `Exploration: ${meta.rounds} round(s), queries tried: ${meta.queries
+          .map((q) => `"${q}"`)
+          .join(", ")}`,
+      );
+      if (meta.graph_expanded) {
+        summaryLines.push(`Graph expansion: ${meta.expansion_count} connected document(s) added`);
+      }
+      if (meta.fallback) {
+        summaryLines.push(
+          `⚠ Fallback: agent judgement unavailable — showing initial results (${meta.reason})`,
+        );
+      }
+    }
+
+    if (res.results.length === 0) {
+      const triedNote = meta ? `\n\n${summaryLines.join("\n")}` : "";
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `No related knowledge found for "${query}". The user likely hasn't stored this yet — do not fabricate.${triedNote}`,
+          },
+        ],
+      };
+    }
+
+    const formatted = res.results
+      .map((r, i) => {
+        const lines = [
+          `[${i + 1}] ${r.summary}`,
+          `    relevance: ${(r.relevance_score * 100).toFixed(0)}%`,
+        ];
+        if (r.workspace) {
+          lines.push(`    workspace: ${r.workspace}`);
+        }
+        if (r.expanded_from) {
+          lines.push(`    ↳ via graph (neighbor of ${r.expanded_from})`);
+        }
+        if (r.matched_facts && r.matched_facts.length > 0) {
+          lines.push(`    matched_facts:`);
+          r.matched_facts.forEach((f) => lines.push(`      - ${f}`));
+        }
+        lines.push(`    id: ${r.id}`);
+        return lines.join("\n");
+      })
+      .join("\n\n");
+
+    const header = `Recalled ${res.results.length} related entries:`;
+    const footer = summaryLines.length > 0 ? `\n\n${summaryLines.join("\n")}` : "";
+
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: `${header}\n\n${formatted}${footer}`,
+        },
+      ],
+    };
+  },
+);
+
 // ─── Tool: ingest_information ────────────────────────────────────────
 server.tool(
   "ingest_information",

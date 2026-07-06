@@ -50,6 +50,25 @@ pub struct SearchConfig {
     pub default_mode: String,
     /// 교차 검색 허용 워크스페이스 ID 목록
     pub cross_workspace: Vec<String>,
+    /// agent(deep) 검색의 그래프 이웃 확장 깊이 (Phase 3).
+    /// 0이면 확장 비활성, [1, MAX_NEIGHBOR_DEPTH]로 클램프된다.
+    /// `#[serde(default)]`로 이 필드가 없는 기존 config.json도 로드된다(하위호환).
+    #[serde(default = "default_graph_expansion_depth")]
+    pub graph_expansion_depth: usize,
+    /// agent(deep) 검색 전체 파이프라인 시간 상한(ms, Phase 3).
+    /// 초과 시 그 시점까지의 결과를 반환한다. 0이면 재작성 루프를 돌지 않는다(초기 결과만).
+    #[serde(default = "default_deep_search_time_limit_ms")]
+    pub deep_search_time_limit_ms: u64,
+}
+
+/// agent 검색 그래프 확장 깊이 기본값 — 1-hop 이웃(가장 관련 높은 직접 연결).
+fn default_graph_expansion_depth() -> usize {
+    1
+}
+
+/// agent 검색 시간 상한 기본값(ms) — 다중 라운드 LLM 호출을 감안한 보수적 상한.
+fn default_deep_search_time_limit_ms() -> u64 {
+    15_000
 }
 
 impl WorkspaceConfig {
@@ -99,6 +118,8 @@ impl WorkspaceConfig {
                 time_decay_lambda: 0.01,
                 default_mode: "hybrid".to_string(),
                 cross_workspace: vec![],
+                graph_expansion_depth: default_graph_expansion_depth(),
+                deep_search_time_limit_ms: default_deep_search_time_limit_ms(),
             },
         )
     }
@@ -122,6 +143,9 @@ impl WorkspaceConfig {
                 time_decay_lambda: 0.005,
                 default_mode: "hybrid".to_string(),
                 cross_workspace: vec![],
+                // enterprise는 문서 간 관계 탐색 수요가 커 확장을 2-hop으로 넓힌다.
+                graph_expansion_depth: 2,
+                deep_search_time_limit_ms: default_deep_search_time_limit_ms(),
             },
         )
     }
@@ -192,6 +216,26 @@ mod tests {
     }
 
     #[test]
+    fn test_config_deserialize_legacy_search_without_phase3_fields() {
+        // Phase 3 이전에 저장된 config.json(search에 graph_expansion_depth/
+        // deep_search_time_limit_ms 없음)도 serde default로 로드되어야 한다(하위호환).
+        // 이 불변식이 깨지면 기동 시 기존 워크스페이스 설정 파싱이 실패해 브릭된다.
+        let json = r#"{
+            "id": "legacy",
+            "name": "Legacy",
+            "created_at": "2026-04-01T00:00:00Z",
+            "template": "personal",
+            "patrol": {"frequency": "weekly", "strictness": 0.3},
+            "parsing": {"entity_priorities": [], "fact_depth": "deep", "llm_provider": null},
+            "search": {"time_decay_lambda": 0.01, "default_mode": "hybrid", "cross_workspace": []}
+        }"#;
+
+        let config: WorkspaceConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.search.graph_expansion_depth, 1, "누락 필드는 기본값 1");
+        assert_eq!(config.search.deep_search_time_limit_ms, 15_000, "누락 필드는 기본값 15초");
+    }
+
+    #[test]
     fn test_config_serialize_template_lowercase() {
         let personal = serde_json::to_string(&WorkspaceTemplate::Personal).unwrap();
         assert_eq!(personal, "\"personal\"");
@@ -220,6 +264,8 @@ mod tests {
         assert!(config.parsing.llm_provider.is_none());
         assert_eq!(config.search.default_mode, "hybrid");
         assert!(config.search.cross_workspace.is_empty());
+        assert_eq!(config.search.graph_expansion_depth, 1);
+        assert_eq!(config.search.deep_search_time_limit_ms, 15_000);
     }
 
     #[test]
@@ -238,6 +284,8 @@ mod tests {
             .entity_priorities
             .contains(&"service".to_string()));
         assert!((config.search.time_decay_lambda - 0.005).abs() < f32::EPSILON);
+        // enterprise는 관계 탐색 수요가 커 확장 깊이가 personal(1)보다 깊다.
+        assert_eq!(config.search.graph_expansion_depth, 2);
     }
 
     #[test]
