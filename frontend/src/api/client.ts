@@ -6,17 +6,70 @@ import type {
   ListResponse,
   ListOptions,
   SettingsResponse,
+  WorkspaceSummary,
+  CreateWorkspaceRequest,
+  ApiKeyInfo,
+  CreateKeyRequest,
+  CreateKeyResponse,
 } from './types';
 
 const API_BASE = '';
 
+// ─── 워크스페이스 & 웹 UI 인증 키 상태 (localStorage 영속) ───────────────
+// 별도 상태 라이브러리 없이 client 모듈이 단일 진실 원천 역할을 한다.
+const WORKSPACE_KEY = 'maia_workspace';
+const AUTH_KEY = 'maia_auth_key';
+
+let currentWorkspace = localStorage.getItem(WORKSPACE_KEY) || '';
+let authKey = localStorage.getItem(AUTH_KEY) || '';
+
+/** 현재 선택된 워크스페이스. 빈 문자열이면 서버의 키 기본값을 사용한다. */
+export function getWorkspace(): string {
+  return currentWorkspace;
+}
+
+export function setWorkspace(id: string): void {
+  currentWorkspace = id;
+  if (id) {
+    localStorage.setItem(WORKSPACE_KEY, id);
+  } else {
+    localStorage.removeItem(WORKSPACE_KEY);
+  }
+}
+
+/** 웹 UI가 admin 작업에 사용할 Bearer 키 (마스터키 또는 admin 키). */
+export function getAuthKey(): string {
+  return authKey;
+}
+
+export function setAuthKey(key: string): void {
+  authKey = key;
+  if (key) {
+    localStorage.setItem(AUTH_KEY, key);
+  } else {
+    localStorage.removeItem(AUTH_KEY);
+  }
+}
+
+/** 현재 워크스페이스를 쿼리 파라미터로 덧붙인다. */
+function withWorkspace(path: string): string {
+  if (!currentWorkspace) return path;
+  const sep = path.includes('?') ? '&' : '?';
+  return `${path}${sep}workspace=${encodeURIComponent(currentWorkspace)}`;
+}
+
 async function request<T>(endpoint: string, options?: RequestInit): Promise<T> {
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    ...(options?.headers as Record<string, string>),
+  };
+  if (authKey) {
+    headers['Authorization'] = `Bearer ${authKey}`;
+  }
+
   const response = await fetch(`${API_BASE}${endpoint}`, {
-    headers: {
-      'Content-Type': 'application/json',
-      ...options?.headers,
-    },
     ...options,
+    headers,
   });
 
   if (!response.ok) {
@@ -34,14 +87,14 @@ async function request<T>(endpoint: string, options?: RequestInit): Promise<T> {
 export const api = {
   // Ingest
   ingest: (content: string) =>
-    request<IngestResponse>('/ingest', {
+    request<IngestResponse>(withWorkspace('/ingest'), {
       method: 'POST',
       body: JSON.stringify({ content }),
     }),
 
   // Search with options
   search: (options: SearchOptions) =>
-    request<SearchResponse>('/search', {
+    request<SearchResponse>(withWorkspace('/search'), {
       method: 'POST',
       body: JSON.stringify({
         query: options.query,
@@ -52,16 +105,16 @@ export const api = {
     }),
 
   // Documents
-  getDocument: (id: string) => request<Document>(`/documents/${id}`),
+  getDocument: (id: string) => request<Document>(withWorkspace(`/documents/${id}`)),
 
   updateDocument: (id: string, content: string) =>
-    request<IngestResponse>(`/documents/${id}`, {
+    request<IngestResponse>(withWorkspace(`/documents/${id}`), {
       method: 'PUT',
       body: JSON.stringify({ content }),
     }),
 
   deleteDocument: (id: string) =>
-    request<void>(`/documents/${id}`, {
+    request<void>(withWorkspace(`/documents/${id}`), {
       method: 'DELETE',
     }),
 
@@ -70,7 +123,7 @@ export const api = {
     const params = new URLSearchParams();
     params.set('limit', String(options.limit ?? 20));
     params.set('offset', String(options.offset ?? 0));
-    return request<ListResponse>(`/recent?${params.toString()}`);
+    return request<ListResponse>(withWorkspace(`/recent?${params.toString()}`));
   },
 
   // Settings
@@ -98,9 +151,37 @@ export const api = {
       method: 'POST',
     }),
 
-  // Reindex
+  // Reindex (현재 워크스페이스 대상)
   reindex: () =>
-    request<{ indexed: number }>('/api/reindex', {
+    request<{ indexed: number }>(withWorkspace('/api/reindex'), {
       method: 'POST',
+    }),
+
+  // ─── 워크스페이스 관리 (admin) ───────────────────────────────
+  listWorkspaces: () => request<WorkspaceSummary[]>('/api/workspaces'),
+
+  createWorkspace: (body: CreateWorkspaceRequest) =>
+    request<WorkspaceSummary>('/api/workspaces', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+
+  deleteWorkspace: (id: string) =>
+    request<void>(`/api/workspaces/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+    }),
+
+  // ─── API 키 관리 (admin) ─────────────────────────────────────
+  listKeys: () => request<ApiKeyInfo[]>('/api/keys'),
+
+  createKey: (body: CreateKeyRequest) =>
+    request<CreateKeyResponse>('/api/keys', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+
+  revokeKey: (keyId: string) =>
+    request<void>(`/api/keys/${encodeURIComponent(keyId)}`, {
+      method: 'DELETE',
     }),
 };

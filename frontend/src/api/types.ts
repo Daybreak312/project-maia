@@ -29,6 +29,8 @@ export interface SearchResult {
   id: string;
   summary: string;
   relevance_score: number;
+  /** 결과 출처 워크스페이스 (교차 검색 시 구분) */
+  workspace?: string;
 }
 
 export interface SearchResponse {
@@ -67,4 +69,53 @@ export interface SettingsResponse {
   providers: ProviderInfo[];
   parsing_provider: string | null;
   embedding_provider: string | null;
+}
+
+// ─── 워크스페이스 ────────────────────────────────────────────────
+export type WorkspaceTemplate = 'personal' | 'enterprise';
+
+/** 백엔드 WorkspaceConfig 중 프론트에서 사용하는 필드 (전체 구조의 부분집합). */
+export interface WorkspaceSummary {
+  id: string;
+  name: string;
+  template: WorkspaceTemplate;
+  created_at: string;
+  search: {
+    cross_workspace: string[];
+    default_mode: string;
+    time_decay_lambda: number;
+  };
+}
+
+export interface CreateWorkspaceRequest {
+  id: string;
+  name: string;
+  template?: WorkspaceTemplate;
+}
+
+// ─── API 키 ──────────────────────────────────────────────────────
+export type Permission = 'read_only' | 'read_write' | 'admin';
+
+/** 키 공개 뷰 (해시 미포함). */
+export interface ApiKeyInfo {
+  key_id: string;
+  label: string;
+  workspaces: string[];
+  permissions: Permission;
+  created_at: string;
+  last_used_at: string | null;
+  expires_at: string | null;
+}
+
+export interface CreateKeyRequest {
+  label: string;
+  workspaces: string[];
+  permissions: Permission;
+  expires_at?: string | null;
+}
+
+export interface CreateKeyResponse {
+  /** 평문 키 — 이 응답에서만 확인 가능 */
+  api_key: string;
+  key: ApiKeyInfo;
 }

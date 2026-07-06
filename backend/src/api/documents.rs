@@ -1,12 +1,14 @@
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
-    Json,
+    Extension, Json,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use uuid::Uuid;
 
+use crate::api::{require_write, resolve_and_authorize_workspace, WorkspaceQuery};
+use crate::auth::AuthContext;
 use crate::models::api::{DocumentResponse, IngestResponse};
 use crate::AppState;
 
@@ -17,11 +19,15 @@ pub struct UpdateRequest {
 
 pub async fn get_document_handler(
     State(state): State<Arc<AppState>>,
+    Extension(ctx): Extension<AuthContext>,
     Path(id): Path<Uuid>,
+    Query(wq): Query<WorkspaceQuery>,
 ) -> Result<Json<DocumentResponse>, (StatusCode, String)> {
+    let workspace = resolve_and_authorize_workspace(&state, &ctx, wq.workspace).await?;
+
     state
         .indexer
-        .get_document(id)
+        .get_document_from_workspace(id, &workspace)
         .await
         .map(|doc| {
             Json(DocumentResponse {
@@ -44,6 +50,9 @@ pub struct RecentQuery {
     pub limit: usize,
     #[serde(default)]
     pub offset: usize,
+    /// 대상 워크스페이스 (미지정 시 키 기본값)
+    #[serde(default)]
+    pub workspace: Option<String>,
 }
 
 fn default_limit() -> usize {
@@ -60,11 +69,14 @@ pub struct ListResponse {
 
 pub async fn recent_handler(
     State(state): State<Arc<AppState>>,
+    Extension(ctx): Extension<AuthContext>,
     Query(query): Query<RecentQuery>,
 ) -> Result<Json<ListResponse>, (StatusCode, String)> {
+    let workspace = resolve_and_authorize_workspace(&state, &ctx, query.workspace.clone()).await?;
+
     state
         .indexer
-        .recent(query.limit, query.offset)
+        .recent_in_workspace(query.limit, query.offset, &workspace)
         .await
         .map(|(docs, total)| {
             Json(ListResponse {
@@ -91,12 +103,17 @@ pub async fn recent_handler(
 
 pub async fn update_document_handler(
     State(state): State<Arc<AppState>>,
+    Extension(ctx): Extension<AuthContext>,
     Path(id): Path<Uuid>,
+    Query(wq): Query<WorkspaceQuery>,
     Json(payload): Json<UpdateRequest>,
 ) -> Result<Json<IngestResponse>, (StatusCode, String)> {
+    require_write(&ctx)?;
+    let workspace = resolve_and_authorize_workspace(&state, &ctx, wq.workspace).await?;
+
     state
         .indexer
-        .update(id, payload.content)
+        .update_in_workspace(id, payload.content, &workspace)
         .await
         .map(Json)
         .map_err(|e| {
@@ -107,11 +124,16 @@ pub async fn update_document_handler(
 
 pub async fn delete_document_handler(
     State(state): State<Arc<AppState>>,
+    Extension(ctx): Extension<AuthContext>,
     Path(id): Path<Uuid>,
+    Query(wq): Query<WorkspaceQuery>,
 ) -> Result<StatusCode, (StatusCode, String)> {
+    require_write(&ctx)?;
+    let workspace = resolve_and_authorize_workspace(&state, &ctx, wq.workspace).await?;
+
     state
         .indexer
-        .delete(id)
+        .delete_from_workspace(id, &workspace)
         .await
         .map(|_| StatusCode::NO_CONTENT)
         .map_err(|e| {
@@ -127,10 +149,15 @@ pub struct ReindexResponse {
 
 pub async fn reindex_handler(
     State(state): State<Arc<AppState>>,
+    Extension(ctx): Extension<AuthContext>,
+    Query(wq): Query<WorkspaceQuery>,
 ) -> Result<Json<ReindexResponse>, (StatusCode, String)> {
+    require_write(&ctx)?;
+    let workspace = resolve_and_authorize_workspace(&state, &ctx, wq.workspace).await?;
+
     state
         .indexer
-        .reindex_all()
+        .reindex_workspace(&workspace)
         .await
         .map(|indexed| Json(ReindexResponse { indexed }))
         .map_err(|e| {

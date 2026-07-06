@@ -78,7 +78,10 @@ pub struct AuthContext {
     pub key_id: String,
     /// 권한 수준
     pub permissions: Permission,
-    /// 접근 가능한 워크스페이스 목록. 비어있으면 전체 접근 (마스터키/개발모드).
+    /// 접근 가능한 워크스페이스 ID 목록.
+    /// 영속 키(비마스터)는 이 목록에 명시된 워크스페이스에만 접근한다
+    /// (빈 목록 = 접근 없음, fail-closed). 마스터키/개발모드(`is_master`)만
+    /// 목록과 무관하게 전체 접근을 가진다.
     pub workspaces: Vec<String>,
     /// 마스터키 또는 개발모드 여부
     pub is_master: bool,
@@ -116,9 +119,23 @@ impl AuthContext {
     }
 
     /// 특정 워크스페이스에 접근 가능한지 확인.
-    /// 마스터키/개발모드는 항상 true, API Key는 workspaces 목록 기반.
+    ///
+    /// 마스터키/개발모드(`is_master`)는 항상 true. 영속 API 키는 오직 `workspaces`
+    /// 목록에 명시된 워크스페이스에만 접근한다 — 빈 목록은 "전체 접근"이 아니라
+    /// "접근 없음"(fail-closed)이다. 이로써 `has_workspace_access`와 동일한 판정을
+    /// 보장한다. ("unscoped = all"은 마스터/dev 전용 의미이며, 영속 키에 허용하면
+    /// 스코프하려던 키가 개인 워크스페이스까지 조용히 읽는 격리 우회가 된다.)
     pub fn can_access_workspace(&self, workspace_id: &str) -> bool {
-        self.is_master || self.workspaces.is_empty() || self.workspaces.iter().any(|w| w == workspace_id)
+        self.is_master || self.workspaces.iter().any(|w| w == workspace_id)
+    }
+
+    /// 워크스페이스 미지정 시 사용할 기본 워크스페이스 ID.
+    /// 키에 바인딩된 첫 워크스페이스, 비어있으면(마스터/개발모드) `default`.
+    pub fn default_workspace(&self) -> String {
+        self.workspaces
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "default".to_string())
     }
 
     pub fn can_write(&self) -> bool {
@@ -159,10 +176,20 @@ pub fn generate_raw_key() -> String {
 // ApiKeyManager — 키 CRUD + 파일 시스템 영속화
 // ──────────────────────────────────────────────────────────────
 
+/// `last_used_at` 디스크 반영 최소 간격(초).
+///
+/// 인증된 모든 요청이 요청당 파일 전체를 재작성하는 쓰기 증폭을 막기 위해, 이 간격
+/// 안의 갱신은 디스크에 반영하지 않는다. `last_used_at`은 "안 쓰는 키 찾기"용 관측
+/// 필드라 이 정도 granularity("최근 N초 내 사용")로 충분하다.
+const LAST_USED_PERSIST_INTERVAL_SECS: i64 = 60;
+
 /// API Key 관리자. `data/api_keys.json`에 키를 영속화하고 메모리 캐시를 유지한다.
 pub struct ApiKeyManager {
     keys_path: PathBuf,
     keys: RwLock<Vec<ApiKey>>,
+    /// 저장 직렬화 락. 동시 `save()`가 temp 파일/쓰기 순서를 침범하지 않도록 하고,
+    /// 락 안에서 최신 인메모리 상태를 다시 읽어 폐기 직후 잔존 스냅샷 부활을 막는다.
+    save_lock: tokio::sync::Mutex<()>,
 }
 
 impl ApiKeyManager {
@@ -175,8 +202,31 @@ impl ApiKeyManager {
             let content = fs::read_to_string(&keys_path)
                 .await
                 .context("Failed to read api_keys.json")?;
-            serde_json::from_str(&content)
-                .context("Failed to parse api_keys.json")?
+            match serde_json::from_str::<Vec<ApiKey>>(&content) {
+                Ok(keys) => keys,
+                Err(e) => {
+                    // 손상된 키 파일로 부팅을 막지 않는다: 손상본을 백업하고 빈 목록으로
+                    // degrade한다(torn write/재배포 크래시 대비). 침묵 금지 — error로
+                    // 명시하고, 마스터키(MAIA_API_KEY)로 복구할 수 있게 남긴다.
+                    // (대조: SettingsManager::new도 unwrap_or_default로 graceful.)
+                    let file_name = keys_path
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("api_keys.json");
+                    let backup = keys_path.with_file_name(format!("{}.corrupt", file_name));
+                    if let Err(re) = fs::rename(&keys_path, &backup).await {
+                        tracing::error!("손상된 api_keys.json 백업 실패: {}", re);
+                    }
+                    tracing::error!(
+                        "api_keys.json 파싱 실패({}). 손상 파일을 {:?}로 백업하고 빈 키 \
+                         목록으로 시작합니다. 마스터키(MAIA_API_KEY)로 접속해 키를 \
+                         재발급하세요.",
+                        e,
+                        backup
+                    );
+                    Vec::new()
+                }
+            }
         } else {
             Vec::new()
         };
@@ -184,6 +234,7 @@ impl ApiKeyManager {
         Ok(Self {
             keys_path,
             keys: RwLock::new(keys),
+            save_lock: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -248,6 +299,20 @@ impl ApiKeyManager {
         keys.iter().find(|k| k.hashed_key == hashed_key).cloned()
     }
 
+    /// 평문 토큰을 인증한다.
+    ///
+    /// 토큰을 해시하여 조회하고(해시 비교 → 타이밍 공격 완화), 만료되지 않은
+    /// 키만 반환한다. 일치하는 키가 없거나 만료되었으면 `None`.
+    pub async fn authenticate(&self, raw_token: &str) -> Option<ApiKey> {
+        let hashed = hash_key(raw_token);
+        let key = self.find_by_hash(&hashed).await?;
+        if key.is_expired() {
+            tracing::warn!("Rejected expired API key: {}", key.key_id);
+            return None;
+        }
+        Some(key)
+    }
+
     /// 등록된 키가 있는지 확인한다.
     pub async fn has_keys(&self) -> bool {
         !self.keys.read().await.is_empty()
@@ -255,30 +320,65 @@ impl ApiKeyManager {
 
     /// `last_used_at`을 현재 시각으로 갱신한다.
     /// 미들웨어에서 `tokio::spawn`으로 비동기 호출하여 응답 지연을 방지한다.
+    ///
+    /// 요청당 전체 파일 재작성(쓰기 증폭)을 막기 위해, 마지막 반영이
+    /// `LAST_USED_PERSIST_INTERVAL_SECS`보다 오래됐을 때만 갱신하고 디스크에 flush한다.
     pub async fn update_last_used(&self, key_id: &str) -> Result<()> {
-        {
+        let should_save = {
             let mut keys = self.keys.write().await;
-            if let Some(key) = keys.iter_mut().find(|k| k.key_id == key_id) {
-                key.last_used_at = Some(Utc::now());
+            match keys.iter_mut().find(|k| k.key_id == key_id) {
+                Some(key) => {
+                    let now = Utc::now();
+                    let stale = key.last_used_at.map_or(true, |prev| {
+                        now.signed_duration_since(prev).num_seconds()
+                            >= LAST_USED_PERSIST_INTERVAL_SECS
+                    });
+                    if stale {
+                        key.last_used_at = Some(now);
+                    }
+                    stale
+                }
+                None => false,
             }
-        }
+        };
 
-        self.save().await
+        if should_save {
+            self.save().await?;
+        }
+        Ok(())
     }
 
-    /// 현재 키 목록을 디스크에 영속화한다.
+    /// 현재 키 목록을 디스크에 원자적으로 영속화한다.
+    ///
+    /// temp 파일에 쓴 뒤 `rename`으로 교체해 torn write(쓰기 도중 크래시로 인한
+    /// 잘린 파일 → 부팅 브릭)를 방지한다. `save_lock`으로 동시 저장을 직렬화하고,
+    /// 락 안에서 최신 인메모리 상태를 다시 직렬화하므로 폐기 직후 잔존 스냅샷이
+    /// 되살아나는 경합도 막는다.
     async fn save(&self) -> Result<()> {
-        let keys = self.keys.read().await;
-        let content = serde_json::to_string_pretty(&*keys)?;
-        drop(keys);
+        let _guard = self.save_lock.lock().await;
+
+        let content = {
+            let keys = self.keys.read().await;
+            serde_json::to_string_pretty(&*keys)?
+        };
 
         if let Some(parent) = self.keys_path.parent() {
             fs::create_dir_all(parent).await?;
         }
 
-        fs::write(&self.keys_path, content)
+        let file_name = self
+            .keys_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("api_keys.json");
+        let tmp_path = self.keys_path.with_file_name(format!("{}.tmp", file_name));
+
+        fs::write(&tmp_path, content)
             .await
-            .context("Failed to write api_keys.json")?;
+            .context("Failed to write api_keys.json.tmp")?;
+        fs::rename(&tmp_path, &self.keys_path)
+            .await
+            .context("Failed to persist api_keys.json")?;
 
         Ok(())
     }
@@ -557,6 +657,40 @@ mod tests {
     }
 
     #[test]
+    fn test_auth_context_empty_workspaces_is_fail_closed() {
+        // 회귀 방지: 빈 workspaces 목록의 비마스터 키는 어떤 워크스페이스에도
+        // 접근할 수 없어야 한다(fail-closed). 과거 `is_empty() → true` 단락이
+        // 스코프 없는 키에 전 워크스페이스(개인정보 포함) 접근을 조용히 부여하는
+        // 격리 우회였다. (Devil's Advocate Cycle 1 최우선 blocking 시나리오)
+        let mut key = make_test_key();
+        key.workspaces = vec![];
+        let ctx = AuthContext::from_api_key(&key);
+        assert!(!ctx.is_master);
+        assert!(!ctx.can_access_workspace("default"));
+        assert!(!ctx.can_access_workspace("personal"));
+        assert!(!ctx.can_access_workspace("work"));
+        assert!(!ctx.can_access_workspace(""));
+    }
+
+    #[test]
+    fn test_can_access_and_has_access_agree_on_empty() {
+        // 같은 개념을 판정하는 두 메서드는 빈 목록에서 일치해야 한다(둘 다 거부).
+        // 과거 has_workspace_access(거부) vs can_access_workspace(전체허용)의
+        // 정반대 판정이 구조적 결함의 근거였다.
+        let mut key = make_test_key();
+        key.workspaces = vec![];
+        let ctx = AuthContext::from_api_key(&key);
+        for ws in ["default", "personal", "work"] {
+            assert_eq!(
+                key.has_workspace_access(ws),
+                ctx.can_access_workspace(ws),
+                "has_workspace_access와 can_access_workspace는 '{}'에서 일치해야 한다",
+                ws
+            );
+        }
+    }
+
+    #[test]
     fn test_master_key_grants_full_access() {
         let ctx = AuthContext::master();
         // 마스터키는 모든 워크스페이스에 admin 접근
@@ -782,6 +916,75 @@ mod tests {
         assert!(!key.has_workspace_access("denied-ws"));
     }
 
+    // ──── authenticate ────
+
+    #[tokio::test]
+    async fn test_authenticate_valid_key() {
+        let (_tmp, manager) = setup_manager().await;
+        let (key, raw) = manager.create_key(
+            "Auth".to_string(),
+            vec!["default".to_string()],
+            Permission::ReadWrite,
+            None,
+        ).await.unwrap();
+
+        let authed = manager.authenticate(&raw).await;
+        assert!(authed.is_some());
+        assert_eq!(authed.unwrap().key_id, key.key_id);
+    }
+
+    #[tokio::test]
+    async fn test_authenticate_wrong_token() {
+        let (_tmp, manager) = setup_manager().await;
+        manager.create_key(
+            "Auth".to_string(),
+            vec!["default".to_string()],
+            Permission::ReadWrite,
+            None,
+        ).await.unwrap();
+
+        assert!(manager.authenticate("maia_wrongtoken").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_authenticate_expired_key_rejected() {
+        let (_tmp, manager) = setup_manager().await;
+        let expires = Utc::now() - Duration::seconds(5);
+        let (_, raw) = manager.create_key(
+            "Expired".to_string(),
+            vec!["default".to_string()],
+            Permission::ReadWrite,
+            Some(expires),
+        ).await.unwrap();
+
+        // 만료된 키는 검색은 되지만 authenticate는 거부해야 한다
+        assert!(manager.authenticate(&raw).await.is_none(), "만료 키는 인증되면 안 된다");
+    }
+
+    // ──── default_workspace ────
+
+    #[test]
+    fn test_default_workspace_master_is_default() {
+        assert_eq!(AuthContext::master().default_workspace(), "default");
+        assert_eq!(AuthContext::dev_mode().default_workspace(), "default");
+    }
+
+    #[test]
+    fn test_default_workspace_bound_key_first() {
+        let mut key = make_test_key();
+        key.workspaces = vec!["work".to_string(), "personal".to_string()];
+        let ctx = AuthContext::from_api_key(&key);
+        assert_eq!(ctx.default_workspace(), "work");
+    }
+
+    #[test]
+    fn test_default_workspace_empty_falls_back() {
+        let mut key = make_test_key();
+        key.workspaces = vec![];
+        let ctx = AuthContext::from_api_key(&key);
+        assert_eq!(ctx.default_workspace(), "default");
+    }
+
     #[tokio::test]
     async fn test_manager_serialization_roundtrip() {
         let (tmp, manager) = setup_manager().await;
@@ -804,5 +1007,59 @@ mod tests {
         assert_eq!(key.workspaces, vec!["ws-a", "ws-b"]);
         assert_eq!(key.permissions, Permission::ReadWrite);
         assert!(key.expires_at.is_some());
+    }
+
+    // ──── 영속화 하드닝 (원자적 저장 / graceful degrade / 쓰기 증폭 억제) ────
+
+    #[tokio::test]
+    async fn test_manager_corrupt_file_degrades_gracefully() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("api_keys.json");
+        // 손상된(파싱 불가) JSON 기록 — torn write 시뮬레이션
+        fs::write(&path, "{ this is not valid json ]").await.unwrap();
+
+        // 부팅이 막히지 않고 빈 목록으로 degrade해야 한다 (하드 실패 아님)
+        let manager = ApiKeyManager::new(tmp.path().to_str().unwrap()).await.unwrap();
+        assert!(manager.list_keys().await.is_empty());
+
+        // 손상 파일은 .corrupt로 백업되어 보존된다 (복구 가능)
+        let backup = tmp.path().join("api_keys.json.corrupt");
+        assert!(backup.exists(), "손상 파일은 .corrupt로 백업되어야 한다");
+    }
+
+    #[tokio::test]
+    async fn test_manager_save_is_atomic_no_temp_left() {
+        let (tmp, manager) = setup_manager().await;
+        manager.create_key("A".to_string(), vec!["default".to_string()], Permission::ReadOnly, None).await.unwrap();
+        manager.create_key("B".to_string(), vec!["work".to_string()], Permission::ReadOnly, None).await.unwrap();
+
+        // 원자적 저장(temp+rename) 후 .tmp 파일이 남지 않아야 한다
+        let tmp_path = tmp.path().join("api_keys.json.tmp");
+        assert!(!tmp_path.exists(), "저장 후 .tmp 파일이 남으면 안 된다");
+
+        // 데이터는 온전히 재로드된다
+        let m2 = ApiKeyManager::new(tmp.path().to_str().unwrap()).await.unwrap();
+        assert_eq!(m2.list_keys().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_manager_update_last_used_coarsened() {
+        let (_tmp, manager) = setup_manager().await;
+        let (key, _) = manager.create_key(
+            "Coarse".to_string(),
+            vec!["default".to_string()],
+            Permission::ReadOnly,
+            None,
+        ).await.unwrap();
+
+        // 첫 갱신은 None → Some (임계값 무관하게 반영)
+        manager.update_last_used(&key.key_id).await.unwrap();
+        let first = manager.list_keys().await[0].last_used_at;
+        assert!(first.is_some());
+
+        // 임계값(60s) 안의 재갱신은 값을 바꾸지 않는다 (쓰기 증폭 억제)
+        manager.update_last_used(&key.key_id).await.unwrap();
+        let second = manager.list_keys().await[0].last_used_at;
+        assert_eq!(first, second, "임계값 내 재갱신은 last_used_at을 변경하지 않아야 한다");
     }
 }
