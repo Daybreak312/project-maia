@@ -259,6 +259,13 @@ Payload Indexes: document_id (Keyword), chunk_type (Keyword)
   복원**하는 것이 핵심 불변식(단위 테스트로 고정: raw 보존 + payload 왕복 + build_chunk_payload).
 - **엣지 동기 갱신 순서**: raw JSON을 먼저 저장하고 성공 시에만 payload를 동기화한다.
   raw 실패 시 Qdrant는 호출조차 되지 않아 "둘 다 미반영"이 관측된다.
+- **쓰기 직렬화 (lost-update 방지)**: `DocumentStore`의 문서 쓰기 트랜잭션(load→수정→save)은
+  `write_lock`으로 직렬화된다(`DocumentStore::update` 동기 클로저 / `write_guard` 복합 트랜잭션).
+  raw JSON이 엣지의 SSoT인데 `save`는 락 없는 전체 덮어쓰기라, **엣지 감쇠 재계산·엣지 추가/제거·
+  재파싱 업데이트**가 같은 문서를 동시에 write하면 늦은 쪽이 앞선 엣지를 조용히 소실시킨다(reindex도
+  오염된 raw를 읽어 복원 불가 — "기억을 잃으면 안 된다" 위반). 모든 라이터가 이 락을 공유해 경합을
+  제거한다. 감쇠·업데이트는 계산(LLM 파싱·임베딩)을 락 밖에서 끝내고 임계 구역은 최신 재로드→저장으로
+  짧게 유지한다. review/freshness/history 저장소와 동일한 파일 쓰기 직렬화 패턴.
 - **이웃 탐색** (`storage/documents.rs::neighbors`): raw JSON 기반 BFS. depth `[1, 5]` 클램프,
   결과 200개 상한, `visited` 집합으로 순환 안전, 최단 depth 보장, dangling 엣지 스킵.
 
@@ -410,7 +417,9 @@ API 트리거(수동)┘        │              │
   낮춰 그래프 확장에서 뒤로 밀리게 한다(Phase 2 lambda 재사용). `Edge.base_weight`(생성 시점
   원본)를 기준으로 매번 재계산하므로 **반복 실행이 멱등**이다(base 없으면 최초 감쇠 때 현재
   weight로 고정 — 구버전 하위호환). 감쇠는 문서 내용 변경이 아니므로 `updated_at`을 건드리지
-  않는다(staleness 기준점 리셋 방지). raw JSON이 SSoT, payload는 best-effort 동기화.
+  않는다(staleness 기준점 리셋 방지). raw JSON이 SSoT, payload는 best-effort 동기화. 실행 시
+  전 문서를 스냅샷으로 적재하지 않고 **문서별로 `write_lock` 아래 최신 상태를 재로드**해 감쇠하므로,
+  패스가 도는 동안 동시 추가된 엣지를 stale 스냅샷으로 덮어쓰지 않는다(lost-update 제거).
 - **Review Queue** (`patrol/review.rs`): 워크스페이스별 단일 JSON. 상태 대기→판단(유효/수정
   필요/삭제/기각). **열린 동일 (문서, 유형) 항목은 중복 생성 금지**, **판단은 멱등**(같은 판단
   재제출이 상태를 깨지 않음, 부수효과 이중 실행 없음). enqueue는 유형별 상한으로 폭주를 막는다.
