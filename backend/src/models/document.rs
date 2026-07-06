@@ -15,6 +15,15 @@ pub struct Document {
     /// `#[serde(default)]`로 edges 필드가 없는 기존 JSON도 로드 가능하다(하위호환).
     #[serde(default)]
     pub edges: Vec<Edge>,
+    /// 문서의 출처 — 커넥터(로컬 디렉토리 등)로 유입된 경우 어느 소스의 어느 항목에서
+    /// 왔는지 추적한다. 수동 입력(API/MCP)은 None. `#[serde(default)]`로 이 필드가 없는
+    /// 기존 문서 JSON도 로드된다(하위호환). None이면 직렬화에서 생략된다.
+    ///
+    /// **재유입 중복 방지의 키:** `(source.source_type, source.source_id)`가 동일한 문서를
+    /// 찾으면 신규 생성이 아니라 업데이트 경로로 보내, 같은 파일이 여러 문서로 난립하는
+    /// 것을 막는다. raw JSON(SSoT)에 저장되므로 reindex에서 그대로 살아남는다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<DocumentSource>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -34,9 +43,17 @@ impl Document {
             entities,
             facts,
             edges: Vec::new(),
+            source: None,
             created_at: now,
             updated_at: now,
         }
+    }
+
+    /// 출처 메타데이터를 부여한 문서를 반환한다(빌더 스타일).
+    /// 커넥터 유입 경로가 신규 문서에 소스 식별자를 각인할 때 쓴다.
+    pub fn with_source(mut self, source: DocumentSource) -> Self {
+        self.source = Some(source);
+        self
     }
 
     /// 대상 문서로의 엣지를 추가한다.
@@ -149,6 +166,23 @@ impl Edge {
             created_at: Utc::now(),
         }
     }
+}
+
+/// 문서의 출처 — 커넥터로 유입된 문서가 "어느 소스의 어느 항목에서 왔는지"를 기록한다.
+///
+/// `(source_type, source_id)`가 재유입 중복 방지의 키다. 예컨대 로컬 디렉토리 커넥터가
+/// 유입한 문서는 `source_type = "local_directory"`, `source_id = 원본 파일 경로`를 갖는다.
+/// 같은 파일이 다시 스캔되면 이 키로 기존 문서를 찾아 업데이트 경로로 보낸다.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DocumentSource {
+    /// 소스 타입 식별자 (커넥터 종류). 예: "local_directory".
+    pub source_type: String,
+    /// 소스 내 고유 식별자 (원본 경로/ID). 중복 방지·업데이트 경로의 키.
+    pub source_id: String,
+    /// 원본의 수정 시각. 증분 스캔 커서·"변경 없으면 스킵" 판단의 기준.
+    pub modified_at: DateTime<Utc>,
+    /// 이 문서를 유입시킨 커넥터 인스턴스 ID (관측·추적용).
+    pub connector_id: String,
 }
 
 /// 추출된 엔티티 (회사명, 금액, 날짜 등)
@@ -350,6 +384,9 @@ pub mod api {
         pub summary: String,
         pub entities: Vec<Entity>,
         pub created_at: DateTime<Utc>,
+        /// 문서 출처 (커넥터 유입 문서만). 수동 입력은 None → 직렬화 생략.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub source: Option<DocumentSource>,
     }
 }
 
@@ -406,6 +443,66 @@ mod tests {
     #[test]
     fn test_new_document_has_empty_edges() {
         assert!(make_doc().edges.is_empty());
+    }
+
+    // ──── 출처 메타데이터 (DocumentSource) ────
+
+    fn make_source() -> DocumentSource {
+        DocumentSource {
+            source_type: "local_directory".to_string(),
+            source_id: "/notes/daily/2026-07-06.md".to_string(),
+            modified_at: Utc::now(),
+            connector_id: "notes".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_new_document_has_no_source() {
+        // 수동 입력 문서는 출처가 없다(None).
+        assert!(make_doc().source.is_none());
+    }
+
+    #[test]
+    fn test_with_source_builder() {
+        let doc = make_doc().with_source(make_source());
+        let source = doc.source.expect("source가 설정되어야 한다");
+        assert_eq!(source.source_type, "local_directory");
+        assert_eq!(source.source_id, "/notes/daily/2026-07-06.md");
+        assert_eq!(source.connector_id, "notes");
+    }
+
+    #[test]
+    fn test_document_source_roundtrip() {
+        // 출처를 가진 문서가 직렬화 후 온전히 복원되어야 한다(reindex 생존 불변식의 raw 측).
+        let doc = make_doc().with_source(make_source());
+        let json = serde_json::to_string(&doc).unwrap();
+        let restored: Document = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.source, doc.source);
+    }
+
+    #[test]
+    fn test_document_without_source_omits_field() {
+        // 출처 없는 문서는 source 필드를 직렬화하지 않는다(하위호환·간결성).
+        let doc = make_doc();
+        let json = serde_json::to_value(&doc).unwrap();
+        assert!(json.get("source").is_none(), "None source는 생략되어야 한다");
+    }
+
+    #[test]
+    fn test_document_loads_legacy_json_without_source() {
+        // source 필드가 없는 기존 문서 JSON도 로드되어야 한다(#[serde(default)]).
+        let legacy = r#"{
+            "id": "550e8400-e29b-41d4-a716-446655440000",
+            "raw_content": "old content",
+            "summary": "old summary",
+            "entities": [],
+            "facts": [],
+            "edges": [],
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z"
+        }"#;
+        let doc: Document = serde_json::from_str(legacy).unwrap();
+        assert!(doc.source.is_none(), "누락된 source는 None으로 기본값 처리되어야 한다");
     }
 
     // ──── RelationType 직렬화/파싱 ────

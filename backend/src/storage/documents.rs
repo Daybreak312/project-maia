@@ -128,6 +128,51 @@ impl DocumentStore {
         Ok(docs)
     }
 
+    /// 워크스페이스에서 `(source_type, source_id)`가 일치하는 문서를 찾는다.
+    ///
+    /// 커넥터 재유입 시 "이미 유입된 소스 항목인가"를 판별하는 조회다 — 일치하면
+    /// 신규 생성이 아니라 업데이트 경로로 보내 문서 난립을 막는다. raw JSON(SSoT)만
+    /// 스캔하므로 Qdrant 없이 동작하고, 손상되었거나 파싱 불가한 파일은 조용히 건너뛴다
+    /// (하나의 깨진 파일이 조회 전체를 실패시키지 않는다).
+    ///
+    /// 디렉토리 전체를 스캔하므로 대량 적재에서 문서 수에 비례하는 비용이 있으나, 유입은
+    /// LLM 파싱 지연이 지배적이라 이 스캔은 상대적으로 무시 가능하다.
+    pub async fn find_by_source(
+        &self,
+        source_type: &str,
+        source_id: &str,
+        workspace_id: &str,
+    ) -> Result<Option<Document>> {
+        let base = self.workspace_docs_path(workspace_id);
+        if !base.exists() {
+            return Ok(None);
+        }
+
+        let mut entries = fs::read_dir(&base)
+            .await
+            .context("Failed to read document directory")?;
+
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if path.extension().is_none_or(|ext| ext != "json") {
+                continue;
+            }
+            let Ok(content) = fs::read_to_string(&path).await else {
+                continue;
+            };
+            let Ok(doc) = serde_json::from_str::<Document>(&content) else {
+                continue;
+            };
+            if let Some(source) = &doc.source {
+                if source.source_type == source_type && source.source_id == source_id {
+                    return Ok(Some(doc));
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
     /// 시작 문서로부터 엣지를 따라 BFS로 이웃 문서들을 탐색한다.
     ///
     /// - `depth`는 `[1, MAX_NEIGHBOR_DEPTH]`로 클램프된다(상한 필수).
@@ -367,6 +412,93 @@ mod tests {
         assert_eq!(b_docs.len(), 1);
         assert_eq!(a_docs[0].raw_content, "a");
         assert_eq!(b_docs[0].raw_content, "b");
+    }
+
+    // ──── 소스 기반 조회 (커넥터 중복 방지) ────
+
+    fn make_doc_with_source(content: &str, source_id: &str) -> Document {
+        use crate::models::DocumentSource;
+        make_doc(content).with_source(DocumentSource {
+            source_type: "local_directory".to_string(),
+            source_id: source_id.to_string(),
+            modified_at: chrono::Utc::now(),
+            connector_id: "notes".to_string(),
+        })
+    }
+
+    #[tokio::test]
+    async fn test_find_by_source_matches() {
+        let (_tmp, store) = setup().await;
+        let doc = make_doc_with_source("hello", "/notes/a.md");
+        let id = doc.id;
+        store.save(&doc, "default").await.unwrap();
+
+        let found = store
+            .find_by_source("local_directory", "/notes/a.md", "default")
+            .await
+            .unwrap();
+        assert_eq!(found.map(|d| d.id), Some(id), "일치하는 소스 문서를 찾아야 한다");
+    }
+
+    #[tokio::test]
+    async fn test_find_by_source_none_when_absent() {
+        let (_tmp, store) = setup().await;
+        store.save(&make_doc_with_source("x", "/notes/a.md"), "default").await.unwrap();
+
+        // source_id가 다르면 None
+        let by_id = store
+            .find_by_source("local_directory", "/notes/other.md", "default")
+            .await
+            .unwrap();
+        assert!(by_id.is_none());
+
+        // source_type이 다르면 None (같은 경로여도)
+        let by_type = store
+            .find_by_source("notion", "/notes/a.md", "default")
+            .await
+            .unwrap();
+        assert!(by_type.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_find_by_source_ignores_sourceless_docs() {
+        // 수동 입력(출처 없음) 문서는 소스 조회에서 무시되어야 한다.
+        let (_tmp, store) = setup().await;
+        store.save(&make_doc("manual"), "default").await.unwrap();
+
+        let found = store
+            .find_by_source("local_directory", "/notes/a.md", "default")
+            .await
+            .unwrap();
+        assert!(found.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_find_by_source_empty_workspace() {
+        let (_tmp, store) = setup().await;
+        let found = store
+            .find_by_source("local_directory", "/x.md", "empty-ws")
+            .await
+            .unwrap();
+        assert!(found.is_none(), "빈 워크스페이스는 None (에러 아님)");
+    }
+
+    #[tokio::test]
+    async fn test_find_by_source_workspace_isolation() {
+        // 같은 source_id라도 다른 워크스페이스의 문서는 찾지 않는다.
+        let (_tmp, store) = setup().await;
+        store.save(&make_doc_with_source("a", "/notes/shared.md"), "ws-a").await.unwrap();
+
+        assert!(store
+            .find_by_source("local_directory", "/notes/shared.md", "ws-a")
+            .await
+            .unwrap()
+            .is_some());
+        assert!(store
+            .find_by_source("local_directory", "/notes/shared.md", "ws-b")
+            .await
+            .unwrap()
+            .is_none());
     }
 
     // ──── 이웃 탐색 (그래프 BFS) ────
