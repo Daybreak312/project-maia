@@ -7,7 +7,7 @@ project-maia/
 ├── backend/                    # Rust RAG 서버
 │   ├── Cargo.toml
 │   ├── src/
-│   │   ├── main.rs             # 진입점, axum 서버, AppState(indexer/settings/workspaces/api_keys/connector_runner) + 커넥터 스케줄러 기동
+│   │   ├── main.rs             # 진입점, axum 서버, AppState(indexer/settings/workspaces/api_keys/connector_runner/patrol) + 커넥터·Patrol 스케줄러 기동
 │   │   ├── config.rs           # 환경설정 (SERVER_PORT, QDRANT_URL, DATA_DIR, MAIA_API_KEY)
 │   │   ├── settings.rs         # 설정 관리 (LLM API Key, Provider 선택)
 │   │   │
@@ -36,6 +36,7 @@ project-maia/
 │   │   │   ├── workspaces.rs   # 워크스페이스 CRUD API (admin 전용)
 │   │   │   ├── connectors.rs   # 커넥터 관리 API (목록/상태=워크스페이스 접근, 등록/삭제/즉시실행=admin)
 │   │   │   ├── keys.rs         # API 키 발급/조회/폐기 API (admin 전용)
+│   │   │   ├── patrol.rs       # Patrol·거버넌스 API (실행/판단/피드백=write, 이력/큐/메트릭 조회=접근)
 │   │   │   └── settings.rs     # 설정 API (mutation은 admin)
 │   │   │
 │   │   ├── core/               # 비즈니스 로직
@@ -51,6 +52,17 @@ project-maia/
 │   │   │   ├── sync_state.rs   # 커넥터별 마지막 실행·커서·결과 요약 영속화
 │   │   │   ├── runner.rs       # 동기화/대량 적재 (동시성 제한·진행 관측·실패 격리·중단 재개)
 │   │   │   └── scheduler.rs    # 주기 실행 + 오류/패닉 격리 (기동 시 자동 시작)
+│   │   │
+│   │   ├── patrol/             # 자기 관리 & 메모리 거버넌스 (Phase 5)
+│   │   │   ├── mod.rs          # Patrol 파사드(run/judge/조회/피드백) + PatrolExecutor trait
+│   │   │   ├── detectors.rs    # staleness/중복/고아/외부 불일치 4종 (LLM 없이 수치 신호, 순수)
+│   │   │   ├── decay.rs        # 엣지 시간 감쇠 (멱등, base_weight 기준 재계산, 순수)
+│   │   │   ├── review.rs       # Review Queue 모델·저장·중복 방지·멱등 판단
+│   │   │   ├── freshness.rs    # "유효" 판단 기준점 (문서 미변경 — 별도 파일)
+│   │   │   ├── feedback.rs     # "관련 없음" 피드백 일 JSONL + 문서별 집계
+│   │   │   ├── metrics.rs      # 일 롤업(검색/그래프/유입/Patrol) 순수 계산·저장
+│   │   │   ├── history.rs      # 실행 이력·마지막 실행 시각 (스케줄 due 판정)
+│   │   │   └── scheduler.rs    # 주기 실행 + 오류 격리 (frequency→주기)
 │   │   │
 │   │   ├── storage/            # 데이터 레이어
 │   │   │   ├── mod.rs
@@ -68,7 +80,12 @@ project-maia/
 │   │   ├── workspaces/{id}/    # 워크스페이스별 격리 저장
 │   │   │   ├── config.json     #   워크스페이스 설정 (커넥터 인스턴스 등록 포함)
 │   │   │   ├── documents/      #   원본 문서 JSON (Single Source of Truth)
-│   │   │   └── connectors/     #   커넥터별 동기화 상태 {connector_id}.json (마지막 실행·커서·결과)
+│   │   │   ├── versions/       #   업데이트/삭제 전 스냅샷 (복구 안전망)
+│   │   │   ├── search_logs/    #   검색 로그 일 단위 JSONL (메트릭·거버넌스 신호)
+│   │   │   ├── connectors/     #   커넥터별 동기화 상태 {connector_id}.json (마지막 실행·커서·결과)
+│   │   │   ├── feedback/       #   "관련 없음" 피드백 일 단위 JSONL (Phase 5)
+│   │   │   ├── metrics/        #   일자 메트릭 롤업 {YYYY-MM-DD}.json (Phase 5)
+│   │   │   └── patrol/         #   Review Queue·freshness·실행 이력 (review_queue.json/freshness.json/state.json)
 │   │   ├── raw/                # 레거시 flat 문서 (기동 시 default로 마이그레이션)
 │   │   ├── api_keys.json       # API 키(해시만) 저장
 │   │   ├── settings.json       # LLM API Key 및 Provider 설정
@@ -242,6 +259,18 @@ Payload Indexes: document_id (Keyword), chunk_type (Keyword)
   복원**하는 것이 핵심 불변식(단위 테스트로 고정: raw 보존 + payload 왕복 + build_chunk_payload).
 - **엣지 동기 갱신 순서**: raw JSON을 먼저 저장하고 성공 시에만 payload를 동기화한다.
   raw 실패 시 Qdrant는 호출조차 되지 않아 "둘 다 미반영"이 관측된다.
+- **쓰기 직렬화 (lost-update·부활 방지)**: `DocumentStore`의 문서 쓰기 트랜잭션(load→수정→save)은
+  `write_lock`으로 직렬화된다(`DocumentStore::update` 동기 클로저 / `write_guard` 복합 트랜잭션 /
+  `delete_serialized` 삭제). raw JSON이 엣지의 SSoT인데 `save`는 락 없는 전체 덮어쓰기라, **엣지 감쇠
+  재계산·엣지 추가/제거·재파싱 업데이트**가 같은 문서를 동시에 write하면 늦은 쪽이 앞선 엣지를 조용히
+  소실시킨다(reindex도 오염된 raw를 읽어 복원 불가 — "기억을 잃으면 안 된다" 위반). **삭제도 이 락에
+  참여한다**(`delete_serialized`): 참여하지 않으면 감쇠/엣지추가의 load→save 사이에 삭제가 파일을 지우고
+  뒤늦은 save가 삭제 문서를 raw JSON에 **부활**시켜 SSoT(살아있음)와 Qdrant(삭제됨)가 영구 불일치하고
+  reindex가 소유자가 파기한 지식을 되살린다("삭제=삭제" 붕괴). 생성·수정·삭제 **모든 라이터가 이 락을
+  공유**해 경합을 제거한다(`update`의 "락 아래 exists 체크"가 삭제와 갱신을 상호 배제 — 삭제가 먼저면
+  save 생략, 갱신이 먼저면 삭제가 방금 저장된 파일 제거). 감쇠·업데이트는 계산(LLM 파싱·임베딩)을 락
+  밖에서 끝내고 임계 구역은 최신 재로드→저장으로 짧게 유지하며, 삭제도 Qdrant 제거(파생물)를 임계 구역
+  밖에 둔다. review/freshness/history 저장소와 동일한 파일 쓰기 직렬화 패턴.
 - **이웃 탐색** (`storage/documents.rs::neighbors`): raw JSON 기반 BFS. depth `[1, 5]` 클램프,
   결과 200개 상한, `visited` 집합으로 순환 안전, 최단 depth 보장, dangling 엣지 스킵.
 
@@ -361,6 +390,64 @@ API 트리거(수동)┘        │                                             
   (워크스페이스 접근), 등록 `POST /api/connectors`, 삭제 `DELETE .../:id`, 즉시 실행
   `POST .../:id/sync`(admin). 즉시 실행은 백그라운드 태스크로 spawn해 요청 경로와 격리(202 반환).
 
+## Patrol (자기 관리 & 메모리 거버넌스)
+
+두뇌가 스스로의 기억 상태를 점검하는 **반자율** 계층(Phase 5). 완전 자동 수정의 자기참조
+순환·오탐 피로를 피하려, 시스템은 후보를 식별해 플래그를 세우고(Review Queue) 소유자가
+판단하며 그 피드백이 축적된다. **Patrol 자체는 읽기 + 플래그 + 감쇠 재계산만 하고 문서
+내용을 변경·삭제하지 않는다** — 삭제는 오직 사람 판단(judge)에서만 일어난다.
+
+```
+스케줄러(주기) ─┐
+               ├─▶ Patrol.run(ws) ─▶ 신호 수집(문서·피드백·freshness·소스 mtime)
+API 트리거(수동)┘        │              │
+                        │              ▼ 탐지기 4종(순수·격리 실행)
+                        │        [staleness·중복·고아·외부 불일치] → 후보
+                        │              ▼
+                        │        Review Queue enqueue(열린 항목 dedup + 유형별 상한)
+                        │              ▼
+                        ├─▶ 엣지 시간 감쇠 자동 재계산(수학적 유지보수)
+                        ├─▶ 메트릭 일 롤업(검색/그래프/유입/Patrol)
+                        └─▶ 실행 이력 기록
+```
+
+- **탐지기** (`patrol/detectors.rs`): (a) staleness — freshness 기준점 나이 + "관련 없음"
+  피드백 가중, (b) 중복 — 요약 토큰 Jaccard 유사도 상위 쌍(임베딩 없이 순수·결정적, 실제
+  중복의 지배 사례인 동일 내용 재유입을 잡음), (c) 고아 — 엣지 없는 문서(신규 유예), (d)
+  외부 불일치 — 커넥터 소스 수정 시각 vs 문서 유입 시각. **LLM 없이 수치 신호 기반**이라
+  전부 순수 함수·단위 테스트. 임계값은 워크스페이스 `patrol.strictness`에서 파생(엄격할수록
+  더 많이 플래그), 기본은 보수적(큐 쓰레기장 방지). 탐지기는 독립 실행되며 `combine`이 실패를
+  격리한다(하나의 실패가 나머지를 막지 않음).
+- **엣지 시간 감쇠** (`patrol/decay.rs`): `exp(-lambda * age_days)`로 오래된 엣지 가중치를
+  낮춰 그래프 확장에서 뒤로 밀리게 한다(Phase 2 lambda 재사용). `Edge.base_weight`(생성 시점
+  원본)를 기준으로 매번 재계산하므로 **반복 실행이 멱등**이다(base 없으면 최초 감쇠 때 현재
+  weight로 고정 — 구버전 하위호환). 감쇠는 문서 내용 변경이 아니므로 `updated_at`을 건드리지
+  않는다(staleness 기준점 리셋 방지). raw JSON이 SSoT, payload는 best-effort 동기화. 실행 시
+  전 문서를 스냅샷으로 적재하지 않고 **문서별로 `write_lock` 아래 최신 상태를 재로드**해 감쇠하므로,
+  패스가 도는 동안 동시 추가된 엣지를 stale 스냅샷으로 덮어쓰지 않는다(lost-update 제거).
+- **Review Queue** (`patrol/review.rs`): 워크스페이스별 단일 JSON. 상태 대기→판단(유효/수정
+  필요/삭제/기각). **열린 동일 (문서, 유형) 항목은 중복 생성 금지**, **판단은 멱등**(같은 판단
+  재제출이 상태를 깨지 않음, 부수효과 이중 실행 없음). enqueue는 유형별 상한으로 폭주를 막는다.
+- **판단 조율** (`Patrol.judge`): 유효 → freshness 기준점 갱신(당분간 staleness 유예), 삭제 →
+  **복구 가능 삭제**(`Indexer.soft_delete_document`: 버전 보관 후 삭제, 멱등). 부수효과를 상태
+  전이 전에 수행해 크래시 후 재제출로 복구되게 한다.
+- **freshness** (`patrol/freshness.rs`): "유효" 판단 시각을 문서별 맵으로 별도 파일에 둔다
+  (문서 raw JSON 미변경 — Patrol 불변식 순수 준수). staleness 탐지기가 이 기준점으로 나이를 잰다.
+- **피드백** (`patrol/feedback.rs`): 검색 결과 "관련 없음"을 일 단위 JSONL로 축적(실패 무해)
+  하고 문서별로 집계해 staleness 신호로 쓴다. 저장·집계까지만(ML 학습은 범위 밖).
+- **메트릭** (`patrol/metrics.rs`): 일자 롤업 — 검색(횟수·zero-result율·평균 점수, search_log
+  재활용), 그래프(노드·엣지·고아·평균 degree), 유입(문서 수·커넥터 요약 전략 분포), Patrol
+  (탐지 수·큐 처리율). 계산은 순수 함수, 저장은 `{YYYY-MM-DD}.json`, 기간 조회 API.
+- **스케줄러·이력** (`patrol/scheduler.rs`, `patrol/history.rs`): 커넥터 스케줄러와 동일한 틱
+  루프 + 오류 격리. `patrol.frequency`(hourly/daily/weekly)를 주기로 환산해 마지막 실행(이력)
+  기준으로 due를 판정한다. 수동 트리거는 동기 실행 후 리포트 반환.
+- **mock 주입** (`PatrolExecutor` trait): 문서 실행기(전 문서 조회·삭제·감쇠)를 trait으로
+  추상화해 `Indexer`가 구현하고, 오케스트레이터 단위 테스트는 mock으로 Qdrant·LLM 없이 전
+  경로(탐지·enqueue·판단·감쇠·롤업)를 고정한다.
+- **API** (`api/patrol.rs`): 실행 `POST /api/patrol/run`, 이력 `GET /api/patrol/history`, 큐
+  `GET /api/review`(상태·유형 필터)·판단 `POST /api/review/judge`(단건·일괄 통합), 피드백
+  `POST /api/feedback`, 메트릭 `GET /api/metrics`(기간). 실행·판단·피드백=write, 조회=워크스페이스 접근.
+
 ## Versioning (버전 보관)
 
 업데이트 경로에서 이전 문서 상태를 보관한다(잘못된 업데이트의 안전망).
@@ -400,7 +487,8 @@ API 트리거(수동)┘        │                                             
 
 ## Data Portability
 
-서버 이전 시 `backend/data/workspaces/` 디렉토리(원본 문서 + 워크스페이스 설정 + 버전 스냅샷)와
-`api_keys.json`을 복사 후 워크스페이스별 `POST /api/reindex?workspace={id}` 호출.
+서버 이전 시 `backend/data/workspaces/` 디렉토리(원본 문서 + 워크스페이스 설정 + 버전 스냅샷
++ 거버넌스 데이터: Review Queue·freshness·피드백·메트릭·Patrol 이력)와 `api_keys.json`을 복사
+후 워크스페이스별 `POST /api/reindex?workspace={id}` 호출.
 Qdrant는 파생 인덱스이므로 reindex만으로 전체 상태(**그래프 엣지 포함** — raw JSON의 edges가
 summary chunk payload로 복원됨) 복원 가능. 설정(`settings.json`)은 환경마다 재설정.

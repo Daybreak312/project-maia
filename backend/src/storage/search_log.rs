@@ -80,6 +80,27 @@ impl SearchLogStore {
             .join(format!("{date}.jsonl"))
     }
 
+    /// 특정 날짜(`YYYY-MM-DD`)의 검색 로그 레코드를 읽는다 (Phase 5 메트릭 롤업용).
+    ///
+    /// 파일이 없으면 빈 목록(그 날 검색이 없었음). 파싱 불가한 줄은 조용히 건너뛴다
+    /// — 하나의 손상된 줄이 그 날 메트릭 전체를 실패시키지 않는다(장애 격리).
+    pub async fn read_day(&self, workspace_id: &str, date: &str) -> Result<Vec<SearchLogRecord>> {
+        let path = self
+            .data_dir
+            .join("workspaces")
+            .join(workspace_id)
+            .join("search_logs")
+            .join(format!("{date}.jsonl"));
+        match fs::read_to_string(&path).await {
+            Ok(content) => Ok(content
+                .lines()
+                .filter_map(|line| serde_json::from_str::<SearchLogRecord>(line).ok())
+                .collect()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(e) => Err(e).context("검색 로그 읽기 실패"),
+        }
+    }
+
     /// 레코드를 해당 날짜 파일에 한 줄로 append한다. I/O 실패는 `Err`로 반환한다.
     pub async fn append(&self, record: &SearchLogRecord) -> Result<()> {
         let path = self.log_path(record);
@@ -242,6 +263,40 @@ mod tests {
 
         assert!(tmp.path().join("workspaces/personal/search_logs/2026-07-06.jsonl").exists());
         assert!(tmp.path().join("workspaces/work/search_logs/2026-07-06.jsonl").exists());
+    }
+
+    #[tokio::test]
+    async fn test_read_day_returns_records() {
+        let tmp = TempDir::new().unwrap();
+        let store = SearchLogStore::new(tmp.path());
+        store.append(&record_at((2026, 7, 6), "default", "hybrid")).await.unwrap();
+        store.append(&record_at((2026, 7, 6), "default", "agent")).await.unwrap();
+
+        let records = store.read_day("default", "2026-07-06").await.unwrap();
+        assert_eq!(records.len(), 2, "그 날의 두 레코드를 읽어야 한다");
+    }
+
+    #[tokio::test]
+    async fn test_read_day_missing_is_empty() {
+        let tmp = TempDir::new().unwrap();
+        let store = SearchLogStore::new(tmp.path());
+        let records = store.read_day("default", "2026-01-01").await.unwrap();
+        assert!(records.is_empty(), "검색 없던 날은 빈 목록");
+    }
+
+    #[tokio::test]
+    async fn test_read_day_skips_malformed_lines() {
+        // 손상된 줄이 섞여 있어도 정상 줄은 읽고 깨진 줄만 건너뛴다.
+        let tmp = TempDir::new().unwrap();
+        let store = SearchLogStore::new(tmp.path());
+        store.append(&record_at((2026, 7, 6), "default", "hybrid")).await.unwrap();
+        let path = tmp.path().join("workspaces/default/search_logs/2026-07-06.jsonl");
+        let mut content = std::fs::read_to_string(&path).unwrap();
+        content.push_str("this is not json\n");
+        std::fs::write(&path, content).unwrap();
+
+        let records = store.read_day("default", "2026-07-06").await.unwrap();
+        assert_eq!(records.len(), 1, "정상 줄만 읽어야 한다");
     }
 
     #[tokio::test]

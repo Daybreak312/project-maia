@@ -223,3 +223,83 @@ export interface SyncTriggerRequest {
   full?: boolean;
   concurrency?: number;
 }
+
+// ─── Patrol · 거버넌스 (Phase 5) ─────────────────────────────────
+export type ReviewStatus = 'pending' | 'valid' | 'needs_fix' | 'deleted' | 'dismissed';
+export type DetectorKind = 'staleness' | 'duplicate' | 'orphan' | 'external_mismatch';
+export type ReviewDecision = 'valid' | 'needs_fix' | 'deleted' | 'dismissed';
+
+/** Review Queue 한 항목 (탐지 후보 + 판단 상태). */
+export interface ReviewItem {
+  id: string;
+  workspace: string;
+  document_id: string;
+  kind: DetectorKind;
+  reason: string;
+  /** 탐지기가 남긴 근거 수치(유형별 상이). */
+  evidence: Record<string, unknown>;
+  status: ReviewStatus;
+  created_at: string;
+  decided_at?: string | null;
+}
+
+export interface JudgeResponse {
+  items: ReviewItem[];
+}
+
+export interface DetectionCounts {
+  staleness: number;
+  duplicate: number;
+  orphan: number;
+  external_mismatch: number;
+  total: number;
+}
+
+/** Patrol 실행 한 건의 기록. */
+export interface PatrolRun {
+  started_at: string;
+  finished_at: string;
+  trigger: string;
+  detections: DetectionCounts;
+  enqueued: number;
+  edges_decayed: number;
+  failed_detectors: string[];
+}
+
+export interface PatrolState {
+  last_run_at: string | null;
+  history: PatrolRun[];
+}
+
+export interface SearchMetrics {
+  count: number;
+  zero_result_rate: number;
+  avg_top_score: number;
+}
+export interface GraphMetrics {
+  nodes: number;
+  edges: number;
+  orphans: number;
+  avg_degree: number;
+}
+export interface IngestMetrics {
+  document_count: number;
+  strategy_distribution: Record<string, number>;
+}
+export interface PatrolMetrics {
+  detections: number;
+  open_items: number;
+  resolved_items: number;
+  resolution_rate: number;
+}
+
+/** 하루치 메트릭 롤업. */
+export interface DailyRollup {
+  date: string;
+  workspace: string;
+  search: SearchMetrics;
+  graph: GraphMetrics;
+  ingest: IngestMetrics;
+  patrol: PatrolMetrics;
+  generated_at: string;
+}

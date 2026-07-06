@@ -5,6 +5,7 @@ import { Toast } from './components/Toast';
 import { AddPage } from './pages/AddPage';
 import { SearchPage } from './pages/SearchPage';
 import { BrowsePage } from './pages/BrowsePage';
+import { ReviewPage } from './pages/ReviewPage';
 import { AdminPage } from './pages/AdminPage';
 import { api, getWorkspace, setWorkspace as persistWorkspace } from './api/client';
 import type { WorkspaceSummary } from './api/types';
@@ -67,6 +68,7 @@ function App() {
             <Route path="/" element={<AddPage showToast={showToast} />} />
             <Route path="/search" element={<SearchPage showToast={showToast} />} />
             <Route path="/browse" element={<BrowsePage showToast={showToast} />} />
+            <Route path="/review" element={<ReviewPage showToast={showToast} />} />
             <Route
               path="/admin"
               element={
