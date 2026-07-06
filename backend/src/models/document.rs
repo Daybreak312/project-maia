@@ -274,6 +274,10 @@ pub mod api {
         /// 기간 필터: 이 시각(포함) 이전 생성된 문서만.
         #[serde(default)]
         pub until: Option<DateTime<Utc>>,
+        /// agent(deep) 검색 활성화 (opt-in, Phase 3). None/false면 기존 단일 검색 동작.
+        /// true면 Search Agent가 충분성 평가·쿼리 재작성·그래프 확장으로 능동 탐색한다.
+        #[serde(default)]
+        pub agent: Option<bool>,
     }
 
     fn default_limit() -> usize {
@@ -296,6 +300,29 @@ pub mod api {
         pub total: usize,
         /// 사용된 검색 모드
         pub mode: String,
+        /// Phase 3 agent(deep) 검색 메타데이터. 기본(비 agent) 검색은 None →
+        /// 직렬화 생략(하위호환: 기존 클라이언트는 이 필드를 몰라도 무방).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub agent: Option<AgentSearchMeta>,
+    }
+
+    /// agent(deep) 검색의 탐색 과정 요약 — 에이전트가 어떻게 회상했는지를 관측 가능하게 한다.
+    ///
+    /// PRD 인수 조건: 응답에 라운드 수·사용된 쿼리들·그래프 확장 여부·폴백 여부가 포함된다.
+    #[derive(Debug, Clone, Serialize)]
+    pub struct AgentSearchMeta {
+        /// 수행된 검색 라운드 수 (초기 1회 + 재작성 재검색 횟수).
+        pub rounds: usize,
+        /// 실제로 시도된 쿼리 목록 (원 쿼리가 항상 첫 번째).
+        pub queries: Vec<String>,
+        /// 그래프 이웃 확장이 수행되었는지 여부.
+        pub graph_expanded: bool,
+        /// 그래프 확장으로 결과에 추가된 문서 수.
+        pub expansion_count: usize,
+        /// LLM 판단 실패/미설정으로 폴백(초기 결과 반환)했는지 여부.
+        pub fallback: bool,
+        /// 폴백 사유 또는 정상 종료 사유 (조기 종료·상한 도달 등).
+        pub reason: String,
     }
 
     #[derive(Debug, Clone, Serialize)]
@@ -310,6 +337,10 @@ pub mod api {
         /// 문서 생성 시각 (시간 인식 검색·표시용). Qdrant payload에서 유래.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub created_at: Option<DateTime<Utc>>,
+        /// 그래프 확장으로 추가된 결과의 유래 — 어느 검색 결과 문서의 이웃인지(Phase 3).
+        /// 직접 검색으로 매칭된 결과는 None(직렬화 생략).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub expanded_from: Option<Uuid>,
     }
 
     #[derive(Debug, Serialize)]
