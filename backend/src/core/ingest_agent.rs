@@ -98,13 +98,6 @@ impl IngestAgent {
         Self::default()
     }
 
-    /// 분할 상한을 지정해 생성한다. 0이 들어오면 1로 보정한다(최소 상한 보장).
-    pub fn with_max_split(max_split: usize) -> Self {
-        Self {
-            max_split: max_split.max(1),
-        }
-    }
-
     /// 입력과 후보 문서를 바탕으로 저장 전략을 판단한다.
     ///
     /// LLM 호출과 파싱을 최대 `MAX_DECISION_ATTEMPTS`회 시도한다. 모두 실패하면

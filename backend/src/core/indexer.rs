@@ -1057,7 +1057,7 @@ pub fn apply_period_filter(
     results
         .into_iter()
         .filter(|r| match r.created_at {
-            Some(ts) => since.map_or(true, |s| ts >= s) && until.map_or(true, |u| ts <= u),
+            Some(ts) => since.is_none_or(|s| ts >= s) && until.is_none_or(|u| ts <= u),
             None => false,
         })
         .collect()
