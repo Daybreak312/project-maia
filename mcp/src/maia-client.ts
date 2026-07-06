@@ -9,6 +9,8 @@ export interface SearchResult {
   id: string;
   summary: string;
   relevance_score: number;
+  /** 이 결과가 나온 출처 워크스페이스 (교차 검색 시 구분용) */
+  workspace?: string;
   matched_facts?: string[];
 }
 
@@ -57,20 +59,33 @@ export class MaiaClient {
     query: string,
     limit: number = 5,
     mode: string = "hybrid",
+    workspace?: string,
   ): Promise<SearchResponse> {
-    return this.post("/search", { query, limit, offset: 0, mode });
+    return this.post(this.withWorkspace("/search", workspace), {
+      query,
+      limit,
+      offset: 0,
+      mode,
+    });
   }
 
-  async ingest(content: string): Promise<IngestResponse> {
-    return this.post("/ingest", { content });
+  async ingest(content: string, workspace?: string): Promise<IngestResponse> {
+    return this.post(this.withWorkspace("/ingest", workspace), { content });
   }
 
-  async getDocument(id: string): Promise<DocumentResponse> {
-    return this.get(`/documents/${id}`);
+  async getDocument(id: string, workspace?: string): Promise<DocumentResponse> {
+    return this.get(this.withWorkspace(`/documents/${id}`, workspace));
   }
 
-  async listRecent(limit: number = 10): Promise<ListResponse> {
-    return this.get(`/recent?limit=${limit}&offset=0`);
+  async listRecent(limit: number = 10, workspace?: string): Promise<ListResponse> {
+    return this.get(this.withWorkspace(`/recent?limit=${limit}&offset=0`, workspace));
+  }
+
+  /** 워크스페이스가 지정되면 경로에 `workspace` 쿼리 파라미터를 덧붙인다. */
+  private withWorkspace(path: string, workspace?: string): string {
+    if (!workspace) return path;
+    const sep = path.includes("?") ? "&" : "?";
+    return `${path}${sep}workspace=${encodeURIComponent(workspace)}`;
   }
 
   private authHeaders(): Record<string, string> {

@@ -16,7 +16,22 @@ import { MaiaClient } from "./maia-client.js";
 
 const MAIA_URL = process.env.MAIA_URL ?? "http://localhost:8080";
 const MAIA_API_KEY = process.env.MAIA_API_KEY;
+/** 기본 워크스페이스. 미설정 시 서버가 API 키에 바인딩된 기본 워크스페이스를 사용한다. */
+const MAIA_WORKSPACE = process.env.MAIA_WORKSPACE;
 const client = new MaiaClient(MAIA_URL, MAIA_API_KEY);
+
+/** tool 인자로 받은 workspace가 없으면 환경변수 기본값을 사용한다. */
+function resolveWorkspace(workspace?: string): string | undefined {
+  return workspace ?? MAIA_WORKSPACE;
+}
+
+/** 모든 tool에 공통으로 추가되는 선택적 workspace 인자 스키마. */
+const workspaceArg = z
+  .string()
+  .optional()
+  .describe(
+    "Target workspace ID (e.g. 'personal', 'work'). Omit to use the default workspace bound to the API key.",
+  );
 
 const server = new McpServer({
   name: "maia",
@@ -54,9 +69,10 @@ INTERPRETING RESULTS:
       .enum(["hybrid", "vector", "keyword"])
       .default("hybrid")
       .describe("Search mode: hybrid (recommended), vector (semantic), keyword (exact match)"),
+    workspace: workspaceArg,
   },
-  async ({ query, limit, mode }) => {
-    const res = await client.search(query, limit, mode);
+  async ({ query, limit, mode, workspace }) => {
+    const res = await client.search(query, limit, mode, resolveWorkspace(workspace));
 
     if (res.results.length === 0) {
       return {
@@ -75,6 +91,9 @@ INTERPRETING RESULTS:
           `[${i + 1}] ${r.summary}`,
           `    relevance: ${(r.relevance_score * 100).toFixed(0)}%`,
         ];
+        if (r.workspace) {
+          lines.push(`    workspace: ${r.workspace}`);
+        }
         if (r.matched_facts && r.matched_facts.length > 0) {
           lines.push(`    matched_facts:`);
           r.matched_facts.forEach((f) => lines.push(`      - ${f}`));
@@ -110,9 +129,10 @@ Input can be any natural language text. The system automatically extracts: summa
     content: z
       .string()
       .describe("Information to store (natural language, no length limit)"),
+    workspace: workspaceArg,
   },
-  async ({ content }) => {
-    const res = await client.ingest(content);
+  async ({ content, workspace }) => {
+    const res = await client.ingest(content, resolveWorkspace(workspace));
 
     const parts = [
       `Saved successfully (id: ${res.id})`,
@@ -149,9 +169,10 @@ Use this when:
 Requires the document UUID from a previous search result.`,
   {
     id: z.string().uuid().describe("Document UUID (from search results)"),
+    workspace: workspaceArg,
   },
-  async ({ id }) => {
-    const doc = await client.getDocument(id);
+  async ({ id, workspace }) => {
+    const doc = await client.getDocument(id, resolveWorkspace(workspace));
 
     const parts = [
       `Document: ${doc.id}`,
@@ -188,9 +209,10 @@ Use when:
       .max(50)
       .default(10)
       .describe("Number of documents to retrieve"),
+    workspace: workspaceArg,
   },
-  async ({ limit }) => {
-    const res = await client.listRecent(limit);
+  async ({ limit, workspace }) => {
+    const res = await client.listRecent(limit, resolveWorkspace(workspace));
 
     if (res.documents.length === 0) {
       return {
