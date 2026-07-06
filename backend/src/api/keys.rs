@@ -61,6 +61,22 @@ pub struct CreateKeyResponse {
     pub key: ApiKeyInfo,
 }
 
+/// 발급 요청의 워크스페이스 스코프를 검증한다 (fail-closed).
+///
+/// 영속 키는 반드시 1개 이상의 워크스페이스를 명시해야 한다. 빈 스코프를 허용하면
+/// (과거) 전 워크스페이스 접근을 조용히 부여했고, `can_access_workspace` fail-closed
+/// 이후에는 접근 불가한 무용 키가 되므로 어느 쪽이든 400으로 거부한다.
+/// "unscoped = all"은 마스터키(MAIA_API_KEY, env) 전용 의미다.
+fn validate_key_scope(workspaces: &[String]) -> Result<(), (StatusCode, String)> {
+    if workspaces.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "At least one workspace must be specified (unscoped keys are not allowed)".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// GET /api/keys — 키 목록 (admin). 해시는 노출하지 않는다.
 pub async fn list_keys_handler(
     State(state): State<Arc<AppState>>,
@@ -78,6 +94,7 @@ pub async fn create_key_handler(
     Json(req): Json<CreateKeyRequest>,
 ) -> Result<Json<CreateKeyResponse>, (StatusCode, String)> {
     require_admin(&ctx)?;
+    validate_key_scope(&req.workspaces)?;
 
     let (key, raw) = state
         .api_keys
@@ -109,4 +126,22 @@ pub async fn revoke_key_handler(
     })?;
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_validate_key_scope_rejects_empty() {
+        // 빈 스코프는 400으로 거부되어야 한다 (fail-open 격리 우회 방지).
+        let (status, _) = validate_key_scope(&[]).unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_validate_key_scope_accepts_non_empty() {
+        assert!(validate_key_scope(&["work".to_string()]).is_ok());
+        assert!(validate_key_scope(&["a".to_string(), "b".to_string()]).is_ok());
+    }
 }

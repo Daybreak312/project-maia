@@ -46,21 +46,42 @@ pub async fn resolve_and_authorize_workspace(
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| ctx.default_workspace());
 
-    if !state.workspaces.exists(&ws).await {
+    let exists = state.workspaces.exists(&ws).await;
+    let can_access = ctx.can_access_workspace(&ws);
+    authorize_workspace_access(&ws, exists, can_access)?;
+
+    Ok(ws)
+}
+
+/// 워크스페이스 접근 결정 (순수 함수, 테스트 가능).
+///
+/// 존재/접근 두 사실로부터 결과를 결정한다:
+/// - 존재하지 않음 → 404
+/// - 존재하나 접근 불가 → 403 (PRD 인수 조건: 타 워크스페이스 접근 시 403)
+///
+/// 존재 확인을 접근 확인보다 먼저 한다. 신뢰 공유 모델(개인+소규모)이라 워크스페이스
+/// 존재 여부 노출은 수용하며, PRD가 명시적으로 403을 요구하므로 접근 실패를 404로
+/// 뭉개지 않는다.
+fn authorize_workspace_access(
+    ws: &str,
+    exists: bool,
+    can_access: bool,
+) -> Result<(), (StatusCode, String)> {
+    if !exists {
         return Err((
             StatusCode::NOT_FOUND,
             format!("Workspace '{}' not found", ws),
         ));
     }
 
-    if !ctx.can_access_workspace(&ws) {
+    if !can_access {
         return Err((
             StatusCode::FORBIDDEN,
             format!("API key does not have access to workspace '{}'", ws),
         ));
     }
 
-    Ok(ws)
+    Ok(())
 }
 
 /// admin 권한을 요구한다. 실패 시 403.
@@ -126,6 +147,28 @@ mod tests {
     #[test]
     fn test_require_write_returns_403() {
         let (status, _) = require_write(&ctx(Permission::ReadOnly)).unwrap_err();
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    // ──── authorize_workspace_access (403/404 매핑) ────
+
+    #[test]
+    fn test_authorize_workspace_access_ok() {
+        assert!(authorize_workspace_access("work", true, true).is_ok());
+    }
+
+    #[test]
+    fn test_authorize_workspace_access_not_found() {
+        // 존재하지 않는 워크스페이스 → 404
+        let (status, _) = authorize_workspace_access("ghost", false, false).unwrap_err();
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn test_authorize_workspace_access_forbidden() {
+        // 존재하지만 접근 불가 → 403 (PRD 인수 조건: 타 워크스페이스 접근 403).
+        // personal 스코프 키로 work 문서 접근 시나리오의 결정 로직.
+        let (status, _) = authorize_workspace_access("personal", true, false).unwrap_err();
         assert_eq!(status, StatusCode::FORBIDDEN);
     }
 }
