@@ -869,46 +869,52 @@ impl Indexer {
 
     /// 특정 워크스페이스에서 문서를 수정한다.
     pub async fn update_in_workspace(&self, id: uuid::Uuid, raw_content: String, workspace_id: &str) -> Result<IngestResponse> {
-        // 1. LLM으로 파싱
+        // 1. LLM 파싱 + 임베딩 (계산 — 쓰기 락 밖에서 수행해 임계 구역을 짧게 유지).
         tracing::info!("Re-parsing content for update...");
         let llm = self.get_llm_provider().await?;
         let parsed = llm.parse(&raw_content).await?;
-
-        // 2. 기존 문서의 created_at·edges 보존, updated_at 갱신.
-        //    edges는 문서의 raw JSON에 사는 그래프 상태이므로 재파싱 업데이트에서
-        //    유실되면 안 된다(reindex 생존 불변식과 동일한 이유).
-        let existing = self.documents.load(id, workspace_id).await?;
-
-        // 덮어쓰기 전에 이전 상태를 버전으로 보관한다(잘못된 업데이트의 안전망).
-        // 보관에 실패하면 이전 버전을 남길 수 없으므로 업데이트를 진행하지 않는다
-        // — "이전 버전 보장" 시맨틱을 지켜 오염 위험을 차단한다.
-        self.versions.archive(&existing, workspace_id).await?;
-
-        let now = chrono::Utc::now();
-        let doc = Document {
-            id,
-            raw_content,
-            summary: parsed.summary.clone(),
-            entities: parsed.entities.clone(),
-            facts: parsed.facts.clone(),
-            edges: existing.edges.clone(),
-            // 출처는 edges와 마찬가지로 재파싱 업데이트에서 보존한다(커넥터 유입 문서의
-            // provenance 유지). 커넥터 업데이트 경로는 이후 명시적으로 갱신한다.
-            source: existing.source.clone(),
-            created_at: existing.created_at,
-            updated_at: now,
-        };
-
-        // 3. 임베딩 생성 (summary + facts)
         tracing::info!("Re-generating embeddings...");
         let embedder = self.get_embedding_provider().await?;
-        let chunks = self.build_chunks(embedder.as_ref(), &parsed.summary, &parsed.facts).await?;
+        let chunks = self
+            .build_chunks(embedder.as_ref(), &parsed.summary, &parsed.facts)
+            .await?;
 
-        // 4. 파일 덮어쓰기
-        tracing::info!("Saving updated document...");
-        self.documents.save(&doc, workspace_id).await?;
+        // 2. 원자적 임계 구역: 최신 상태 재로드 → 버전 보관 → 병합 저장.
+        //    edges는 문서의 raw JSON에 사는 그래프 상태이므로 재파싱 업데이트에서
+        //    유실되면 안 된다(reindex 생존 불변식). LLM 파싱이 도는 동안 다른 라이터가
+        //    엣지를 추가했을 수 있으므로, 파싱 전에 캡처한 스냅샷이 아니라 **write_lock
+        //    아래에서 갓 로드한 최신 edges**를 보존해 lost-update를 막는다.
+        let doc = {
+            let _guard = self.documents.write_guard().await;
+            let existing = self.documents.load(id, workspace_id).await?;
 
-        // 5. 기존 chunk 전부 삭제 후 새 chunk 저장 (보존된 edges를 payload에 재비정규화)
+            // 덮어쓰기 전에 이전 상태를 버전으로 보관한다(잘못된 업데이트의 안전망).
+            // 보관에 실패하면 이전 버전을 남길 수 없으므로 업데이트를 진행하지 않는다
+            // — "이전 버전 보장" 시맨틱을 지켜 오염 위험을 차단한다.
+            self.versions.archive(&existing, workspace_id).await?;
+
+            let doc = Document {
+                id,
+                raw_content,
+                summary: parsed.summary.clone(),
+                entities: parsed.entities.clone(),
+                facts: parsed.facts.clone(),
+                // 최신 edges 보존(락 아래 재로드 → 동시 추가된 엣지도 포함).
+                edges: existing.edges.clone(),
+                // 출처는 edges와 마찬가지로 재파싱 업데이트에서 보존한다(커넥터 유입 문서의
+                // provenance 유지). 커넥터 업데이트 경로는 이후 명시적으로 갱신한다.
+                source: existing.source.clone(),
+                created_at: existing.created_at,
+                updated_at: chrono::Utc::now(),
+            };
+
+            // 파일 덮어쓰기 (락 아래 — 저장까지 원자적).
+            tracing::info!("Saving updated document...");
+            self.documents.save(&doc, workspace_id).await?;
+            doc
+        };
+
+        // 3. 기존 chunk 전부 삭제 후 새 chunk 저장 (보존된 edges를 payload에 재비정규화, 락 밖)
         tracing::info!("Updating Qdrant index...");
         self.qdrant.delete_by_document_id(workspace_id, id).await?;
         self.qdrant.upsert_chunks(
@@ -961,13 +967,20 @@ impl Indexer {
         source_id: Uuid,
         edge: Edge,
     ) -> Result<Document> {
-        // 1. raw JSON 로드 → 엣지 추가 → 저장 (SSoT 먼저)
-        let mut doc = self.documents.load(source_id, workspace_id).await?;
-        doc.add_edge(edge);
-        doc.updated_at = chrono::Utc::now();
-        self.documents.save(&doc, workspace_id).await?;
+        // 1. raw JSON을 원자적으로 로드→엣지 추가→저장 (SSoT 먼저).
+        //    DocumentStore::update가 쓰기 락으로 직렬화해, 동시 감쇠/업데이트가 이
+        //    엣지를 stale 스냅샷으로 덮어쓰는 lost-update를 원천 차단한다.
+        let doc = self
+            .documents
+            .update(source_id, workspace_id, |doc| {
+                doc.add_edge(edge);
+                doc.updated_at = chrono::Utc::now();
+                true
+            })
+            .await?
+            .ok_or_else(|| anyhow!("엣지 추가 대상 문서 없음: {source_id}"))?;
 
-        // 2. Qdrant summary payload의 edges 재동기화 (파생물 갱신)
+        // 2. Qdrant summary payload의 edges 재동기화 (파생물 갱신, 락 밖).
         self.qdrant
             .update_edges_payload(workspace_id, source_id, &doc.edges)
             .await?;
@@ -993,13 +1006,26 @@ impl Indexer {
         source_id: Uuid,
         target_id: Uuid,
     ) -> Result<usize> {
-        let mut doc = self.documents.load(source_id, workspace_id).await?;
-        let removed = doc.remove_edge(target_id);
+        // 원자적 로드→제거→저장 (쓰기 락으로 직렬화). 제거할 엣지가 없으면 저장을 생략한다.
+        let mut removed = 0usize;
+        let updated = self
+            .documents
+            .update(source_id, workspace_id, |doc| {
+                removed = doc.remove_edge(target_id);
+                if removed > 0 {
+                    doc.updated_at = chrono::Utc::now();
+                    true
+                } else {
+                    false
+                }
+            })
+            .await?
+            .ok_or_else(|| anyhow!("엣지 제거 대상 문서 없음: {source_id}"))?;
+
+        // 실제 제거가 있었을 때만 payload 재동기화 (파생물 갱신, 락 밖).
         if removed > 0 {
-            doc.updated_at = chrono::Utc::now();
-            self.documents.save(&doc, workspace_id).await?;
             self.qdrant
-                .update_edges_payload(workspace_id, source_id, &doc.edges)
+                .update_edges_payload(workspace_id, source_id, &updated.edges)
                 .await?;
         }
         Ok(removed)
@@ -1043,15 +1069,36 @@ impl Indexer {
         if lambda <= 0.0 {
             return Ok(0);
         }
-        let docs = self.documents.list_recent(usize::MAX, workspace_id).await?;
+        // 문서 ID만 열거하고(벌크 스냅샷을 저장에 재사용하지 않는다), 감쇠는 문서별로
+        // 쓰기 락 아래에서 **갓 로드된 최신 상태**에 적용한다. 기존 구현은 전 문서를 T0
+        // 스냅샷으로 적재한 뒤 그 stale 스냅샷을 문서별로 blind overwrite했기에, 패스가
+        // 도는 동안 커넥터/에이전트가 추가한 엣지가 조용히 소실됐다(SSoT 오염, reindex
+        // 복원 불가). 이제 경합 창이 코퍼스 전체 패스에서 단일 문서의 원자적 load→save로
+        // 좁혀지고, 그 창마저 write_lock이 직렬화해 lost-update가 사라진다.
+        let ids: Vec<Uuid> = self
+            .documents
+            .list_recent(usize::MAX, workspace_id)
+            .await?
+            .into_iter()
+            .map(|d| d.id)
+            .collect();
+
         let mut total_changed = 0usize;
-        for mut doc in docs {
-            let changed = apply_edge_decay(&mut doc, now, lambda);
+        for id in ids {
+            let mut changed = 0usize;
+            // 원자적 로드→감쇠→저장. updated_at은 의도적으로 보존(staleness 기준점 유지).
+            // 열거 후 삭제된 문서는 Ok(None) — 조용히 건너뛴다.
+            let updated = self
+                .documents
+                .update(id, workspace_id, |doc| {
+                    changed = apply_edge_decay(doc, now, lambda);
+                    changed > 0
+                })
+                .await?;
+            let Some(doc) = updated else { continue };
             if changed == 0 {
                 continue;
             }
-            // raw JSON 먼저 저장(SSoT). updated_at은 의도적으로 보존.
-            self.documents.save(&doc, workspace_id).await?;
             // payload 동기화는 best-effort — 실패해도 raw가 진실이라 reindex로 복원된다.
             if let Err(e) = self
                 .qdrant
@@ -1138,9 +1185,8 @@ impl Indexer {
         mode: ConnectorIngestMode,
         workspace_id: &str,
     ) -> Result<()> {
-        let existing = self.documents.load(id, workspace_id).await?;
-
-        // Parsed는 파싱·임베딩을 저장 전에 끝낸다(실패해도 문서 미변경 → 재시도 안전).
+        // Parsed는 파싱·임베딩을 저장 전(그리고 쓰기 락 밖)에 끝낸다 — 실패해도 문서
+        // 미변경(재시도 안전)이고, 임계 구역을 계산으로 늘리지 않는다.
         let (summary, entities, facts, chunks) = match mode {
             ConnectorIngestMode::Parsed => {
                 let llm = self.get_llm_provider().await?;
@@ -1154,24 +1200,33 @@ impl Indexer {
             ConnectorIngestMode::Raw => (fallback_summary(&content), Vec::new(), Vec::new(), None),
         };
 
-        // 덮어쓰기 전에 이전 버전 보관(안전망). 실패 시 업데이트 중단.
-        self.versions.archive(&existing, workspace_id).await?;
+        // 원자적 임계 구역: 최신 상태 재로드 → 버전 보관 → 교체 저장. 파싱이 도는 동안
+        // 다른 라이터가 추가한 엣지를 stale 스냅샷으로 덮어쓰지 않도록, write_lock 아래에서
+        // 갓 로드한 최신 edges를 보존한다(그래프 엣지는 재유입 업데이트에서 유실 금지).
+        let doc = {
+            let _guard = self.documents.write_guard().await;
+            let existing = self.documents.load(id, workspace_id).await?;
 
-        let doc = Document {
-            id,
-            raw_content: content,
-            summary: summary.clone(),
-            entities,
-            facts,
-            // 그래프 엣지는 재유입 업데이트에서 보존한다.
-            edges: existing.edges.clone(),
-            // 출처를 새 수정 시각으로 갱신한다(다음 스캔의 "변경 없음" 판단 기준).
-            source: Some(source),
-            created_at: existing.created_at,
-            updated_at: chrono::Utc::now(),
+            // 덮어쓰기 전에 이전 버전 보관(안전망). 실패 시 업데이트 중단.
+            self.versions.archive(&existing, workspace_id).await?;
+
+            let doc = Document {
+                id,
+                raw_content: content,
+                summary: summary.clone(),
+                entities,
+                facts,
+                // 최신 edges 보존(락 아래 재로드 → 동시 추가된 엣지도 포함).
+                edges: existing.edges.clone(),
+                // 출처를 새 수정 시각으로 갱신한다(다음 스캔의 "변경 없음" 판단 기준).
+                source: Some(source),
+                created_at: existing.created_at,
+                updated_at: chrono::Utc::now(),
+            };
+
+            self.documents.save(&doc, workspace_id).await?;
+            doc
         };
-
-        self.documents.save(&doc, workspace_id).await?;
 
         // Qdrant 재동기화: 기존 chunk 삭제 후 새로 upsert (best-effort — raw는 SSoT).
         if let Err(e) = self.qdrant.delete_by_document_id(workspace_id, id).await {
