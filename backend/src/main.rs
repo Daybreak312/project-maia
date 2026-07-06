@@ -96,6 +96,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/documents/:id", get(api::get_document_handler))
         .route("/documents/:id", put(api::update_document_handler))
         .route("/documents/:id", delete(api::delete_document_handler))
+        // 그래프: 이웃 조회 + 수동 엣지 추가/제거
+        .route("/documents/:id/neighbors", get(api::neighbors_handler))
+        .route("/documents/:id/edges", post(api::add_edge_handler))
+        .route("/documents/:id/edges/:target", delete(api::remove_edge_handler))
         .route("/recent", get(api::recent_handler))
         .route("/api/reindex", post(api::reindex_handler))
         .route("/api/settings", get(api::settings::get_settings))

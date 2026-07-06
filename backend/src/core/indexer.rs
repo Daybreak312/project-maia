@@ -760,6 +760,16 @@ impl Indexer {
         Ok(doc)
     }
 
+    /// 시작 문서의 그래프 이웃을 depth 상한과 함께 조회한다(순환 안전).
+    pub async fn neighbors_in_workspace(
+        &self,
+        start_id: Uuid,
+        depth: usize,
+        workspace_id: &str,
+    ) -> Result<Vec<crate::storage::NeighborNode>> {
+        self.documents.neighbors(start_id, depth, workspace_id).await
+    }
+
     /// 문서에서 특정 대상 문서로 향하는 엣지를 모두 제거한다. 제거된 개수를 반환한다.
     /// 제거할 엣지가 없으면 저장/동기화를 생략한다(불필요한 쓰기 억제).
     pub async fn remove_edge_from_document(

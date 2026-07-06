@@ -1,6 +1,7 @@
 mod ingest;
 mod search;
 mod documents;
+mod graph;
 mod workspaces;
 mod keys;
 pub mod settings;
@@ -8,6 +9,7 @@ pub mod settings;
 pub use ingest::ingest_handler;
 pub use search::search_handler;
 pub use documents::{get_document_handler, recent_handler, update_document_handler, delete_document_handler, reindex_handler};
+pub use graph::{neighbors_handler, add_edge_handler, remove_edge_handler};
 pub use workspaces::{
     list_workspaces_handler, create_workspace_handler, get_workspace_handler,
     delete_workspace_handler,
