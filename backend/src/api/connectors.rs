@@ -211,6 +211,16 @@ pub async fn trigger_connector_handler(
         return Err((StatusCode::NOT_FOUND, format!("Connector '{id}' not found")));
     }
 
+    // 이미 실행 중이면 409로 즉답한다(이중 클릭 방어). 데이터 무결성의 보증은 run_sync 내부의
+    // 원자적 claim이며, 이 검사는 그 앞단의 빠른 피드백이다(미세 경합 시엔 내부 claim이 최종
+    // 판정 — 중복 문서는 어느 경로에서도 생기지 않는다).
+    if state.connector_runner.is_running(&workspace, &id) {
+        return Err((
+            StatusCode::CONFLICT,
+            format!("Connector '{id}' is already running"),
+        ));
+    }
+
     let opts = SyncOptions {
         mode: ConnectorIngestMode::from_str_or_default(req.mode.as_deref()),
         full: req.full,

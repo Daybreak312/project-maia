@@ -93,6 +93,17 @@ impl ConnectorScheduler {
                 if !due(state.last_run_at, connector.interval_secs, now) {
                     continue;
                 }
+                // 이미 실행 중이면(수동 트리거 또는 이전 틱의 장기 실행) 이번 틱은 건너뛴다.
+                // run_sync 내부 claim이 최종 방어선이나, 여기서 미리 걸러 doomed 태스크 spawn과
+                // 로그 노이즈를 줄인다(장기 대량 적재 중 due가 매 틱 참이 되는 상황 대비).
+                if self.runner.is_running(&ws.id, &connector.id) {
+                    tracing::debug!(
+                        "커넥터 '{}'(ws={}) 이미 실행 중 — 이번 틱 스킵",
+                        connector.id,
+                        ws.id
+                    );
+                    continue;
+                }
 
                 ran += 1;
                 // 태스크로 격리 — 실행의 패닉이 스케줄러/서버를 죽이지 않는다.
@@ -283,5 +294,84 @@ mod tests {
         assert_eq!(ran, 1, "실행은 시도됨");
         assert!(ingest.count.load(Ordering::SeqCst) >= 1, "유입이 호출되고 패닉했지만 격리됨");
         // tick_once가 패닉하지 않고 여기까지 도달한 것 자체가 격리 증명.
+    }
+
+    /// 유입을 멈춰 세워 실행을 in-flight로 붙잡아 두는 mock.
+    struct GatedIngest {
+        count: AtomicUsize,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+    #[async_trait]
+    impl ConnectorIngest for GatedIngest {
+        async fn ingest_item(
+            &self,
+            _ws: &str,
+            _st: &str,
+            _cid: &str,
+            _item: ConnectorItem,
+            _mode: ConnectorIngestMode,
+        ) -> Result<ItemOutcome> {
+            self.count.fetch_add(1, Ordering::SeqCst);
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(ItemOutcome::Created(Uuid::new_v4()))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_tick_skips_already_running_connector() {
+        // 커넥터가 이미 실행 중이면(수동 트리거 등) 스케줄러 틱이 이를 건너뛴다.
+        // 스케줄러 틱과 수동 트리거가 겹쳐도 같은 커넥터가 이중 실행되지 않음을 보장한다.
+        let data = TempDir::new().unwrap();
+        let src = TempDir::new().unwrap();
+        fs::write(src.path().join("a.md"), "A").await.unwrap();
+
+        let workspaces = Arc::new(WorkspaceManager::new(data.path()).await.unwrap());
+        workspaces.ensure_default().await.unwrap();
+        let mut config = workspaces.get("default").await.unwrap();
+        config.connectors.push(ConnectorInstance {
+            id: "notes".to_string(),
+            enabled: true,
+            interval_secs: 3600,
+            concurrency: 1,
+            spec: ConnectorSpec::LocalDirectory(LocalDirectoryConfig {
+                directories: vec![src.path().to_string_lossy().into_owned()],
+                extensions: vec!["md".to_string()],
+                exclude: vec![],
+                max_file_bytes: 1_048_576,
+            }),
+        });
+        workspaces.update("default", config).await.unwrap();
+
+        let state = Arc::new(SyncStateStore::new(data.path()));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let ingest = Arc::new(GatedIngest {
+            count: AtomicUsize::new(0),
+            entered: entered.clone(),
+            release: release.clone(),
+        });
+        let runner = Arc::new(ConnectorRunner::new(
+            workspaces.clone(),
+            ingest.clone(),
+            state.clone(),
+        ));
+        let scheduler = Arc::new(ConnectorScheduler::new(runner.clone(), workspaces, state));
+
+        // 수동 실행을 백그라운드로 시작 — 유입에서 claim을 쥔 채 멈춘다.
+        let r = runner.clone();
+        let h = tokio::spawn(async move {
+            r.run_sync("default", "notes", SyncOptions::default()).await
+        });
+        entered.notified().await; // claim 보유 확정
+
+        // 스케줄러 틱: 이미 실행 중이므로 이 커넥터를 실행하지 않는다.
+        let ran = scheduler.tick_once(Utc::now()).await;
+        assert_eq!(ran, 0, "이미 실행 중인 커넥터는 스케줄러가 스킵");
+
+        release.notify_one();
+        h.await.unwrap().unwrap();
+        assert_eq!(ingest.count.load(Ordering::SeqCst), 1, "유입은 수동 실행 1회뿐");
     }
 }
