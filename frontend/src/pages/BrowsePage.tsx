@@ -2,7 +2,6 @@ import { useState, useEffect, useCallback } from 'react';
 import type { Document, IngestResponse } from '../api/types';
 import { api } from '../api/client';
 import { AccordionItem } from '../components/AccordionItem';
-import { TagFilter } from '../components/TagFilter';
 import { Pagination } from '../components/Pagination';
 import { LoadingSpinner } from '../components/LoadingSpinner';
 import { EmptyState } from '../components/EmptyState';
@@ -17,7 +16,6 @@ export function BrowsePage({ showToast }: BrowsePageProps) {
   const [documents, setDocuments] = useState<Document[]>([]);
   const [total, setTotal] = useState(0);
   const [offset, setOffset] = useState(0);
-  const [selectedTags, setSelectedTags] = useState<string[]>([]);
   const [isLoading, setIsLoading] = useState(true);
 
   const loadDocuments = useCallback(async (newOffset = 0) => {
@@ -28,7 +26,6 @@ export function BrowsePage({ showToast }: BrowsePageProps) {
       const response = await api.getRecent({
         limit: PAGE_SIZE,
         offset: newOffset,
-        tags: selectedTags.length > 0 ? selectedTags : undefined,
       });
       setDocuments(response.documents);
       setTotal(response.total);
@@ -37,17 +34,17 @@ export function BrowsePage({ showToast }: BrowsePageProps) {
     } finally {
       setIsLoading(false);
     }
-  }, [selectedTags, showToast]);
+  }, [showToast]);
 
   useEffect(() => {
     loadDocuments(0);
-  }, [selectedTags]); // Reload when tags change
+  }, []);
 
   const handleUpdate = (id: string, data: IngestResponse) => {
     setDocuments((prev) =>
       prev.map((doc) =>
         doc.id === id
-          ? { ...doc, summary: data.summary, tags: data.tags, entities: data.entities }
+          ? { ...doc, summary: data.summary, entities: data.entities }
           : doc
       )
     );
@@ -62,19 +59,12 @@ export function BrowsePage({ showToast }: BrowsePageProps) {
     <div className="max-w-4xl mx-auto p-6">
       <h2 className="text-xl font-semibold text-gray-200 mb-4">All Entries</h2>
 
-      {/* Tag Filter */}
-      <TagFilter selectedTags={selectedTags} onTagsChange={setSelectedTags} />
-
       {isLoading ? (
         <LoadingSpinner text="Loading entries..." />
       ) : documents.length === 0 ? (
         <EmptyState
-          title={selectedTags.length > 0 ? 'No matching entries' : 'No entries yet'}
-          description={
-            selectedTags.length > 0
-              ? 'Try removing some tag filters'
-              : 'Add your first entry to get started'
-          }
+          title="No entries yet"
+          description="Add your first entry to get started"
         />
       ) : (
         <>

@@ -79,7 +79,6 @@ impl LlmProvider for OpenAiChatProvider {
 
         Ok(ParsedContent {
             summary: parsed.summary,
-            tags: parsed.tags,
             entities: parsed
                 .entities
                 .into_iter()
@@ -234,7 +233,6 @@ struct EmbeddingData {
 #[derive(Debug, Deserialize)]
 struct ParsedContentRaw {
     summary: String,
-    tags: Vec<String>,
     entities: Vec<EntityRaw>,
     #[serde(default)]
     facts: Vec<String>,

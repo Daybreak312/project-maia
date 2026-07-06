@@ -1,3 +1,10 @@
+pub mod keys;
+
+pub use keys::{
+    ApiKey, ApiKeyManager, AuthContext, Permission,
+    generate_key_id, generate_raw_key, hash_key,
+};
+
 use std::sync::Arc;
 
 use axum::{

@@ -6,6 +6,7 @@ mod llm;
 mod models;
 mod settings;
 mod storage;
+mod workspace;
 
 use std::sync::Arc;
 
@@ -76,7 +77,6 @@ async fn main() -> anyhow::Result<()> {
         .route("/documents/:id", put(api::update_document_handler))
         .route("/documents/:id", delete(api::delete_document_handler))
         .route("/recent", get(api::recent_handler))
-        .route("/tags", get(api::tags_handler))
         .route("/api/reindex", post(api::reindex_handler))
         .route("/api/settings", get(api::settings::get_settings))
         .route("/api/settings", put(api::settings::update_settings))

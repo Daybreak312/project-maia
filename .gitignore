@@ -13,5 +13,14 @@ mcp/node_modules
 mcp/dist
 mcp/.env
 
+# Root
+.env
+data/
+
+# Orchestration state (ephemeral)
+.task-force/
+.dev-loop/
+.claude/
+
 # General
 .DS_Store

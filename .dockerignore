@@ -1,0 +1,9 @@
+backend/target
+frontend/node_modules
+frontend/dist
+mcp/node_modules
+mcp/dist
+.git
+*.md
+contexts/
+.DS_Store

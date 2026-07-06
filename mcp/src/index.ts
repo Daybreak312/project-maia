@@ -54,13 +54,9 @@ INTERPRETING RESULTS:
       .enum(["hybrid", "vector", "keyword"])
       .default("hybrid")
       .describe("Search mode: hybrid (recommended), vector (semantic), keyword (exact match)"),
-    tags: z
-      .array(z.string())
-      .optional()
-      .describe("Filter by tags (optional). Use get_tags first to see available tags."),
   },
-  async ({ query, limit, mode, tags }) => {
-    const res = await client.search(query, limit, mode, tags);
+  async ({ query, limit, mode }) => {
+    const res = await client.search(query, limit, mode);
 
     if (res.results.length === 0) {
       return {
@@ -78,7 +74,6 @@ INTERPRETING RESULTS:
         const lines = [
           `[${i + 1}] ${r.summary}`,
           `    relevance: ${(r.relevance_score * 100).toFixed(0)}%`,
-          `    tags: ${r.tags.join(", ")}`,
         ];
         if (r.matched_facts && r.matched_facts.length > 0) {
           lines.push(`    matched_facts:`);
@@ -123,7 +118,6 @@ Input can be any natural language text. The system automatically extracts: summa
       `Saved successfully (id: ${res.id})`,
       ``,
       `Summary: ${res.summary}`,
-      `Tags: ${res.tags.join(", ")}`,
     ];
 
     if (res.entities.length > 0) {
@@ -163,7 +157,6 @@ Requires the document UUID from a previous search result.`,
       `Document: ${doc.id}`,
       `Created: ${doc.created_at}`,
       `Summary: ${doc.summary}`,
-      `Tags: ${doc.tags.join(", ")}`,
     ];
 
     if (doc.entities.length > 0) {
@@ -210,7 +203,7 @@ Use when:
     const formatted = res.documents
       .map(
         (d, i) =>
-          `[${i + 1}] ${d.summary}\n    tags: ${d.tags.join(", ")}\n    created: ${d.created_at}\n    id: ${d.id}`,
+          `[${i + 1}] ${d.summary}\n    created: ${d.created_at}\n    id: ${d.id}`,
       )
       .join("\n\n");
 
@@ -219,32 +212,6 @@ Use when:
         {
           type: "text" as const,
           text: `Recent documents (${res.documents.length}/${res.total} total):\n\n${formatted}`,
-        },
-      ],
-    };
-  },
-);
-
-// ─── Tool: get_tags ──────────────────────────────────────────────────
-server.tool(
-  "get_tags",
-  `List all tags in the user's Maia knowledge base.
-
-Use when:
-- You want to know what categories of information the user has stored
-- Before using tag-based filtering in search_context`,
-  {},
-  async () => {
-    const tags = await client.getTags();
-
-    return {
-      content: [
-        {
-          type: "text" as const,
-          text:
-            tags.length > 0
-              ? `Available tags (${tags.length}): ${tags.join(", ")}`
-              : "No tags yet. The knowledge base is empty.",
         },
       ],
     };

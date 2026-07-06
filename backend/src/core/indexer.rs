@@ -5,7 +5,7 @@ use uuid::Uuid;
 
 use crate::core::search::{BM25Scorer, SearchMode, reciprocal_rank_fusion};
 use crate::llm::{create_llm_provider, create_embedding_provider, LlmProvider, EmbeddingProvider};
-use crate::models::{Document, ParsedContent, api::{IngestResponse, SearchResponse, SearchResult}};
+use crate::models::{Document, api::{IngestResponse, SearchResponse, SearchResult}};
 use crate::settings::SettingsManager;
 use crate::storage::{DocumentStore, QdrantStorage, SearchHit, ChunkData};
 
@@ -23,6 +23,9 @@ const SCORE_DROP_THRESHOLD: f32 = 0.15;
 
 /// 단일 검색의 최대 결과 수
 const MAX_RESULTS: usize = 5;
+
+/// 워크스페이스 미지정 시 사용되는 기본 워크스페이스 ID
+const DEFAULT_WORKSPACE: &str = "default";
 
 /// 모든 핵심 로직을 오케스트레이션하는 인덱서
 pub struct Indexer {
@@ -112,6 +115,11 @@ impl Indexer {
 
     /// 자연어 입력 → 파싱 → 임베딩 → 저장
     pub async fn ingest(&self, raw_content: String) -> Result<IngestResponse> {
+        self.ingest_to_workspace(raw_content, DEFAULT_WORKSPACE).await
+    }
+
+    /// 특정 워크스페이스에 문서를 인제스트한다.
+    pub async fn ingest_to_workspace(&self, raw_content: String, workspace_id: &str) -> Result<IngestResponse> {
         // 1. LLM으로 파싱
         tracing::info!("Parsing content...");
         let llm = self.get_llm_provider().await?;
@@ -121,7 +129,6 @@ impl Indexer {
         let doc = Document::new(
             raw_content,
             parsed.summary.clone(),
-            parsed.tags.clone(),
             parsed.entities.clone(),
             parsed.facts.clone(),
         );
@@ -133,14 +140,14 @@ impl Indexer {
 
         // 4. 파일 시스템에 원본 저장
         tracing::info!("Saving document...");
-        self.documents.save(&doc).await?;
+        self.documents.save(&doc, workspace_id).await?;
 
         // 5. Qdrant에 chunk 벡터 저장
-        tracing::info!("Indexing {} chunks to Qdrant...", chunks.len());
+        tracing::info!("Indexing {} chunks to Qdrant (workspace: {})...", chunks.len(), workspace_id);
         self.qdrant.upsert_chunks(
+            workspace_id,
             doc.id,
             &doc.summary,
-            &doc.tags,
             &doc.created_at.to_rfc3339(),
             chunks,
         ).await?;
@@ -150,7 +157,6 @@ impl Indexer {
         Ok(IngestResponse {
             id: doc.id,
             summary: doc.summary,
-            tags: doc.tags,
             entities: doc.entities,
             facts: doc.facts,
         })
@@ -163,19 +169,30 @@ impl Indexer {
         limit: usize,
         offset: usize,
         mode: Option<String>,
-        tags_filter: Option<Vec<String>>,
+    ) -> Result<SearchResponse> {
+        self.search_in_workspace(query, limit, offset, mode, DEFAULT_WORKSPACE).await
+    }
+
+    /// 특정 워크스페이스에서 검색한다.
+    pub async fn search_in_workspace(
+        &self,
+        query: String,
+        limit: usize,
+        offset: usize,
+        mode: Option<String>,
+        workspace_id: &str,
     ) -> Result<SearchResponse> {
         let search_mode: SearchMode = mode
             .as_deref()
             .and_then(|m| m.parse().ok())
             .unwrap_or_default();
 
-        tracing::info!("Search mode: {:?}, query: {}", search_mode, query);
+        tracing::info!("Search mode: {:?}, query: {}, workspace: {}", search_mode, query, workspace_id);
 
-        let (results, total) = match search_mode {
-            SearchMode::Vector => self.vector_search(&query, limit + offset, tags_filter.clone()).await?,
-            SearchMode::Keyword => self.keyword_search(&query, limit + offset, tags_filter.clone()).await?,
-            SearchMode::Hybrid => self.hybrid_search(&query, limit + offset, tags_filter.clone()).await?,
+        let (results, _total) = match search_mode {
+            SearchMode::Vector => self.vector_search(&query, limit + offset, workspace_id).await?,
+            SearchMode::Keyword => self.keyword_search(&query, limit + offset, workspace_id).await?,
+            SearchMode::Hybrid => self.hybrid_search(&query, limit + offset, workspace_id).await?,
         };
 
         // 관련성 기반 동적 필터링
@@ -204,13 +221,13 @@ impl Indexer {
         &self,
         query: &str,
         limit: usize,
-        tags_filter: Option<Vec<String>>,
+        workspace_id: &str,
     ) -> Result<(Vec<SearchResult>, usize)> {
         let embedder = self.get_embedding_provider().await?;
         let query_embedding = embedder.embed(query).await?;
 
         // over-fetch: 같은 문서의 여러 chunk가 히트할 수 있으므로
-        let hits = self.qdrant.search(query_embedding, tags_filter, limit * 5).await?;
+        let hits = self.qdrant.search(workspace_id, query_embedding, limit * 5).await?;
 
         // document_id 기준 그룹핑
         let mut groups: HashMap<Uuid, DocumentGroup> = HashMap::new();
@@ -222,7 +239,6 @@ impl Indexer {
 
             let group = groups.entry(hit.id).or_insert_with(|| DocumentGroup {
                 summary: hit.summary.clone(),
-                tags: hit.tags.clone(),
                 best_score: 0.0,
                 matched_facts: Vec::new(),
             });
@@ -248,7 +264,6 @@ impl Indexer {
             .map(|(id, group)| SearchResult {
                 id,
                 summary: group.summary,
-                tags: group.tags,
                 relevance_score: group.best_score,
                 matched_facts: group.matched_facts,
             })
@@ -262,10 +277,10 @@ impl Indexer {
         &self,
         query: &str,
         limit: usize,
-        tags_filter: Option<Vec<String>>,
+        workspace_id: &str,
     ) -> Result<(Vec<SearchResult>, usize)> {
         // summary chunk만 가져오기
-        let all_docs = self.qdrant.scroll_all(tags_filter, Some("summary")).await?;
+        let all_docs = self.qdrant.scroll_all(workspace_id, Some("summary")).await?;
 
         if all_docs.is_empty() {
             return Ok((vec![], 0));
@@ -277,13 +292,7 @@ impl Indexer {
 
         for doc in all_docs {
             let id_str = doc.id.to_string();
-            // chunk_text(summary) + tags를 결합하여 검색
-            let search_text = format!(
-                "{} {}",
-                doc.chunk_text,
-                doc.tags.join(" ")
-            );
-            scorer.add_document(&id_str, &search_text);
+            scorer.add_document(&id_str, &doc.chunk_text);
             doc_map.insert(id_str, doc);
         }
 
@@ -302,7 +311,6 @@ impl Indexer {
                 Some(SearchResult {
                     id: doc.id,
                     summary: doc.summary.clone(),
-                    tags: doc.tags.clone(),
                     relevance_score: (score / max_score).min(1.0),
                     matched_facts: vec![],
                 })
@@ -317,12 +325,12 @@ impl Indexer {
         &self,
         query: &str,
         limit: usize,
-        tags_filter: Option<Vec<String>>,
+        workspace_id: &str,
     ) -> Result<(Vec<SearchResult>, usize)> {
         // 병렬로 두 검색 수행
         let (vector_results, keyword_results) = tokio::join!(
-            self.vector_search(query, limit * 2, tags_filter.clone()),
-            self.keyword_search(query, limit * 2, tags_filter)
+            self.vector_search(query, limit * 2, workspace_id),
+            self.keyword_search(query, limit * 2, workspace_id)
         );
 
         let vector_results = vector_results.unwrap_or((vec![], 0)).0;
@@ -366,7 +374,6 @@ impl Indexer {
                 Some(SearchResult {
                     id: doc.id,
                     summary: doc.summary.clone(),
-                    tags: doc.tags.clone(),
                     relevance_score: score,
                     matched_facts: doc.matched_facts.clone(),
                 })
@@ -378,7 +385,12 @@ impl Indexer {
 
     /// 문서 조회
     pub async fn get_document(&self, id: uuid::Uuid) -> Result<Document> {
-        self.documents.load(id).await
+        self.documents.load(id, DEFAULT_WORKSPACE).await
+    }
+
+    /// 특정 워크스페이스에서 문서 조회
+    pub async fn get_document_from_workspace(&self, id: uuid::Uuid, workspace_id: &str) -> Result<Document> {
+        self.documents.load(id, workspace_id).await
     }
 
     /// 최근 문서 목록 (페이지네이션 지원)
@@ -386,15 +398,8 @@ impl Indexer {
         &self,
         limit: usize,
         offset: usize,
-        tags_filter: Option<Vec<String>>,
     ) -> Result<(Vec<Document>, usize)> {
-        let mut docs = self.documents.list_recent(1000).await?;
-
-        // 태그 필터링
-        if let Some(tags) = tags_filter {
-            docs.retain(|doc| tags.iter().any(|t| doc.tags.contains(t)));
-        }
-
+        let docs = self.documents.list_recent(1000, DEFAULT_WORKSPACE).await?;
         let total = docs.len();
         let paginated = docs.into_iter().skip(offset).take(limit).collect();
 
@@ -403,19 +408,23 @@ impl Indexer {
 
     /// 문서 수정 (raw_content 변경 → 재파싱 + 재임베딩)
     pub async fn update(&self, id: uuid::Uuid, raw_content: String) -> Result<IngestResponse> {
+        self.update_in_workspace(id, raw_content, DEFAULT_WORKSPACE).await
+    }
+
+    /// 특정 워크스페이스에서 문서를 수정한다.
+    pub async fn update_in_workspace(&self, id: uuid::Uuid, raw_content: String, workspace_id: &str) -> Result<IngestResponse> {
         // 1. LLM으로 파싱
         tracing::info!("Re-parsing content for update...");
         let llm = self.get_llm_provider().await?;
         let parsed = llm.parse(&raw_content).await?;
 
         // 2. 기존 문서의 created_at 보존, updated_at 갱신
-        let existing = self.documents.load(id).await?;
+        let existing = self.documents.load(id, workspace_id).await?;
         let now = chrono::Utc::now();
         let doc = Document {
             id,
             raw_content,
             summary: parsed.summary.clone(),
-            tags: parsed.tags.clone(),
             entities: parsed.entities.clone(),
             facts: parsed.facts.clone(),
             created_at: existing.created_at,
@@ -429,15 +438,15 @@ impl Indexer {
 
         // 4. 파일 덮어쓰기
         tracing::info!("Saving updated document...");
-        self.documents.save(&doc).await?;
+        self.documents.save(&doc, workspace_id).await?;
 
         // 5. 기존 chunk 전부 삭제 후 새 chunk 저장
         tracing::info!("Updating Qdrant index...");
-        self.qdrant.delete_by_document_id(id).await?;
+        self.qdrant.delete_by_document_id(workspace_id, id).await?;
         self.qdrant.upsert_chunks(
+            workspace_id,
             id,
             &doc.summary,
-            &doc.tags,
             &doc.created_at.to_rfc3339(),
             chunks,
         ).await?;
@@ -447,7 +456,6 @@ impl Indexer {
         Ok(IngestResponse {
             id: doc.id,
             summary: doc.summary,
-            tags: doc.tags,
             entities: doc.entities,
             facts: doc.facts,
         })
@@ -455,13 +463,18 @@ impl Indexer {
 
     /// 문서 삭제
     pub async fn delete(&self, id: uuid::Uuid) -> Result<()> {
+        self.delete_from_workspace(id, DEFAULT_WORKSPACE).await
+    }
+
+    /// 특정 워크스페이스에서 문서를 삭제한다.
+    pub async fn delete_from_workspace(&self, id: uuid::Uuid, workspace_id: &str) -> Result<()> {
         // 1. Qdrant에서 해당 문서의 모든 chunk 삭제
         tracing::info!("Deleting chunks from Qdrant...");
-        self.qdrant.delete_by_document_id(id).await?;
+        self.qdrant.delete_by_document_id(workspace_id, id).await?;
 
         // 2. 파일 삭제
         tracing::info!("Deleting document file...");
-        self.documents.delete(id).await?;
+        self.documents.delete(id, workspace_id).await?;
 
         tracing::info!("Deleted document: {}", id);
         Ok(())
@@ -470,7 +483,12 @@ impl Indexer {
     /// 파일 시스템의 모든 문서를 Qdrant에 재인덱싱
     /// 컬렉션을 완전히 재생성하여 구 스키마 데이터도 정리
     pub async fn reindex_all(&self) -> Result<usize> {
-        let docs = self.documents.list_recent(10000).await?;
+        self.reindex_workspace(DEFAULT_WORKSPACE).await
+    }
+
+    /// 특정 워크스페이스의 Qdrant 컬렉션을 재인덱싱한다.
+    pub async fn reindex_workspace(&self, workspace_id: &str) -> Result<usize> {
+        let docs = self.documents.list_recent(10000, workspace_id).await?;
         let total = docs.len();
 
         if total == 0 {
@@ -478,7 +496,7 @@ impl Indexer {
         }
 
         // 컬렉션 재생성 (구 스키마 orphan 포인트 정리)
-        self.qdrant.recreate_collection().await?;
+        self.qdrant.recreate_collection(workspace_id).await?;
 
         let embedder = self.get_embedding_provider().await?;
         let mut indexed = 0;
@@ -489,9 +507,9 @@ impl Indexer {
                 Ok(chunks) => {
                     let chunk_count = chunks.len();
                     if let Err(e) = self.qdrant.upsert_chunks(
+                        workspace_id,
                         doc.id,
                         &doc.summary,
-                        &doc.tags,
                         &doc.created_at.to_rfc3339(),
                         chunks,
                     ).await {
@@ -511,22 +529,6 @@ impl Indexer {
         Ok(indexed)
     }
 
-    /// 모든 고유 태그 목록 조회
-    pub async fn get_all_tags(&self) -> Result<Vec<String>> {
-        // summary chunk만 가져와서 태그 중복 방지
-        let docs = self.qdrant.scroll_all(None, Some("summary")).await?;
-        let mut tags: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-        for doc in docs {
-            for tag in doc.tags {
-                tags.insert(tag);
-            }
-        }
-
-        let mut tags_vec: Vec<_> = tags.into_iter().collect();
-        tags_vec.sort();
-        Ok(tags_vec)
-    }
 }
 
 /// 검색 결과를 관련성 기준으로 동적 필터링
@@ -569,7 +571,6 @@ fn filter_by_relevance(results: Vec<SearchResult>) -> Vec<SearchResult> {
 /// 벡터 검색 그룹핑을 위한 내부 구조체
 struct DocumentGroup {
     summary: String,
-    tags: Vec<String>,
     best_score: f32,
     matched_facts: Vec<String>,
 }

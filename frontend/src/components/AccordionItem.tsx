@@ -116,18 +116,6 @@ export function AccordionItem({
       {/* Content */}
       {isOpen && (
         <div className="p-4 pt-0 border-t border-border">
-          {/* Tags */}
-          <div className="flex flex-wrap gap-2 mb-4">
-            {doc.tags.map((tag, i) => (
-              <span
-                key={i}
-                className="bg-primary/20 text-primary px-3 py-1 rounded-full text-sm"
-              >
-                {tag}
-              </span>
-            ))}
-          </div>
-
           {/* Entities */}
           {doc.entities.length > 0 && (
             <div className="flex flex-col gap-2 mb-4">

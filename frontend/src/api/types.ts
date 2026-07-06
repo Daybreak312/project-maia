@@ -15,7 +15,6 @@ export interface Document {
   id: string;
   raw_content: string;
   summary: string;
-  tags: string[];
   entities: Entity[];
   created_at: string;
 }
@@ -23,14 +22,12 @@ export interface Document {
 export interface IngestResponse {
   id: string;
   summary: string;
-  tags: string[];
   entities: Entity[];
 }
 
 export interface SearchResult {
   id: string;
   summary: string;
-  tags: string[];
   relevance_score: number;
 }
 
@@ -46,7 +43,6 @@ export interface SearchOptions {
   limit?: number;
   offset?: number;
   mode?: 'vector' | 'keyword' | 'hybrid';
-  tags?: string[];
 }
 
 export interface ListResponse {
@@ -59,7 +55,6 @@ export interface ListResponse {
 export interface ListOptions {
   limit?: number;
   offset?: number;
-  tags?: string[];
 }
 
 export interface ProviderInfo {

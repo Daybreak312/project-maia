@@ -45,7 +45,6 @@ export function AddPage({ showToast }: AddPageProps) {
         id: result.id,
         raw_content: content.trim(),
         summary: result.summary,
-        tags: result.tags,
         entities: result.entities,
         created_at: new Date().toISOString(),
       };
@@ -61,7 +60,7 @@ export function AddPage({ showToast }: AddPageProps) {
     setRecentDocs((prev) =>
       prev.map((doc) =>
         doc.id === id
-          ? { ...doc, summary: data.summary, tags: data.tags, entities: data.entities }
+          ? { ...doc, summary: data.summary, entities: data.entities }
           : doc
       )
     );

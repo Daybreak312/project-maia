@@ -82,7 +82,6 @@ impl LlmProvider for GeminiProvider {
 
         Ok(ParsedContent {
             summary: parsed.summary,
-            tags: parsed.tags,
             entities: parsed
                 .entities
                 .into_iter()
@@ -235,7 +234,6 @@ struct EmbeddingValues {
 #[derive(Debug, Deserialize)]
 struct ParsedContentRaw {
     summary: String,
-    tags: Vec<String>,
     entities: Vec<EntityRaw>,
     #[serde(default)]
     facts: Vec<String>,

@@ -5,23 +5,34 @@ use uuid::Uuid;
 
 use crate::models::Document;
 
-/// 원본 문서를 파일 시스템에 저장
+/// 원본 문서를 파일 시스템에 저장 (워크스페이스별 경로 분리)
+///
+/// 저장 경로: `{data_dir}/workspaces/{workspace_id}/documents/{doc_id}.json`
 pub struct DocumentStore {
-    base_path: PathBuf,
+    data_dir: PathBuf,
 }
 
 impl DocumentStore {
-    pub async fn new(base_path: impl Into<PathBuf>) -> Result<Self> {
-        let base_path = base_path.into();
-        fs::create_dir_all(&base_path)
+    pub async fn new(data_dir: impl Into<PathBuf>) -> Result<Self> {
+        let data_dir = data_dir.into();
+        Ok(Self { data_dir })
+    }
+
+    /// 워크스페이스의 문서 디렉토리 경로
+    fn workspace_docs_path(&self, workspace_id: &str) -> PathBuf {
+        self.data_dir
+            .join("workspaces")
+            .join(workspace_id)
+            .join("documents")
+    }
+
+    pub async fn save(&self, doc: &Document, workspace_id: &str) -> Result<PathBuf> {
+        let base = self.workspace_docs_path(workspace_id);
+        fs::create_dir_all(&base)
             .await
             .context("Failed to create document storage directory")?;
 
-        Ok(Self { base_path })
-    }
-
-    pub async fn save(&self, doc: &Document) -> Result<PathBuf> {
-        let file_path = self.base_path.join(format!("{}.json", doc.id));
+        let file_path = base.join(format!("{}.json", doc.id));
         let content = serde_json::to_string_pretty(doc)?;
 
         fs::write(&file_path, content)
@@ -31,8 +42,10 @@ impl DocumentStore {
         Ok(file_path)
     }
 
-    pub async fn load(&self, id: Uuid) -> Result<Document> {
-        let file_path = self.base_path.join(format!("{}.json", id));
+    pub async fn load(&self, id: Uuid, workspace_id: &str) -> Result<Document> {
+        let file_path = self
+            .workspace_docs_path(workspace_id)
+            .join(format!("{}.json", id));
         let content = fs::read_to_string(&file_path)
             .await
             .context("Failed to read document file")?;
@@ -41,21 +54,31 @@ impl DocumentStore {
         Ok(doc)
     }
 
-    pub async fn exists(&self, id: Uuid) -> bool {
-        let file_path = self.base_path.join(format!("{}.json", id));
-        file_path.exists()
+    pub async fn exists(&self, id: Uuid, workspace_id: &str) -> bool {
+        self.workspace_docs_path(workspace_id)
+            .join(format!("{}.json", id))
+            .exists()
     }
 
-    pub async fn delete(&self, id: Uuid) -> Result<()> {
-        let file_path = self.base_path.join(format!("{}.json", id));
+    pub async fn delete(&self, id: Uuid, workspace_id: &str) -> Result<()> {
+        let file_path = self
+            .workspace_docs_path(workspace_id)
+            .join(format!("{}.json", id));
         fs::remove_file(&file_path)
             .await
             .context("Failed to delete document file")?;
         Ok(())
     }
 
-    pub async fn list_recent(&self, limit: usize) -> Result<Vec<Document>> {
-        let mut entries = fs::read_dir(&self.base_path)
+    pub async fn list_recent(&self, limit: usize, workspace_id: &str) -> Result<Vec<Document>> {
+        let base = self.workspace_docs_path(workspace_id);
+
+        // 디렉토리가 없으면 빈 목록 반환
+        if !base.exists() {
+            return Ok(Vec::new());
+        }
+
+        let mut entries = fs::read_dir(&base)
             .await
             .context("Failed to read document directory")?;
 
@@ -77,5 +100,140 @@ impl DocumentStore {
         docs.truncate(limit);
 
         Ok(docs)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::Document;
+    use tempfile::TempDir;
+
+    fn make_doc(content: &str) -> Document {
+        Document::new(
+            content.to_string(),
+            format!("Summary of {}", content),
+            vec![],
+            vec![],
+        )
+    }
+
+    async fn setup() -> (TempDir, DocumentStore) {
+        let tmp = TempDir::new().unwrap();
+        let store = DocumentStore::new(tmp.path()).await.unwrap();
+        (tmp, store)
+    }
+
+    #[tokio::test]
+    async fn test_save_and_load() {
+        let (_tmp, store) = setup().await;
+        let doc = make_doc("hello world");
+        let id = doc.id;
+
+        store.save(&doc, "default").await.unwrap();
+        let loaded = store.load(id, "default").await.unwrap();
+
+        assert_eq!(loaded.id, id);
+        assert_eq!(loaded.raw_content, "hello world");
+    }
+
+    #[tokio::test]
+    async fn test_save_creates_workspace_dir() {
+        let (tmp, store) = setup().await;
+        let doc = make_doc("test");
+
+        store.save(&doc, "my-ws").await.unwrap();
+
+        let ws_dir = tmp.path().join("workspaces/my-ws/documents");
+        assert!(ws_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn test_load_nonexistent_fails() {
+        let (_tmp, store) = setup().await;
+        let result = store.load(Uuid::new_v4(), "default").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_workspace_isolation() {
+        let (_tmp, store) = setup().await;
+        let doc = make_doc("isolated");
+        let id = doc.id;
+
+        store.save(&doc, "ws-a").await.unwrap();
+
+        assert!(store.exists(id, "ws-a").await);
+        assert!(!store.exists(id, "ws-b").await);
+        assert!(store.load(id, "ws-b").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_delete() {
+        let (_tmp, store) = setup().await;
+        let doc = make_doc("will delete");
+        let id = doc.id;
+
+        store.save(&doc, "default").await.unwrap();
+        assert!(store.exists(id, "default").await);
+
+        store.delete(id, "default").await.unwrap();
+        assert!(!store.exists(id, "default").await);
+    }
+
+    #[tokio::test]
+    async fn test_delete_nonexistent_fails() {
+        let (_tmp, store) = setup().await;
+        let result = store.delete(Uuid::new_v4(), "default").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_list_recent_empty_workspace() {
+        let (_tmp, store) = setup().await;
+        let docs = store.list_recent(10, "empty-ws").await.unwrap();
+        assert!(docs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_list_recent_returns_docs() {
+        let (_tmp, store) = setup().await;
+
+        store.save(&make_doc("first"), "default").await.unwrap();
+        store.save(&make_doc("second"), "default").await.unwrap();
+
+        let docs = store.list_recent(10, "default").await.unwrap();
+        assert_eq!(docs.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_list_recent_respects_limit() {
+        let (_tmp, store) = setup().await;
+
+        for i in 0..5 {
+            store
+                .save(&make_doc(&format!("doc {}", i)), "default")
+                .await
+                .unwrap();
+        }
+
+        let docs = store.list_recent(3, "default").await.unwrap();
+        assert_eq!(docs.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_list_recent_workspace_isolation() {
+        let (_tmp, store) = setup().await;
+
+        store.save(&make_doc("a"), "ws-a").await.unwrap();
+        store.save(&make_doc("b"), "ws-b").await.unwrap();
+
+        let a_docs = store.list_recent(10, "ws-a").await.unwrap();
+        let b_docs = store.list_recent(10, "ws-b").await.unwrap();
+
+        assert_eq!(a_docs.len(), 1);
+        assert_eq!(b_docs.len(), 1);
+        assert_eq!(a_docs[0].raw_content, "a");
+        assert_eq!(b_docs[0].raw_content, "b");
     }
 }

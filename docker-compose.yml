@@ -1,0 +1,27 @@
+services:
+  qdrant:
+    image: qdrant/qdrant:latest
+    volumes:
+      - ~/project-maia/qdrant:/qdrant/storage
+    restart: unless-stopped
+
+  app:
+    build: .
+    volumes:
+      - ~/project-maia/data:/data
+    environment:
+      - SERVER_PORT=8080
+      - QDRANT_URL=http://qdrant:6333
+      - DATA_DIR=/data
+      - STATIC_DIR=/app/static
+      - MAIA_API_KEY=${MAIA_API_KEY}
+    depends_on:
+      - qdrant
+    restart: unless-stopped
+
+  tunnel:
+    image: cloudflare/cloudflared:latest
+    command: tunnel run --token ${CLOUDFLARE_TUNNEL_TOKEN}
+    depends_on:
+      - app
+    restart: unless-stopped

@@ -21,7 +21,7 @@ project-maia/
 │   │   ├── api/                # HTTP API 레이어
 │   │   │   ├── mod.rs
 │   │   │   ├── ingest.rs       # POST /ingest
-│   │   │   ├── search.rs       # POST /search, GET /tags
+│   │   │   ├── search.rs       # POST /search
 │   │   │   ├── documents.rs    # CRUD /documents, GET /recent, POST /api/reindex
 │   │   │   └── settings.rs     # 설정 API
 │   │   │
@@ -132,7 +132,6 @@ project-maia/
 | `ingest_information` | 새 정보 저장 | `POST /ingest` |
 | `get_document` | 문서 원문 조회 | `GET /documents/{id}` |
 | `list_recent_documents` | 최근 문서 목록 | `GET /recent` |
-| `get_tags` | 태그 목록 | `GET /tags` |
 
 ## Indexing Architecture (Atomic Fact Chunking)
 
@@ -141,7 +140,7 @@ project-maia/
 ├── 1 summary chunk (embed(summary))       ← 항상 존재
 └── M fact chunks   (embed(fact[0..M-1]))  ← LLM이 추출한 독립적 사실
 
-Point Payload: { document_id, chunk_type, chunk_index, chunk_text, summary, tags, created_at }
+Point Payload: { document_id, chunk_type, chunk_index, chunk_text, summary, created_at }
 Payload Indexes: document_id (Keyword), chunk_type (Keyword)
 ```
 

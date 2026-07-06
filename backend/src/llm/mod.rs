@@ -10,7 +10,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::models::{Entity, ParsedContent};
+use crate::models::ParsedContent;
 
 /// LLM Provider 종류
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -98,7 +98,6 @@ pub fn build_parse_prompt(content: &str) -> String {
 ## 출력 형식 (JSON)
 {{
   "summary": "원본의 핵심 내용을 1-2문장으로 압축. 원본에 있는 키워드를 그대로 사용",
-  "tags": ["원본에서 파생된 분류 태그 3-5개"],
   "entities": [
     {{
       "entity_type": "company|person|money|date|skill|project|location|other",
@@ -113,7 +112,6 @@ pub fn build_parse_prompt(content: &str) -> String {
 
 ## 추출 규칙
 - summary: 원본 키워드 보존, 나중에 검색될 수 있도록 핵심어 포함
-- tags: 면접, 연봉협상, 이직 등 일반적 분류
 - entities: 회사명, 금액, 날짜, 기술스택 등 구체적 고유명사/값
 - facts: 원문을 독립적으로 이해 가능한 사실 문장(atomic fact)으로 분해. 각 문장은 주어/목적어를 생략하지 않고 단독으로 의미가 통해야 함. 원문이 1-2문장으로 짧으면 빈 배열 허용
 - JSON만 출력, 다른 텍스트 없이"#

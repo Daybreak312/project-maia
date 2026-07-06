@@ -8,7 +8,6 @@
 export interface SearchResult {
   id: string;
   summary: string;
-  tags: string[];
   relevance_score: number;
   matched_facts?: string[];
 }
@@ -23,7 +22,6 @@ export interface SearchResponse {
 export interface IngestResponse {
   id: string;
   summary: string;
-  tags: string[];
   entities: Entity[];
   facts?: string[];
 }
@@ -38,7 +36,6 @@ export interface DocumentResponse {
   id: string;
   raw_content: string;
   summary: string;
-  tags: string[];
   entities: Entity[];
   created_at: string;
 }
@@ -60,9 +57,8 @@ export class MaiaClient {
     query: string,
     limit: number = 5,
     mode: string = "hybrid",
-    tags?: string[],
   ): Promise<SearchResponse> {
-    return this.post("/search", { query, limit, offset: 0, mode, tags });
+    return this.post("/search", { query, limit, offset: 0, mode });
   }
 
   async ingest(content: string): Promise<IngestResponse> {
@@ -75,10 +71,6 @@ export class MaiaClient {
 
   async listRecent(limit: number = 10): Promise<ListResponse> {
     return this.get(`/recent?limit=${limit}&offset=0`);
-  }
-
-  async getTags(): Promise<string[]> {
-    return this.get("/tags");
   }
 
   private authHeaders(): Record<string, string> {

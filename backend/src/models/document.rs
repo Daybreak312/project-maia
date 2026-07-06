@@ -8,7 +8,6 @@ pub struct Document {
     pub id: Uuid,
     pub raw_content: String,
     pub summary: String,
-    pub tags: Vec<String>,
     pub entities: Vec<Entity>,
     #[serde(default)]
     pub facts: Vec<String>,
@@ -20,7 +19,6 @@ impl Document {
     pub fn new(
         raw_content: String,
         summary: String,
-        tags: Vec<String>,
         entities: Vec<Entity>,
         facts: Vec<String>,
     ) -> Self {
@@ -29,7 +27,6 @@ impl Document {
             id: Uuid::new_v4(),
             raw_content,
             summary,
-            tags,
             entities,
             facts,
             created_at: now,
@@ -63,7 +60,6 @@ pub enum EntityType {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParsedContent {
     pub summary: String,
-    pub tags: Vec<String>,
     pub entities: Vec<Entity>,
     #[serde(default)]
     pub facts: Vec<String>,
@@ -82,7 +78,6 @@ pub mod api {
     pub struct IngestResponse {
         pub id: Uuid,
         pub summary: String,
-        pub tags: Vec<String>,
         pub entities: Vec<Entity>,
         pub facts: Vec<String>,
     }
@@ -97,9 +92,6 @@ pub mod api {
         /// 검색 모드: "vector", "keyword", "hybrid" (기본값: hybrid)
         #[serde(default)]
         pub mode: Option<String>,
-        /// 태그 필터 (해당 태그가 있는 문서만)
-        #[serde(default)]
-        pub tags: Option<Vec<String>>,
     }
 
     fn default_limit() -> usize {
@@ -112,9 +104,6 @@ pub mod api {
         pub limit: usize,
         #[serde(default)]
         pub offset: usize,
-        /// 태그 필터
-        #[serde(default)]
-        pub tags: Option<Vec<String>>,
     }
 
     #[derive(Debug, Serialize)]
@@ -131,7 +120,6 @@ pub mod api {
     pub struct SearchResult {
         pub id: Uuid,
         pub summary: String,
-        pub tags: Vec<String>,
         pub relevance_score: f32,
         #[serde(skip_serializing_if = "Vec::is_empty")]
         pub matched_facts: Vec<String>,
@@ -142,7 +130,6 @@ pub mod api {
         pub id: Uuid,
         pub raw_content: String,
         pub summary: String,
-        pub tags: Vec<String>,
         pub entities: Vec<Entity>,
         pub created_at: DateTime<Utc>,
     }

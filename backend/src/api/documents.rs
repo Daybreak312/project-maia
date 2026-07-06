@@ -28,7 +28,6 @@ pub async fn get_document_handler(
                 id: doc.id,
                 raw_content: doc.raw_content,
                 summary: doc.summary,
-                tags: doc.tags,
                 entities: doc.entities,
                 created_at: doc.created_at,
             })
@@ -45,8 +44,6 @@ pub struct RecentQuery {
     pub limit: usize,
     #[serde(default)]
     pub offset: usize,
-    /// 쉼표로 구분된 태그 목록
-    pub tags: Option<String>,
 }
 
 fn default_limit() -> usize {
@@ -65,13 +62,9 @@ pub async fn recent_handler(
     State(state): State<Arc<AppState>>,
     Query(query): Query<RecentQuery>,
 ) -> Result<Json<ListResponse>, (StatusCode, String)> {
-    let tags_filter = query.tags.map(|t| {
-        t.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
-    });
-
     state
         .indexer
-        .recent(query.limit, query.offset, tags_filter)
+        .recent(query.limit, query.offset)
         .await
         .map(|(docs, total)| {
             Json(ListResponse {
@@ -81,7 +74,6 @@ pub async fn recent_handler(
                         id: doc.id,
                         raw_content: doc.raw_content,
                         summary: doc.summary,
-                        tags: doc.tags,
                         entities: doc.entities,
                         created_at: doc.created_at,
                     })

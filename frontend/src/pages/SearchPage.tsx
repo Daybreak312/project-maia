@@ -3,7 +3,6 @@ import type { Document, SearchResult, IngestResponse } from '../api/types';
 import { api } from '../api/client';
 import { AccordionItem } from '../components/AccordionItem';
 import { SearchModeSelector } from '../components/SearchModeSelector';
-import { TagFilter } from '../components/TagFilter';
 import { Pagination } from '../components/Pagination';
 import { LoadingSpinner } from '../components/LoadingSpinner';
 import { EmptyState } from '../components/EmptyState';
@@ -24,7 +23,6 @@ export function SearchPage({ showToast }: SearchPageProps) {
   const inputRef = useRef<HTMLInputElement>(null);
   const [query, setQuery] = useState('');
   const [mode, setMode] = useState<SearchMode>('hybrid');
-  const [selectedTags, setSelectedTags] = useState<string[]>([]);
   const [isSearching, setIsSearching] = useState(false);
   const [results, setResults] = useState<SearchResultWithDoc[]>([]);
   const [total, setTotal] = useState(0);
@@ -45,7 +43,6 @@ export function SearchPage({ showToast }: SearchPageProps) {
         limit: PAGE_SIZE,
         offset: newOffset,
         mode,
-        tags: selectedTags.length > 0 ? selectedTags : undefined,
       });
 
       setTotal(response.total);
@@ -86,11 +83,9 @@ export function SearchPage({ showToast }: SearchPageProps) {
           ? {
               ...result,
               summary: data.summary,
-              tags: data.tags,
               document: {
                 ...result.document,
                 summary: data.summary,
-                tags: data.tags,
                 entities: data.entities,
               },
             }
@@ -133,9 +128,6 @@ export function SearchPage({ showToast }: SearchPageProps) {
           <SearchModeSelector mode={mode} onModeChange={setMode} />
         </div>
       </form>
-
-      {/* Tag Filter */}
-      <TagFilter selectedTags={selectedTags} onTagsChange={setSelectedTags} />
 
       {/* Search Results */}
       <div>

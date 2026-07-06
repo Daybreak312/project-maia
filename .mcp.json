@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "maia-dev": {
+      "type": "stdio",
+      "command": "node",
+      "args": [
+        "/Users/daybreak312/IdeaProjects/project-maia/mcp/dist/index.js"
+      ],
+      "env": {
+        "MAIA_URL": "http://localhost:8080"
+      }
+    }
+  }
+}

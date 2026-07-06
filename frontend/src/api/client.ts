@@ -48,7 +48,6 @@ export const api = {
         limit: options.limit ?? 10,
         offset: options.offset ?? 0,
         mode: options.mode ?? 'hybrid',
-        tags: options.tags,
       }),
     }),
 
@@ -71,14 +70,8 @@ export const api = {
     const params = new URLSearchParams();
     params.set('limit', String(options.limit ?? 20));
     params.set('offset', String(options.offset ?? 0));
-    if (options.tags && options.tags.length > 0) {
-      params.set('tags', options.tags.join(','));
-    }
     return request<ListResponse>(`/recent?${params.toString()}`);
   },
-
-  // Tags
-  getTags: () => request<string[]>('/tags'),
 
   // Settings
   getSettings: () => request<SettingsResponse>('/api/settings'),
