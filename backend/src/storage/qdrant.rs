@@ -159,19 +159,15 @@ impl QdrantStorage {
         let points: Vec<PointStruct> = chunks
             .into_iter()
             .map(|chunk| {
-                let is_summary = chunk.chunk_type == "summary";
-                let mut payload: HashMap<String, Value> = HashMap::new();
-                payload.insert("document_id".to_string(), Value::from(document_id.to_string()));
-                payload.insert("chunk_type".to_string(), Value::from(chunk.chunk_type));
-                payload.insert("chunk_index".to_string(), Value::from(chunk.chunk_index as i64));
-                payload.insert("chunk_text".to_string(), Value::from(chunk.chunk_text));
-                payload.insert("summary".to_string(), Value::from(summary.to_string()));
-                payload.insert("created_at".to_string(), Value::from(created_at.to_string()));
-                // 엣지는 summary chunk에만 비정규화 (문서당 1곳, 조회/복원 지점 단일화).
-                if is_summary {
-                    payload.insert("edges".to_string(), Value::from(edges_json.clone()));
-                }
-
+                let payload = build_chunk_payload(
+                    document_id,
+                    summary,
+                    created_at,
+                    &edges_json,
+                    &chunk.chunk_type,
+                    chunk.chunk_index,
+                    &chunk.chunk_text,
+                );
                 let point_id = Uuid::new_v4();
                 PointStruct::new(
                     PointId::from(point_id.to_string()),
@@ -422,6 +418,33 @@ impl QdrantStorage {
     }
 }
 
+/// 하나의 chunk에 대한 Qdrant point payload를 구성한다.
+///
+/// 엣지는 summary chunk에만 포함된다(문서당 1곳). 순수 함수로 분리해 "summary엔
+/// edges, fact엔 없음" 불변식을 Qdrant 없이 단위 테스트로 고정한다 — 이것이
+/// reindex 엣지 생존의 payload 측 절반이다(나머지 절반은 raw JSON의 edges 보존).
+fn build_chunk_payload(
+    document_id: Uuid,
+    summary: &str,
+    created_at: &str,
+    edges_json: &str,
+    chunk_type: &str,
+    chunk_index: usize,
+    chunk_text: &str,
+) -> HashMap<String, Value> {
+    let mut payload: HashMap<String, Value> = HashMap::new();
+    payload.insert("document_id".to_string(), Value::from(document_id.to_string()));
+    payload.insert("chunk_type".to_string(), Value::from(chunk_type.to_string()));
+    payload.insert("chunk_index".to_string(), Value::from(chunk_index as i64));
+    payload.insert("chunk_text".to_string(), Value::from(chunk_text.to_string()));
+    payload.insert("summary".to_string(), Value::from(summary.to_string()));
+    payload.insert("created_at".to_string(), Value::from(created_at.to_string()));
+    if chunk_type == "summary" {
+        payload.insert("edges".to_string(), Value::from(edges_json.to_string()));
+    }
+    payload
+}
+
 /// payload에서 문자열 추출 헬퍼
 fn extract_string(payload: &HashMap<String, Value>, key: &str) -> Option<String> {
     payload.get(key)
@@ -553,5 +576,57 @@ mod tests {
         assert!(edges_from_payload("not valid json").is_empty());
         assert!(edges_from_payload("").is_empty());
         assert!(edges_from_payload("{}").is_empty());
+    }
+
+    // ──── payload 빌드 (reindex 생존의 payload 측 불변식) ────
+
+    #[test]
+    fn test_build_chunk_payload_summary_includes_edges() {
+        use crate::models::{Edge, RelationType};
+        let doc_id = Uuid::new_v4();
+        let target = Uuid::new_v4();
+        let edges_json = edges_to_payload(&[Edge::new(target, RelationType::Updates, 0.5)]);
+
+        let payload = build_chunk_payload(
+            doc_id, "sum", "2026-01-01T00:00:00Z", &edges_json, "summary", 0, "text",
+        );
+
+        let stored = extract_string(&payload, "edges").expect("summary chunk엔 edges 있어야");
+        let restored = edges_from_payload(&stored);
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].target, target);
+        assert_eq!(restored[0].relation, RelationType::Updates);
+    }
+
+    #[test]
+    fn test_build_chunk_payload_fact_omits_edges() {
+        // fact chunk엔 edges 키가 없어야 한다 (문서당 1곳 원칙).
+        let doc_id = Uuid::new_v4();
+        let payload = build_chunk_payload(
+            doc_id, "sum", "2026-01-01T00:00:00Z", "[]", "fact", 1, "a fact",
+        );
+        assert!(extract_string(&payload, "edges").is_none(), "fact chunk엔 edges가 없어야 한다");
+        assert_eq!(extract_string(&payload, "chunk_type").as_deref(), Some("fact"));
+        assert_eq!(
+            extract_string(&payload, "document_id").as_deref(),
+            Some(doc_id.to_string().as_str())
+        );
+    }
+
+    #[test]
+    fn test_build_chunk_payload_reindex_survival() {
+        // reindex 생존의 payload 측: raw의 edges가 그대로 payload로 매핑되어야 한다.
+        // (이진 정확 가중치로 f32 왕복 이슈를 배제한다.)
+        use crate::models::{Edge, RelationType};
+        let edges = vec![
+            Edge::new(Uuid::new_v4(), RelationType::RelatedTo, 0.5),
+            Edge::new(Uuid::new_v4(), RelationType::PartOf, 0.25),
+        ];
+        let edges_json = edges_to_payload(&edges);
+
+        let payload = build_chunk_payload(Uuid::new_v4(), "s", "t", &edges_json, "summary", 0, "c");
+        let restored = edges_from_payload(&extract_string(&payload, "edges").unwrap());
+
+        assert_eq!(restored, edges, "raw edges가 payload 왕복 후에도 동일해야 한다(reindex 생존)");
     }
 }
