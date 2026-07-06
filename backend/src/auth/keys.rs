@@ -78,7 +78,10 @@ pub struct AuthContext {
     pub key_id: String,
     /// 권한 수준
     pub permissions: Permission,
-    /// 접근 가능한 워크스페이스 목록. 비어있으면 전체 접근 (마스터키/개발모드).
+    /// 접근 가능한 워크스페이스 ID 목록.
+    /// 영속 키(비마스터)는 이 목록에 명시된 워크스페이스에만 접근한다
+    /// (빈 목록 = 접근 없음, fail-closed). 마스터키/개발모드(`is_master`)만
+    /// 목록과 무관하게 전체 접근을 가진다.
     pub workspaces: Vec<String>,
     /// 마스터키 또는 개발모드 여부
     pub is_master: bool,
@@ -116,9 +119,14 @@ impl AuthContext {
     }
 
     /// 특정 워크스페이스에 접근 가능한지 확인.
-    /// 마스터키/개발모드는 항상 true, API Key는 workspaces 목록 기반.
+    ///
+    /// 마스터키/개발모드(`is_master`)는 항상 true. 영속 API 키는 오직 `workspaces`
+    /// 목록에 명시된 워크스페이스에만 접근한다 — 빈 목록은 "전체 접근"이 아니라
+    /// "접근 없음"(fail-closed)이다. 이로써 `has_workspace_access`와 동일한 판정을
+    /// 보장한다. ("unscoped = all"은 마스터/dev 전용 의미이며, 영속 키에 허용하면
+    /// 스코프하려던 키가 개인 워크스페이스까지 조용히 읽는 격리 우회가 된다.)
     pub fn can_access_workspace(&self, workspace_id: &str) -> bool {
-        self.is_master || self.workspaces.is_empty() || self.workspaces.iter().any(|w| w == workspace_id)
+        self.is_master || self.workspaces.iter().any(|w| w == workspace_id)
     }
 
     /// 워크스페이스 미지정 시 사용할 기본 워크스페이스 ID.
@@ -577,6 +585,40 @@ mod tests {
         assert!(ctx.can_access_workspace("only-this"));
         assert!(!ctx.can_access_workspace("default"));
         assert!(!ctx.can_access_workspace("other"));
+    }
+
+    #[test]
+    fn test_auth_context_empty_workspaces_is_fail_closed() {
+        // 회귀 방지: 빈 workspaces 목록의 비마스터 키는 어떤 워크스페이스에도
+        // 접근할 수 없어야 한다(fail-closed). 과거 `is_empty() → true` 단락이
+        // 스코프 없는 키에 전 워크스페이스(개인정보 포함) 접근을 조용히 부여하는
+        // 격리 우회였다. (Devil's Advocate Cycle 1 최우선 blocking 시나리오)
+        let mut key = make_test_key();
+        key.workspaces = vec![];
+        let ctx = AuthContext::from_api_key(&key);
+        assert!(!ctx.is_master);
+        assert!(!ctx.can_access_workspace("default"));
+        assert!(!ctx.can_access_workspace("personal"));
+        assert!(!ctx.can_access_workspace("work"));
+        assert!(!ctx.can_access_workspace(""));
+    }
+
+    #[test]
+    fn test_can_access_and_has_access_agree_on_empty() {
+        // 같은 개념을 판정하는 두 메서드는 빈 목록에서 일치해야 한다(둘 다 거부).
+        // 과거 has_workspace_access(거부) vs can_access_workspace(전체허용)의
+        // 정반대 판정이 구조적 결함의 근거였다.
+        let mut key = make_test_key();
+        key.workspaces = vec![];
+        let ctx = AuthContext::from_api_key(&key);
+        for ws in ["default", "personal", "work"] {
+            assert_eq!(
+                key.has_workspace_access(ws),
+                ctx.can_access_workspace(ws),
+                "has_workspace_access와 can_access_workspace는 '{}'에서 일치해야 한다",
+                ws
+            );
+        }
     }
 
     #[test]
