@@ -12,16 +12,17 @@
 //!   실행이 재스캔하고, 이미 유입된 항목은 소스 dedup으로 `Skipped`되어 이어서 처리된다.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 use chrono::Utc;
 use futures::stream::StreamExt;
 use tokio::sync::RwLock;
 
+use super::claim::InFlightSet;
 use super::sync_state::{SyncFailure, SyncState, SyncStateStore, SyncSummary, MAX_STORED_FAILURES};
 use super::{
-    build_connector, ConnectorIngest, ConnectorIngestMode, ItemOutcome,
+    build_connector, ConnectorIngest, ConnectorIngestMode, ConnectorItem, ItemOutcome,
 };
 use crate::workspace::WorkspaceManager;
 
@@ -61,49 +62,6 @@ pub struct RunProgress {
     pub failed: usize,
 }
 
-/// 커넥터별 실행 클레임(RAII 가드).
-///
-/// `run_sync` 진입 시 `{workspace}/{connector}` 키를 원자적으로 claim한다. 같은 키가 이미
-/// claim되어 있으면 `try_acquire`가 `None`을 돌려주어 동시 실행을 막는다. 가드가 Drop될 때
-/// — 정상 종료·`?` 조기 반환·패닉 되감기·태스크 취소, **모든 종료 경로** — 키가 해제된다.
-///
-/// 이 상호배제가 중복 방지 불변식의 최후 방어선이다: 동시에 도는 두 `run_sync`가 같은 파일을
-/// 각각 "신규"로 판정(find_by_source→저장 사이의 TOCTOU)해 UUID가 다른 중복 문서를 만드는
-/// 사고를 원천 차단한다.
-///
-/// `std::sync::Mutex`를 쓰는 이유: 해제는 반드시 `Drop`에서 일어나야 하는데 `Drop`은 async가
-/// 불가하므로 `tokio::sync` 락을 쓸 수 없다. 크리티컬 섹션은 `contains`+`insert`/`remove`뿐이라
-/// await를 가로지르지 않는다(std Mutex가 올바른 선택).
-struct RunClaim {
-    in_flight: Arc<StdMutex<HashSet<String>>>,
-    key: String,
-}
-
-impl RunClaim {
-    /// `key`를 원자적으로 claim한다. 이미 claim되어 있으면(=실행 중) `None`.
-    fn try_acquire(in_flight: &Arc<StdMutex<HashSet<String>>>, key: String) -> Option<Self> {
-        // HashSet::insert는 이미 존재하면 false — 이 한 줄이 원자적 검사-후-설정이다.
-        // (poison은 크리티컬 섹션에 패닉 지점이 없어 사실상 불가하나, 방어적으로 복구한다.)
-        let mut set = in_flight.lock().unwrap_or_else(|e| e.into_inner());
-        if !set.insert(key.clone()) {
-            return None;
-        }
-        Some(Self {
-            in_flight: in_flight.clone(),
-            key,
-        })
-    }
-}
-
-impl Drop for RunClaim {
-    fn drop(&mut self) {
-        self.in_flight
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&self.key);
-    }
-}
-
 /// 커넥터 실행기. 스케줄러(주기)와 API(수동 트리거)가 공유한다.
 pub struct ConnectorRunner {
     workspaces: Arc<WorkspaceManager>,
@@ -111,9 +69,15 @@ pub struct ConnectorRunner {
     state: Arc<SyncStateStore>,
     /// 진행 상태 맵 (key = "{workspace}/{connector_id}").
     progress: Arc<RwLock<HashMap<String, RunProgress>>>,
-    /// 커넥터별 동시 실행 방지 — in-flight 키("{workspace}/{connector_id}") 집합.
-    /// `run_sync`가 진입 시 원자적으로 claim하고 `RunClaim` 가드가 종료 시 해제한다.
-    in_flight: Arc<StdMutex<HashSet<String>>>,
+    /// 커넥터 단위 동시 실행 방지 — 키 "{workspace}/{connector_id}".
+    /// 같은 커넥터의 동시 sync(수동 이중 클릭·스케줄러와 겹침)를 거부한다.
+    connectors_in_flight: InFlightSet,
+    /// 소스 단위 동시 유입 방지 — 키 "{workspace}\u{1f}{source_type}\u{1f}{source_id}".
+    /// 대상 디렉토리가 겹치는 서로 다른 커넥터가 같은 파일을 동시에 유입해 UUID가 다른
+    /// 중복 문서를 만드는 것(경로 B)을 막는다. dedup 키 `(source_type, source_id)`와 입도를
+    /// 일치시켜 `find_by_source→저장` TOCTOU 창을 닫는 근본 방어선이다. 커넥터 가드와 별개
+    /// 집합이라 키가 충돌하지 않는다.
+    sources_in_flight: InFlightSet,
 }
 
 impl ConnectorRunner {
@@ -127,7 +91,8 @@ impl ConnectorRunner {
             ingest,
             state,
             progress: Arc::new(RwLock::new(HashMap::new())),
-            in_flight: Arc::new(StdMutex::new(HashSet::new())),
+            connectors_in_flight: InFlightSet::new(),
+            sources_in_flight: InFlightSet::new(),
         }
     }
 
@@ -142,9 +107,7 @@ impl ConnectorRunner {
     /// `run_sync` 내부의 원자적 claim이며, 이 조회는 그 앞단의 빠른 피드백일 뿐이다(미세 경합
     /// 시엔 내부 claim이 최종 판정 — 중복은 어느 경로에서도 생기지 않는다).
     pub fn is_running(&self, workspace_id: &str, connector_id: &str) -> bool {
-        self.in_flight
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        self.connectors_in_flight
             .contains(&Self::progress_key(workspace_id, connector_id))
     }
 
@@ -171,7 +134,7 @@ impl ConnectorRunner {
         //    가드는 함수의 모든 종료 경로에서 Drop되어 자동 해제된다(에러·`?`·패닉·취소 포함).
         //    이것이 중복 방지 불변식의 최후 방어선이다: 동시 sync의 TOCTOU 중복 생성을 차단한다.
         let key = Self::progress_key(workspace_id, connector_id);
-        let _claim = RunClaim::try_acquire(&self.in_flight, key.clone()).ok_or_else(|| {
+        let _claim = self.connectors_in_flight.try_claim(key.clone()).ok_or_else(|| {
             anyhow!("커넥터 '{connector_id}'(ws={workspace_id})가 이미 실행 중입니다")
         })?;
 
@@ -200,7 +163,26 @@ impl ConnectorRunner {
         // 3. 변경분 조회.
         let started_at = Utc::now();
         let fetched = connector.fetch_changes(cursor.as_deref()).await?;
-        let total = fetched.items.len();
+
+        // 3-1. 소스 단위 dedup(경로 A 방어) — 한 번의 조회가 같은 source_id를 여러 번 담을 수
+        //      있다(대상 디렉토리 겹침: 부모+자식 나열, 후행 슬래시, 리터럴 중복). 이를 그대로
+        //      동시 유입하면 두 항목이 각각 find_by_source=None으로 신규 판정해 UUID가 다른
+        //      중복 문서가 난립한다. 유입 전에 첫 항목만 남겨 설정과 무관하게 원천 차단한다.
+        let fetched_count = fetched.items.len();
+        let mut seen_sources: HashSet<String> = HashSet::new();
+        let items: Vec<ConnectorItem> = fetched
+            .items
+            .into_iter()
+            .filter(|it| seen_sources.insert(it.source_id.clone()))
+            .collect();
+        let total = items.len();
+        let deduped = fetched_count - total;
+        if deduped > 0 {
+            tracing::warn!(
+                "커넥터 '{connector_id}'(ws={workspace_id}): 조회 {fetched_count}건 중 {deduped}건이 \
+                 중복 source_id로 제거됨(대상 디렉토리 겹침 가능성)"
+            );
+        }
         tracing::info!(
             "커넥터 '{connector_id}'(ws={workspace_id}) 동기화 시작: {total}건 (mode={:?}, concurrency={concurrency})",
             opts.mode
@@ -221,6 +203,7 @@ impl ConnectorRunner {
 
         // 5. 동시성 제한 유입 — 항목별 태스크 spawn으로 패닉까지 격리.
         let ingest = self.ingest.clone();
+        let sources = self.sources_in_flight.clone();
         let mode = opts.mode;
         let mut created = 0usize;
         let mut updated = 0usize;
@@ -228,29 +211,49 @@ impl ConnectorRunner {
         let mut failed = 0usize;
         let mut failures: Vec<SyncFailure> = Vec::new();
 
-        let mut stream = futures::stream::iter(fetched.items.into_iter())
+        let mut stream = futures::stream::iter(items.into_iter())
             .map(|item| {
                 let ingest = ingest.clone();
+                let sources = sources.clone();
                 let ws = workspace_id.to_string();
                 let st = source_type.clone();
                 let cid = connector_id.to_string();
                 let source_id = item.source_id.clone();
+                // 소스 단위 상호배제 키 — dedup 키 (source_type, source_id)와 입도를 맞춘다.
+                // 커넥터 키("{ws}/{cid}")와 별개 집합이라 충돌하지 않고, \u{1f} 구분자로
+                // 경로에 슬래시가 있어도 모호성이 없다. 워크스페이스를 포함해 스코프를 격리한다.
+                let source_key = format!("{ws}\u{1f}{st}\u{1f}{source_id}");
                 async move {
-                    // 별도 태스크로 실행해 패닉을 JoinError로 격리한다.
+                    // 소스 단위 상호배제(경로 B 방어): 대상이 겹치는 다른 커넥터(또는 다른
+                    // 실행)가 같은 소스를 유입 중이면 claim이 실패한다. 그 경우 이 항목은
+                    // 건너뛴다 — 같은 소스(같은 파일)를 이미 다른 실행이 유입 중이므로 그
+                    // 실행이 저장을 책임지고, 정보 유실이 없다. None = 동시 유입 회피 스킵.
+                    let Some(src_claim) = sources.try_claim(source_key) else {
+                        tracing::debug!(
+                            "소스 '{source_id}'가 다른 실행에서 유입 중 — 이번 실행은 스킵(동시 중복 방지)"
+                        );
+                        return (source_id, None);
+                    };
+                    // 별도 태스크로 실행해 패닉을 JoinError로 격리한다. claim을 태스크로 옮겨
+                    // 그 수명을 유입 임계 구간(find_by_source→저장)에 정확히 묶는다 — 태스크
+                    // 종료(정상·에러·패닉) 시 Drop되어 자동 해제된다.
                     let handle = tokio::spawn(async move {
+                        let _src_claim = src_claim;
                         ingest.ingest_item(&ws, &st, &cid, item, mode).await
                     });
-                    (source_id, handle.await)
+                    (source_id, Some(handle.await))
                 }
             })
             .buffer_unordered(concurrency);
 
-        while let Some((source_id, joined)) = stream.next().await {
-            match joined {
-                Ok(Ok(ItemOutcome::Created(_))) => created += 1,
-                Ok(Ok(ItemOutcome::Updated(_))) => updated += 1,
-                Ok(Ok(ItemOutcome::Skipped)) => skipped += 1,
-                Ok(Err(e)) => {
+        while let Some((source_id, outcome)) = stream.next().await {
+            match outcome {
+                // 소스 가드로 동시 유입을 회피한 항목(다른 실행이 같은 소스를 처리 중).
+                None => skipped += 1,
+                Some(Ok(Ok(ItemOutcome::Created(_)))) => created += 1,
+                Some(Ok(Ok(ItemOutcome::Updated(_)))) => updated += 1,
+                Some(Ok(Ok(ItemOutcome::Skipped))) => skipped += 1,
+                Some(Ok(Err(e))) => {
                     failed += 1;
                     tracing::warn!("항목 유입 실패(계속): {source_id} — {e}");
                     if failures.len() < MAX_STORED_FAILURES {
@@ -260,7 +263,7 @@ impl ConnectorRunner {
                         });
                     }
                 }
-                Err(join_err) => {
+                Some(Err(join_err)) => {
                     // 유입 태스크 패닉 — 격리하고 계속.
                     failed += 1;
                     tracing::error!("항목 유입 태스크 패닉(격리됨): {source_id} — {join_err}");
@@ -587,27 +590,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_run_claim_mutual_exclusion_per_key() {
-        // RAII 가드의 원자성: 같은 키는 배타적, 다른 키는 동시 허용, Drop 시 해제.
-        let in_flight = Arc::new(StdMutex::new(HashSet::<String>::new()));
-
-        let c1 = RunClaim::try_acquire(&in_flight, "ws/a".to_string());
-        assert!(c1.is_some(), "첫 claim 성공");
-        assert!(
-            RunClaim::try_acquire(&in_flight, "ws/a".to_string()).is_none(),
-            "같은 키 재claim 실패(상호배제)"
-        );
-
-        let c2 = RunClaim::try_acquire(&in_flight, "ws/b".to_string());
-        assert!(c2.is_some(), "다른 키는 동시 claim 가능(커넥터별 격리)");
-
-        drop(c1);
-        assert!(
-            RunClaim::try_acquire(&in_flight, "ws/a".to_string()).is_some(),
-            "Drop 후 키 해제 → 재claim 가능"
-        );
-    }
+    // (RAII 가드의 원자성·격리·Drop 해제는 `claim.rs`의 단위 테스트가 커버한다.
+    //  여기서는 그 가드가 실제 run_sync 경로에서 중복 유입을 막는지를 검증한다.)
 
     #[tokio::test]
     async fn test_concurrent_run_sync_rejected_no_double_ingest() {
@@ -651,6 +635,107 @@ mod tests {
         assert!(
             !runner.is_running("default", "notes"),
             "완료 후 claim 해제(다음 실행 가능)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_sync_dedups_duplicate_source_ids() {
+        // 경로 A 회귀 방지: 한 커넥터가 대상 디렉토리를 겹치게 등록하면(여기선 리터럴 중복)
+        // 같은 파일이 여러 번 열거된다. dedup이 없으면 동시 유입으로 같은 소스가 UUID가
+        // 다른 중복 문서로 난립한다. dedup으로 각 소스가 정확히 한 번만 유입되어야 한다.
+        let (_data, src, workspaces, state) = fixture(&[("a.md", "A"), ("b.md", "B")]).await;
+
+        // 커넥터의 대상 디렉토리를 리터럴 중복으로 바꾼다 → 각 파일이 두 번 열거된다.
+        let mut config = workspaces.get("default").await.unwrap();
+        let dir = src.path().to_string_lossy().into_owned();
+        // ConnectorSpec은 단일 variant라 반박 불가 바인딩.
+        let ConnectorSpec::LocalDirectory(cfg) = &mut config.connectors[0].spec;
+        cfg.directories = vec![dir.clone(), dir];
+        workspaces.update("default", config).await.unwrap();
+
+        let ingest = Arc::new(MockIngest::new());
+        let runner = ConnectorRunner::new(workspaces, ingest.clone(), state);
+
+        let summary = runner
+            .run_sync("default", "notes", SyncOptions::default())
+            .await
+            .unwrap();
+
+        // 파일은 2개뿐. 중복 열거(4건)가 dedup되어 정확히 2건만 처리·유입된다.
+        assert_eq!(summary.processed, 2, "중복 source_id는 dedup되어 2건만 처리");
+        assert_eq!(summary.created, 2);
+        assert_eq!(ingest.call_count(), 2, "각 소스는 정확히 한 번만 유입(중복 유입 없음)");
+
+        // 유입된 source_id에 중복이 없어야 한다.
+        let calls = ingest.calls.lock().unwrap().clone();
+        let unique: HashSet<&String> = calls.iter().collect();
+        assert_eq!(unique.len(), calls.len(), "같은 source_id가 두 번 유입되지 않음");
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_different_connectors_same_source_no_double_ingest() {
+        // 경로 B 회귀 방지: 대상 디렉토리가 겹치는 서로 다른 두 커넥터가 같은 파일을 동시에
+        // 유입하려 하면, 커넥터 단위 claim은 키가 달라(둘 다 통과) 막지 못한다. 소스 단위
+        // 가드가 같은 source_id의 동시 유입을 하나로 직렬화(둘째는 스킵)해 중복 생성을 막는다.
+        let data = TempDir::new().unwrap();
+        let src = TempDir::new().unwrap();
+        fs::write(src.path().join("shared.md"), "S").await.unwrap();
+
+        let workspaces = Arc::new(WorkspaceManager::new(data.path()).await.unwrap());
+        workspaces.ensure_default().await.unwrap();
+        let mut config = workspaces.get("default").await.unwrap();
+        let dir = src.path().to_string_lossy().into_owned();
+        // 같은 디렉토리를 가리키는 커넥터 두 개(conn-a, conn-b) 등록 — 커넥터 키는 다르다.
+        for id in ["conn-a", "conn-b"] {
+            config.connectors.push(ConnectorInstance {
+                id: id.to_string(),
+                enabled: true,
+                interval_secs: 3600,
+                concurrency: 2,
+                spec: ConnectorSpec::LocalDirectory(LocalDirectoryConfig {
+                    directories: vec![dir.clone()],
+                    extensions: vec!["md".to_string()],
+                    exclude: vec![],
+                    max_file_bytes: 1_048_576,
+                }),
+            });
+        }
+        workspaces.update("default", config).await.unwrap();
+
+        let state = Arc::new(SyncStateStore::new(data.path()));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let ingest = Arc::new(GatedIngest {
+            calls: Mutex::new(Vec::new()),
+            entered: entered.clone(),
+            release: release.clone(),
+        });
+        let runner = Arc::new(ConnectorRunner::new(workspaces, ingest.clone(), state));
+
+        // conn-a: 백그라운드로 시작 — shared.md 유입에 진입해 소스 claim을 쥔 채 멈춘다.
+        let r1 = runner.clone();
+        let h1 = tokio::spawn(async move {
+            r1.run_sync("default", "conn-a", SyncOptions::default()).await
+        });
+        entered.notified().await; // conn-a가 소스 claim을 쥔 상태 확정
+
+        // conn-b: conn-a가 소스 claim을 쥔 동안 동시 실행. 커넥터 키가 달라 커넥터 claim은
+        // 통과하지만, 소스 가드가 shared.md를 스킵시켜 유입하지 않아야 한다.
+        let s2 = runner
+            .run_sync("default", "conn-b", SyncOptions::default())
+            .await
+            .expect("conn-b는 커넥터 claim을 얻어 실행 자체는 성공");
+        assert_eq!(s2.created, 0, "conn-b는 소스 가드로 shared.md를 유입하지 않음");
+        assert_eq!(s2.skipped, 1, "conn-b의 shared.md는 동시 유입 회피로 스킵");
+
+        // conn-a 해제 → 완주. shared.md는 conn-a가 1회만 유입.
+        release.notify_one();
+        let s1 = h1.await.unwrap().expect("conn-a 정상 완료");
+        assert_eq!(s1.created, 1, "conn-a가 shared.md를 유입");
+        assert_eq!(
+            ingest.calls.lock().unwrap().len(),
+            1,
+            "shared.md 유입은 conn-a의 1회뿐 — 중복 유입 없음"
         );
     }
 }

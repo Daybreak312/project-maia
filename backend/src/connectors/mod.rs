@@ -11,6 +11,7 @@
 //! - [`runner`]: 동기화/대량 적재 오케스트레이션(동시성 제한·진행 관측·실패 격리·재개).
 //! - [`scheduler`]: 주기 실행 + 오류 격리.
 
+pub mod claim;
 pub mod local_dir;
 pub mod runner;
 pub mod scheduler;
