@@ -1,10 +1,17 @@
-import { useState, useEffect } from 'react';
-import type { ProviderInfo, SettingsResponse } from '../api/types';
+import { useState, useEffect, useCallback } from 'react';
+import type { ProviderInfo, SettingsResponse, WorkspaceSummary } from '../api/types';
 import { api } from '../api/client';
 import { ConfirmModal } from '../components/ConfirmModal';
+import {
+  WebUiKeySection,
+  WorkspacesSection,
+  ApiKeysSection,
+} from '../components/AdminManagement';
 
 interface AdminPageProps {
   showToast: (message: string, type: 'success' | 'error') => void;
+  /** 워크스페이스 생성/삭제 시 상위(App/Navbar) 목록을 갱신하기 위한 콜백 */
+  onWorkspacesChanged: () => void;
 }
 
 function ProviderCard({
@@ -168,15 +175,31 @@ function ProviderCard({
   );
 }
 
-export function AdminPage({ showToast }: AdminPageProps) {
+export function AdminPage({ showToast, onWorkspacesChanged }: AdminPageProps) {
   const [settings, setSettings] = useState<SettingsResponse | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [showReindexModal, setShowReindexModal] = useState(false);
   const [isReindexing, setIsReindexing] = useState(false);
+  const [workspaces, setWorkspaces] = useState<WorkspaceSummary[]>([]);
+
+  const loadWorkspaces = useCallback(async () => {
+    try {
+      setWorkspaces(await api.listWorkspaces());
+    } catch {
+      // 권한 부족 등으로 실패해도 나머지 admin UI는 동작한다.
+    }
+  }, []);
 
   useEffect(() => {
     loadSettings();
-  }, []);
+    loadWorkspaces();
+  }, [loadWorkspaces]);
+
+  // 워크스페이스 변경 시 로컬 목록 + 상위(Navbar) 목록을 함께 갱신
+  const handleWorkspacesChanged = useCallback(() => {
+    loadWorkspaces();
+    onWorkspacesChanged();
+  }, [loadWorkspaces, onWorkspacesChanged]);
 
   const loadSettings = async () => {
     try {
@@ -258,7 +281,20 @@ export function AdminPage({ showToast }: AdminPageProps) {
 
   return (
     <div className="max-w-4xl mx-auto p-6">
-      <h2 className="text-xl font-semibold text-gray-200 mb-6">Settings</h2>
+      <h2 className="text-xl font-semibold text-gray-200 mb-6">Admin</h2>
+
+      {/* 워크스페이스 · 키 관리 (Qdrant 불가용 시에도 파일 기반으로 동작) */}
+      <div className="flex flex-col gap-4 mb-8">
+        <WebUiKeySection showToast={showToast} />
+        <WorkspacesSection
+          showToast={showToast}
+          workspaces={workspaces}
+          onChanged={handleWorkspacesChanged}
+        />
+        <ApiKeysSection showToast={showToast} workspaces={workspaces} />
+      </div>
+
+      <h2 className="text-xl font-semibold text-gray-200 mb-6">Model Settings</h2>
 
       {isLoading ? (
         <div className="text-center text-muted py-8">Loading...</div>
