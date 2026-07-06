@@ -123,6 +123,7 @@ project-maia/
 - 검증 성공 시 `AuthContext`를 request extension으로 주입 → 핸들러가 워크스페이스 접근·권한 판단.
 - `MAIA_API_KEY` 미설정 시 인증 비활성(개발 모드, dev `AuthContext`=admin). `/health`는 항상 공개.
 - 인증 성공 시 등록 키의 `last_used_at`을 `tokio::spawn`으로 비블로킹 갱신(요청 경로 무영향).
+  요청당 파일 재작성(쓰기 증폭)을 막기 위해 최소 간격(60s) 안의 갱신은 디스크에 반영하지 않는다.
 
 ### Permission (3단계)
 | 권한 | 문서 읽기 | 문서 쓰기 | 워크스페이스·키 관리 |
@@ -134,6 +135,12 @@ project-maia/
 ### API Key 모델 (`data/api_keys.json`)
 - 저장: `key_id`, `hashed_key`(SHA-256, 평문 미저장), `label`, `workspaces[]`, `permissions`, `created_at`, `last_used_at`, `expires_at?`
 - 발급 API 응답에서만 평문 키 1회 노출. 목록 조회는 해시를 제외한 뷰 반환.
+- **워크스페이스 스코핑 (fail-closed):** 영속 키는 `workspaces[]`에 명시된 워크스페이스에만 접근한다.
+  빈 목록은 "전체 접근"이 아니라 **접근 없음**이며(`can_access_workspace`), 발급 시 최소 1개 워크스페이스를
+  요구한다(빈 스코프는 400). "unscoped = all"은 마스터키(env) 전용 의미다.
+- **영속화:** `save()`는 temp 파일 쓰기 후 `rename`으로 원자적 교체(torn write → 부팅 브릭 방지),
+  동시 저장은 `save_lock`으로 직렬화. 기동 시 파싱 실패하면 하드 실패 대신 손상본을 `.corrupt`로
+  백업하고 빈 목록으로 degrade(마스터키로 복구 가능).
 
 ## Workspace System
 
