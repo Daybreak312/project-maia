@@ -539,6 +539,105 @@ mod tests {
         assert_eq!(outcome.reason, "판단 근거");
     }
 
+    // ──── SearchRequest agent opt-in (기본 동작 불변) ────
+
+    #[test]
+    fn test_search_request_agent_defaults_none() {
+        // agent 미지정 → None. 핸들러가 기존 단일 검색 경로를 타는 근거(기본 동작 불변).
+        let req: api::SearchRequest = serde_json::from_str(r#"{"query":"hi"}"#).unwrap();
+        assert_eq!(req.agent, None, "agent 미지정 시 None이어야 한다");
+        assert_eq!(req.limit, 10, "limit 기본값 유지");
+        assert_eq!(req.offset, 0);
+        assert!(req.mode.is_none());
+    }
+
+    #[test]
+    fn test_search_request_agent_opt_in() {
+        let req: api::SearchRequest = serde_json::from_str(r#"{"query":"hi","agent":true}"#).unwrap();
+        assert_eq!(req.agent, Some(true), "agent:true로 opt-in");
+    }
+
+    #[test]
+    fn test_search_request_agent_false() {
+        let req: api::SearchRequest =
+            serde_json::from_str(r#"{"query":"hi","agent":false}"#).unwrap();
+        assert_eq!(req.agent, Some(false));
+    }
+
+    // ──── SearchResponse/SearchResult 하위호환 직렬화 ────
+
+    #[test]
+    fn test_search_response_omits_agent_when_none() {
+        // 기존(비 agent) 검색은 agent 메타데이터를 직렬화하지 않는다(하위호환).
+        let resp = api::SearchResponse {
+            results: vec![],
+            sources_used: vec![],
+            total: 0,
+            mode: "hybrid".to_string(),
+            agent: None,
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert!(json.get("agent").is_none(), "agent None은 생략되어야 한다");
+    }
+
+    #[test]
+    fn test_search_response_includes_agent_when_present() {
+        let resp = api::SearchResponse {
+            results: vec![],
+            sources_used: vec![],
+            total: 0,
+            mode: "agent".to_string(),
+            agent: Some(api::AgentSearchMeta {
+                rounds: 2,
+                queries: vec!["a".to_string(), "b".to_string()],
+                graph_expanded: true,
+                expansion_count: 1,
+                fallback: false,
+                reason: "충분".to_string(),
+            }),
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        let agent = json.get("agent").expect("agent 메타데이터가 포함되어야 한다");
+        assert_eq!(agent.get("rounds").unwrap(), 2);
+        assert_eq!(agent.get("graph_expanded").unwrap(), true);
+    }
+
+    #[test]
+    fn test_search_result_omits_expanded_from_when_none() {
+        // 직접 검색 결과는 expanded_from을 직렬화하지 않는다(하위호환).
+        let r = api::SearchResult {
+            id: Uuid::new_v4(),
+            summary: "s".to_string(),
+            relevance_score: 0.5,
+            workspace: "default".to_string(),
+            matched_facts: vec![],
+            created_at: None,
+            expanded_from: None,
+        };
+        let json = serde_json::to_value(&r).unwrap();
+        assert!(json.get("expanded_from").is_none(), "None은 생략되어야 한다");
+    }
+
+    #[test]
+    fn test_search_result_includes_expanded_from_when_present() {
+        let origin = Uuid::new_v4();
+        let r = api::SearchResult {
+            id: Uuid::new_v4(),
+            summary: "s".to_string(),
+            relevance_score: 0.5,
+            workspace: "default".to_string(),
+            matched_facts: vec![],
+            created_at: None,
+            expanded_from: Some(origin),
+        };
+        let json = serde_json::to_value(&r).unwrap();
+        assert_eq!(
+            json.get("expanded_from").unwrap().as_str().unwrap(),
+            origin.to_string(),
+            "확장 유래가 직렬화되어야 한다"
+        );
+    }
+
     #[test]
     fn test_ingest_outcome_serialize_backward_compatible() {
         // 직렬화에 기존 IngestResponse 필드가 모두 포함되어야 한다(하위호환).
