@@ -7,7 +7,7 @@ use crate::core::search::{BM25Scorer, SearchMode, reciprocal_rank_fusion};
 use crate::llm::{create_llm_provider, create_embedding_provider, LlmProvider, EmbeddingProvider};
 use crate::models::{Document, Edge, api::{IngestResponse, SearchResponse, SearchResult}};
 use crate::settings::SettingsManager;
-use crate::storage::{DocumentStore, QdrantStorage, SearchHit, ChunkData};
+use crate::storage::{DocumentStore, QdrantStorage, SearchHit, ChunkData, VersionStore};
 
 /// RRF 상수 (일반적으로 60 사용)
 const RRF_K: f32 = 60.0;
@@ -32,6 +32,7 @@ pub struct Indexer {
     settings: Arc<SettingsManager>,
     qdrant: Arc<QdrantStorage>,
     documents: Arc<DocumentStore>,
+    versions: Arc<VersionStore>,
 }
 
 impl Indexer {
@@ -39,11 +40,13 @@ impl Indexer {
         settings: Arc<SettingsManager>,
         qdrant: Arc<QdrantStorage>,
         documents: Arc<DocumentStore>,
+        versions: Arc<VersionStore>,
     ) -> Self {
         Self {
             settings,
             qdrant,
             documents,
+            versions,
         }
     }
 
@@ -436,6 +439,12 @@ impl Indexer {
         //    edges는 문서의 raw JSON에 사는 그래프 상태이므로 재파싱 업데이트에서
         //    유실되면 안 된다(reindex 생존 불변식과 동일한 이유).
         let existing = self.documents.load(id, workspace_id).await?;
+
+        // 덮어쓰기 전에 이전 상태를 버전으로 보관한다(잘못된 업데이트의 안전망).
+        // 보관에 실패하면 이전 버전을 남길 수 없으므로 업데이트를 진행하지 않는다
+        // — "이전 버전 보장" 시맨틱을 지켜 오염 위험을 차단한다.
+        self.versions.archive(&existing, workspace_id).await?;
+
         let now = chrono::Utc::now();
         let doc = Document {
             id,
