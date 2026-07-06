@@ -942,14 +942,21 @@ impl Indexer {
     }
 
     /// 특정 워크스페이스에서 문서를 삭제한다.
+    ///
+    /// **쓰기 직렬화 불변식(부활 방지):** raw JSON(SSoT) 파일 제거를 `delete_serialized`로
+    /// 수행해, 동시 실행되는 감쇠·엣지 추가(`DocumentStore::update`)의 load→save와 같은
+    /// `write_lock`으로 직렬화한다. 이 직렬화가 없으면 update가 문서를 load한 뒤 save하기
+    /// 전에 삭제가 파일을 지우고, 뒤늦은 save가 삭제된 문서를 raw JSON에 되살려(reindex로
+    /// 검색 부활) SSoT와 파생 인덱스가 영구 불일치한다. Qdrant chunk 삭제(파생물)는 임계
+    /// 구역 밖에 둬 네트워크 I/O로 모든 쓰기를 직렬화하지 않는다(파생물은 reindex로 복원).
     pub async fn delete_from_workspace(&self, id: uuid::Uuid, workspace_id: &str) -> Result<()> {
-        // 1. Qdrant에서 해당 문서의 모든 chunk 삭제
+        // 1. Qdrant에서 해당 문서의 모든 chunk 삭제 (파생물 — 임계 구역 밖).
         tracing::info!("Deleting chunks from Qdrant...");
         self.qdrant.delete_by_document_id(workspace_id, id).await?;
 
-        // 2. 파일 삭제
+        // 2. raw JSON(SSoT) 파일 삭제 — 쓰기 락 아래에서 update의 save와 직렬화(부활 차단).
         tracing::info!("Deleting document file...");
-        self.documents.delete(id, workspace_id).await?;
+        self.documents.delete_serialized(id, workspace_id).await?;
 
         tracing::info!("Deleted document: {}", id);
         Ok(())

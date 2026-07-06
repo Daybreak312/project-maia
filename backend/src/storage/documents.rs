@@ -142,6 +142,28 @@ impl DocumentStore {
         Ok(Some(doc))
     }
 
+    /// 문서 raw JSON을 **쓰기 락 아래에서** 삭제한다(SSoT 제거의 직렬화 진입점).
+    ///
+    /// [`update`](Self::update)·[`write_guard`](Self::write_guard)와 같은
+    /// [`write_lock`](Self::write_lock)으로 직렬화되어, 동시 실행되는 감쇠·엣지 추가
+    /// (`update`의 load→save)와 삭제를 **상호 배제**한다. 이 직렬화가 없으면 `update`가
+    /// 문서를 load한 뒤 save하기 전 사이에 삭제가 파일을 지우고, 뒤늦은 save가 삭제된 문서를
+    /// raw JSON에 **부활**시킨다 — SSoT(살아있음)와 Qdrant(삭제됨)가 영구 불일치하고, 정상
+    /// reindex가 소유자가 의도적으로 파기한 지식을 검색에 되살린다("삭제=삭제" 신뢰 붕괴).
+    /// 락 아래 삭제는 `update`의 "락 아래 exists 체크"와 짝을 이룬다: 삭제가 먼저면 update가
+    /// not-exists를 보고 save를 생략(부활 없음), update가 먼저면 삭제가 방금 저장된 파일을
+    /// 제거(삭제 유지) — `update`는 파일을 **생성**하지 않으므로 뒤늦은 save의 부활이 불가능하다.
+    ///
+    /// 파일이 이미 없으면 **성공으로 간주**한다(멱등 — 경합 중 이중 삭제/판단 재제출 안전,
+    /// `update`의 `Ok(None)` 시맨틱과 대칭). 락 없는 원시 삭제가 필요하면 [`delete`](Self::delete).
+    pub async fn delete_serialized(&self, id: Uuid, workspace_id: &str) -> Result<()> {
+        let _guard = self.write_lock.lock().await;
+        if !self.exists(id, workspace_id).await {
+            return Ok(()); // 이미 삭제됨 — 멱등 성공(부활 방지 직렬화와 무관하게 안전)
+        }
+        self.delete(id, workspace_id).await
+    }
+
     /// 쓰기 트랜잭션 임계 구역 가드.
     ///
     /// `load→(비동기 작업)→save`를 이 가드 아래에서 수행하면 다른 쓰기와 직렬화된다.
@@ -597,6 +619,86 @@ mod tests {
             loaded.edges.len(),
             n as usize,
             "동시 수정 {n}건이 모두 반영되어야 한다 (lost-update 없음)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_serialized_removes_existing() {
+        let (_tmp, store) = setup().await;
+        let doc = make_doc("will delete");
+        let id = doc.id;
+        store.save(&doc, "default").await.unwrap();
+
+        store.delete_serialized(id, "default").await.unwrap();
+        assert!(!store.exists(id, "default").await);
+    }
+
+    #[tokio::test]
+    async fn test_delete_serialized_idempotent_when_missing() {
+        // 경합 중 이중 삭제/판단 재제출 — 없는 문서의 직렬화 삭제는 에러가 아니라 성공(멱등).
+        // (update의 Ok(None)과 대칭. 반복 "삭제" 판단이 상태를 깨지 않는다.)
+        let (_tmp, store) = setup().await;
+        store
+            .delete_serialized(Uuid::new_v4(), "default")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_delete_serialized_excludes_concurrent_update_no_resurrection() {
+        // 삭제와 update(감쇠/엣지추가)가 같은 write_lock으로 **상호 배제**됨을 결정론적으로
+        // 검증한다. update의 클로저는 load와 save 사이에서 실행되므로, 그 임계 구역에 진입한
+        // 순간을 신호로 알린 뒤 잠깐 머무는 동안 동시 삭제를 밀어 넣는다:
+        //  - 직렬화되면(정상): 삭제는 update의 save가 끝날 때까지 락에서 대기했다가 파일을
+        //    지운다 → 최종 "삭제됨".
+        //  - 직렬화가 없으면(회귀): 삭제가 클로저 체류 중 파일을 지우고, update의 뒤늦은 save가
+        //    삭제된 문서를 raw JSON에 **부활**시킨다 → 최종 "파일 존재"(SSoT 오염 → reindex로
+        //    검색 부활, "삭제=삭제" 신뢰 붕괴).
+        // 창을 신호+체류로 강제하므로 이 테스트는 락 제거 회귀에서 **결정론적으로 실패**한다
+        // (강제 지연 없이는 load→save 창이 너무 좁아 부활이 재현되지 않아 가드로서 무의미하다).
+        use crate::models::{Edge, RelationType};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let (_tmp, store) = setup().await;
+        let store = Arc::new(store);
+        let doc = make_doc("target");
+        let id = doc.id;
+        store.save(&doc, "default").await.unwrap();
+
+        // update가 임계 구역(load 이후, save 이전)에 진입했음을 알리는 신호.
+        let in_critical = Arc::new(AtomicBool::new(false));
+
+        let s_upd = store.clone();
+        let flag = in_critical.clone();
+        let upd = tokio::spawn(async move {
+            let target = Uuid::from_u128(1);
+            let _ = s_upd
+                .update(id, "default", move |d| {
+                    flag.store(true, Ordering::SeqCst); // 임계 구역 진입 알림
+                    // 동시 삭제가 이 창으로 들어올 시간을 준다. 직렬화가 있으면 삭제는 이 체류
+                    // 동안 락에서 대기하므로 뒤늦은 save의 부활이 불가능하다. (클로저는 동기라
+                    // std::thread::sleep을 쓰되, multi_thread 런타임의 다른 워커에서 삭제가 진행된다.)
+                    std::thread::sleep(Duration::from_millis(50));
+                    d.add_edge(Edge::new(target, RelationType::RelatedTo, 0.5));
+                    true
+                })
+                .await;
+        });
+
+        // update가 임계 구역에 진입할 때까지 대기(고정 지연 대신 신호로 경합을 결정론화).
+        while !in_critical.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        // 이제 삭제를 시도한다 — update의 load→save 창 한가운데다.
+        store.delete_serialized(id, "default").await.unwrap();
+
+        upd.await.unwrap();
+
+        assert!(
+            !store.exists(id, "default").await,
+            "삭제가 동시 update의 뒤늦은 save로 부활하면 안 된다 (write_lock 상호 배제 회귀)"
         );
     }
 
