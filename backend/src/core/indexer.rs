@@ -431,7 +431,9 @@ impl Indexer {
         let llm = self.get_llm_provider().await?;
         let parsed = llm.parse(&raw_content).await?;
 
-        // 2. 기존 문서의 created_at 보존, updated_at 갱신
+        // 2. 기존 문서의 created_at·edges 보존, updated_at 갱신.
+        //    edges는 문서의 raw JSON에 사는 그래프 상태이므로 재파싱 업데이트에서
+        //    유실되면 안 된다(reindex 생존 불변식과 동일한 이유).
         let existing = self.documents.load(id, workspace_id).await?;
         let now = chrono::Utc::now();
         let doc = Document {
@@ -440,6 +442,7 @@ impl Indexer {
             summary: parsed.summary.clone(),
             entities: parsed.entities.clone(),
             facts: parsed.facts.clone(),
+            edges: existing.edges.clone(),
             created_at: existing.created_at,
             updated_at: now,
         };
