@@ -36,6 +36,7 @@ pub async fn get_document_handler(
                 summary: doc.summary,
                 entities: doc.entities,
                 created_at: doc.created_at,
+                source: doc.source,
             })
         })
         .map_err(|e| {
@@ -88,6 +89,7 @@ pub async fn recent_handler(
                         summary: doc.summary,
                         entities: doc.entities,
                         created_at: doc.created_at,
+                        source: doc.source,
                     })
                     .collect(),
                 total,

@@ -6,6 +6,7 @@ import {
   WebUiKeySection,
   WorkspacesSection,
   ApiKeysSection,
+  ConnectorsSection,
 } from '../components/AdminManagement';
 
 interface AdminPageProps {
@@ -291,6 +292,7 @@ export function AdminPage({ showToast, onWorkspacesChanged }: AdminPageProps) {
           workspaces={workspaces}
           onChanged={handleWorkspacesChanged}
         />
+        <ConnectorsSection showToast={showToast} workspaces={workspaces} />
         <ApiKeysSection showToast={showToast} workspaces={workspaces} />
       </div>
 

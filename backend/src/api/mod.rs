@@ -3,6 +3,7 @@ mod search;
 mod documents;
 mod graph;
 mod workspaces;
+mod connectors;
 mod keys;
 pub mod settings;
 
@@ -13,6 +14,10 @@ pub use graph::{neighbors_handler, add_edge_handler, remove_edge_handler};
 pub use workspaces::{
     list_workspaces_handler, create_workspace_handler, get_workspace_handler,
     delete_workspace_handler,
+};
+pub use connectors::{
+    connector_status_handler, delete_connector_handler, list_connectors_handler,
+    register_connector_handler, trigger_connector_handler,
 };
 pub use keys::{list_keys_handler, create_key_handler, revoke_key_handler};
 
