@@ -4,7 +4,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
 use crate::models::{Entity, ParsedContent};
-use super::{LlmProvider, ProviderType, build_parse_prompt, extract_json, parse_entity_type};
+use super::{LlmProvider, ProviderType, build_http_client, build_parse_prompt, extract_json, parse_entity_type};
 
 const ANTHROPIC_API_URL: &str = "https://api.anthropic.com/v1/messages";
 
@@ -18,7 +18,7 @@ pub struct ClaudeProvider {
 impl ClaudeProvider {
     pub fn new(api_key: String) -> Self {
         Self {
-            client: Client::new(),
+            client: build_http_client(),
             api_key,
             model: "claude-sonnet-4-20250514".to_string(),
         }

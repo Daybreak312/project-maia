@@ -4,7 +4,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
 use crate::models::{Entity, ParsedContent};
-use super::{LlmProvider, EmbeddingProvider, ProviderType, build_parse_prompt, extract_json, parse_entity_type};
+use super::{LlmProvider, EmbeddingProvider, ProviderType, build_http_client, build_parse_prompt, extract_json, parse_entity_type};
 
 const GEMINI_API_BASE: &str = "https://generativelanguage.googleapis.com/v1beta";
 
@@ -18,7 +18,7 @@ pub struct GeminiProvider {
 impl GeminiProvider {
     pub fn new(api_key: String) -> Self {
         Self {
-            client: Client::new(),
+            client: build_http_client(),
             api_key,
             model: "gemini-2.5-flash".to_string(),
         }
@@ -162,7 +162,7 @@ pub struct GeminiEmbeddingProvider {
 impl GeminiEmbeddingProvider {
     pub fn new(api_key: String) -> Self {
         Self {
-            client: Client::new(),
+            client: build_http_client(),
             api_key,
             model: "gemini-embedding-001".to_string(),
         }

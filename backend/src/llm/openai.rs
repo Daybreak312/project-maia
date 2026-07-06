@@ -4,7 +4,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
 use crate::models::{Entity, ParsedContent};
-use super::{LlmProvider, EmbeddingProvider, ProviderType, build_parse_prompt, extract_json, parse_entity_type};
+use super::{LlmProvider, EmbeddingProvider, ProviderType, build_http_client, build_parse_prompt, extract_json, parse_entity_type};
 
 const OPENAI_API_BASE: &str = "https://api.openai.com/v1";
 
@@ -18,7 +18,7 @@ pub struct OpenAiChatProvider {
 impl OpenAiChatProvider {
     pub fn new(api_key: String) -> Self {
         Self {
-            client: Client::new(),
+            client: build_http_client(),
             api_key,
             model: "gpt-4o-mini".to_string(),
         }
@@ -155,7 +155,7 @@ pub struct OpenAiEmbeddingProvider {
 impl OpenAiEmbeddingProvider {
     pub fn new(api_key: String) -> Self {
         Self {
-            client: Client::new(),
+            client: build_http_client(),
             api_key,
             model: "text-embedding-3-small".to_string(),
         }
