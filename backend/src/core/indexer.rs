@@ -176,9 +176,11 @@ impl Indexer {
 
     /// Smart Ingest — 저장 전에 에이전트가 신규/업데이트/분할/중복을 판단하고 실행한다.
     ///
-    /// **정보 유실 0 불변식**: 어느 단계든(LLM 미설정/후보 검색 실패/판단 실패) 실패하면
-    /// raw 저장으로 폴백하며 응답에 `fallback=true`로 표시한다. 저장 실행은 기존 인덱싱
-    /// 파이프라인(`ingest_to_workspace`/`update_in_workspace`)을 실행기로 재사용한다.
+    /// **정보 유실 0 불변식**: 어느 단계에서 실패하든 입력이 사라지는 경로가 없다.
+    /// 판단 전 실패(LLM 미설정/판단 자체 실패)는 `raw_fallback`으로, 전략 실행 중
+    /// 흡수 가능한 실패(임베딩 장애/대상 load 실패 등)는 원문 raw 폴백으로 처리한다.
+    /// 폴백은 `persist_raw_document`(판단·파싱·임베딩과 무관하게 원문을 SSoT에 선기록)를
+    /// 통하므로, 프로바이더가 전면 장애여도 원문이 디스크에 남는다. 응답에 `fallback=true`.
     ///
     /// **LLM 호출 상한**: New/Update는 판단 1 + 관계 판단 1 = 2회. Split은 판단 1회
     /// (세그먼트 수 비례 관계 판단을 피해 기본 RELATED_TO로 연결). Duplicate는 판단 1회.
@@ -225,91 +227,266 @@ impl Indexer {
         };
 
         let reason = decision.reason.clone();
-        tracing::info!("Smart ingest 전략: {} — {}", decision.strategy.label(), reason);
+        let label = decision.strategy.label();
+        tracing::info!("Smart ingest 전략: {} — {}", label, reason);
 
-        match decision.strategy {
+        // 전략 실행. 실행 단계의 흡수 가능한 실패(임베딩 장애, Update 대상 load 실패 등)
+        // 에도 원문이 사라지지 않도록, 실패하면 원문을 raw로 보존한다(정보 유실 0 최후
+        // 방어선). 실행기에는 원문 클론을 넘겨 원본을 폴백용으로 살려둔다 — String 클론
+        // 비용은 LLM 호출 비용에 비해 무시 가능하다.
+        match self
+            .execute_decision(
+                llm.as_ref(),
+                &decision.strategy,
+                raw_content.clone(),
+                &candidates,
+                &reason,
+                workspace_id,
+            )
+            .await
+        {
+            Ok(outcome) => Ok(outcome),
+            Err(e) => {
+                tracing::warn!("전략 '{}' 실행 실패, 원문 raw 폴백: {}", label, e);
+                self.raw_fallback(
+                    raw_content,
+                    workspace_id,
+                    format!("전략 '{label}' 실행 실패로 raw 저장: {e}"),
+                )
+                .await
+            }
+        }
+    }
+
+    /// 판단된 전략을 실행한다. 실패는 호출 측(smart_ingest)의 raw 폴백으로 흡수된다.
+    ///
+    /// **LLM 호출 상한**: New/Update는 관계 판단 1회, Split/Duplicate는 관계 판단 없이
+    /// RELATED_TO 기본(문서 수 비례 무한 호출 금지 불변식).
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_decision(
+        &self,
+        llm: &dyn LlmProvider,
+        strategy: &IngestStrategy,
+        raw_content: String,
+        candidates: &[CandidateDoc],
+        reason: &str,
+        workspace_id: &str,
+    ) -> Result<IngestOutcome> {
+        match strategy {
             IngestStrategy::New => {
                 let resp = self.ingest_to_workspace(raw_content, workspace_id).await?;
                 let new_id = resp.id;
                 let edges = self
-                    .create_auto_edges(llm.as_ref(), workspace_id, new_id, &resp.summary, &candidates, true)
+                    .create_auto_edges(llm, workspace_id, new_id, &resp.summary, candidates, true)
                     .await;
                 Ok(IngestOutcome::from_response(resp, "new", vec![new_id], edges, false, reason))
             }
             IngestStrategy::Update { target } => {
-                // 병합 전략 = append: 기존 원문에 새 원문을 이어 붙여 재파싱한다(정보 누적).
+                let target = *target;
+                // Update 대상 로드 실패 시 New로 안전 강등한다(파서의 환각 target 강등과
+                // 대칭). 원문을 신규 저장해 정보 유실을 막는다 — 실행 단계에도 판단 단계와
+                // 동일한 방어선을 둔다.
+                let existing = match self.documents.load(target, workspace_id).await {
+                    Ok(d) => d,
+                    Err(e) => {
+                        tracing::warn!("Update 대상 {} 로드 실패, New로 강등: {}", target, e);
+                        let resp = self.ingest_to_workspace(raw_content, workspace_id).await?;
+                        let new_id = resp.id;
+                        let edges = self
+                            .create_auto_edges(llm, workspace_id, new_id, &resp.summary, candidates, true)
+                            .await;
+                        return Ok(IngestOutcome::from_response(
+                            resp,
+                            "new",
+                            vec![new_id],
+                            edges,
+                            false,
+                            format!("업데이트 대상 로드 실패로 신규 저장: {reason}"),
+                        ));
+                    }
+                };
+
+                // 병합 전략 = 상한 있는 append: 기존 원문에 새 원문을 이어 붙이되, 재파싱
+                // 입력이 무한 성장하지 않도록 총 길이를 제한한다(전체 이력은 버전 보관됨).
                 // update_in_workspace가 덮어쓰기 전에 이전 버전을 보관한다.
-                let existing = self.documents.load(target, workspace_id).await?;
-                let merged = format!("{}\n\n---\n\n{}", existing.raw_content, raw_content);
+                let merged = merge_for_update(&existing.raw_content, &raw_content);
                 let resp = self.update_in_workspace(target, merged, workspace_id).await?;
                 let others: Vec<CandidateDoc> =
                     candidates.iter().filter(|c| c.id != target).cloned().collect();
                 let edges = self
-                    .create_auto_edges(llm.as_ref(), workspace_id, target, &resp.summary, &others, true)
+                    .create_auto_edges(llm, workspace_id, target, &resp.summary, &others, true)
                     .await;
                 Ok(IngestOutcome::from_response(resp, "update", vec![target], edges, false, reason))
             }
             IngestStrategy::Split { segments } => {
-                let mut document_ids = Vec::new();
-                let mut total_edges = 0;
-                let mut primary: Option<IngestResponse> = None;
-                for segment in segments {
-                    let resp = self.ingest_to_workspace(segment, workspace_id).await?;
-                    let seg_id = resp.id;
-                    document_ids.push(seg_id);
+                self.execute_split(llm, segments, raw_content, candidates, reason, workspace_id)
+                    .await
+            }
+            IngestStrategy::Duplicate { of } => {
+                let of = *of;
+                // 중복이어도 원문은 보관한다(정보 유실 0). 자동 삭제/병합은 하지 않고
+                // (Phase 5 Review Queue의 사람 몫), 원본과 엣지로만 연결해 중복을 추적한다.
+                let resp = self.ingest_to_workspace(raw_content, workspace_id).await?;
+                let new_id = resp.id;
+                let dup_target = vec![CandidateDoc { id: of, summary: String::new() }];
+                let edges = self
+                    .create_auto_edges(llm, workspace_id, new_id, &resp.summary, &dup_target, false)
+                    .await;
+                Ok(IngestOutcome::from_response(resp, "duplicate", vec![new_id], edges, false, reason))
+            }
+        }
+    }
+
+    /// 분할 전략 실행 — best-effort. 각 세그먼트를 독립 저장하되, 하나라도 실패하면
+    /// 원문 전체를 raw dead-letter로 보존해 미저장 세그먼트의 유실을 막는다(정보 유실 0).
+    /// 부분 실패는 응답에 `fallback=true`와 사유로 관측 가능하게 남긴다.
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_split(
+        &self,
+        llm: &dyn LlmProvider,
+        segments: &[String],
+        raw_content: String,
+        candidates: &[CandidateDoc],
+        reason: &str,
+        workspace_id: &str,
+    ) -> Result<IngestOutcome> {
+        let mut document_ids: Vec<Uuid> = Vec::new();
+        let mut total_edges = 0usize;
+        let mut primary: Option<IngestResponse> = None;
+        let mut failed = 0usize;
+
+        for segment in segments {
+            match self.ingest_to_workspace(segment.clone(), workspace_id).await {
+                Ok(resp) => {
+                    document_ids.push(resp.id);
                     // Split은 관계 판단 없이 RELATED_TO로 연결 (LLM 호출 수를 상수로 유지).
                     let edges = self
-                        .create_auto_edges(llm.as_ref(), workspace_id, seg_id, &resp.summary, &candidates, false)
+                        .create_auto_edges(llm, workspace_id, resp.id, &resp.summary, candidates, false)
                         .await;
                     total_edges += edges;
                     if primary.is_none() {
                         primary = Some(resp);
                     }
                 }
-                let primary = primary.ok_or_else(|| anyhow!("split 세그먼트가 비어 있습니다"))?;
-                Ok(IngestOutcome::from_response(
-                    primary,
-                    "split",
-                    document_ids,
-                    total_edges,
-                    false,
-                    reason,
-                ))
-            }
-            IngestStrategy::Duplicate { of } => {
-                // 중복이어도 원문은 보관한다(정보 유실 0). 자동 삭제/병합은 하지 않고
-                // (Phase 5 Review Queue의 사람 몫), 원본과 엣지로만 연결해 중복을 추적한다.
-                let resp = self.ingest_to_workspace(raw_content, workspace_id).await?;
-                let new_id = resp.id;
-                let dup_target = vec![CandidateDoc {
-                    id: of,
-                    summary: String::new(),
-                }];
-                let edges = self
-                    .create_auto_edges(llm.as_ref(), workspace_id, new_id, &resp.summary, &dup_target, false)
-                    .await;
-                Ok(IngestOutcome::from_response(
-                    resp,
-                    "duplicate",
-                    vec![new_id],
-                    edges,
-                    false,
-                    reason,
-                ))
+                Err(e) => {
+                    failed += 1;
+                    tracing::warn!("분할 세그먼트 저장 실패(best-effort 계속): {}", e);
+                }
             }
         }
+
+        if failed == 0 {
+            // 전 세그먼트 성공 — 원문 dead-letter가 필요 없다.
+            let primary = primary.ok_or_else(|| anyhow!("split 세그먼트가 비어 있습니다"))?;
+            return Ok(IngestOutcome::from_response(
+                primary,
+                "split",
+                document_ids,
+                total_edges,
+                false,
+                reason,
+            ));
+        }
+
+        // 일부(또는 전부) 세그먼트 실패 — 원문 전체를 raw dead-letter로 보존한다.
+        tracing::warn!("분할 세그먼트 {}개 실패 — 원문을 raw dead-letter로 보존", failed);
+        let dead_letter = self.persist_raw_document(raw_content, workspace_id).await?;
+        document_ids.push(dead_letter.id);
+        let rep = primary.unwrap_or_else(|| IngestResponse {
+            id: dead_letter.id,
+            summary: dead_letter.summary.clone(),
+            entities: dead_letter.entities.clone(),
+            facts: dead_letter.facts.clone(),
+        });
+        Ok(IngestOutcome::from_response(
+            rep,
+            "split",
+            document_ids,
+            total_edges,
+            true,
+            format!("분할 중 {failed}개 세그먼트 실패로 원문을 raw 보존: {reason}"),
+        ))
     }
 
-    /// raw 저장 폴백 — 판단을 우회하고 기존 파이프라인으로 저장한 뒤 fallback=true로 표시.
+    /// raw 저장 폴백 — 판단·파싱·임베딩과 무관하게 원문을 저장하고 fallback=true로 표시.
     async fn raw_fallback(
         &self,
         raw_content: String,
         workspace_id: &str,
         reason: String,
     ) -> Result<IngestOutcome> {
-        let resp = self.ingest_to_workspace(raw_content, workspace_id).await?;
-        let id = resp.id;
-        Ok(IngestOutcome::from_response(resp, "raw", vec![id], 0, true, reason))
+        let doc = self.persist_raw_document(raw_content, workspace_id).await?;
+        let id = doc.id;
+        Ok(IngestOutcome::from_response(
+            IngestResponse {
+                id,
+                summary: doc.summary,
+                entities: doc.entities,
+                facts: doc.facts,
+            },
+            "raw",
+            vec![id],
+            0,
+            true,
+            reason,
+        ))
+    }
+
+    /// **최후의 방어선** — 원문을 판단·파싱·임베딩과 무관하게 디스크(SSoT)에 먼저 기록.
+    ///
+    /// 기존 폴백은 `ingest_to_workspace`를 재사용해 LLM `parse`와 임베딩을 다시 호출했다
+    /// — 폴백이라는 이름의 경로가 폴백해야 할 바로 그 서비스에 의존하는 모순이었다.
+    /// 프로바이더 장애 시 폴백 자체가 실패해 입력이 소실됐다. 이 메서드는 그 의존을 끊는다:
+    /// 1. LLM 없이 원문 앞부분으로 summary를 만들고 raw JSON을 **먼저** 저장한다
+    ///    (외부 서비스 무관 — 이 저장만이 정보 유실 0의 hard requirement).
+    /// 2. 임베딩이 가용하면 best-effort로 Qdrant에 인덱싱해 즉시 검색 가능하게 한다.
+    ///    실패해도 raw JSON은 SSoT로 남아 다음 reindex에서 복원되므로 유실이 없다.
+    async fn persist_raw_document(
+        &self,
+        raw_content: String,
+        workspace_id: &str,
+    ) -> Result<Document> {
+        let summary = fallback_summary(&raw_content);
+        let doc = Document::new(raw_content, summary, Vec::new(), Vec::new());
+
+        // SSoT 저장 — 외부 서비스에 의존하지 않는 유일한 필수 단계.
+        self.documents.save(&doc, workspace_id).await?;
+
+        // best-effort 인덱싱 — 실패는 흡수하되 침묵하지 않는다(reindex로 복원 가능).
+        self.best_effort_index(&doc, workspace_id).await;
+
+        Ok(doc)
+    }
+
+    /// raw 문서를 best-effort로 Qdrant에 인덱싱한다. 임베딩/Qdrant 실패는 warn만 하고
+    /// 흡수한다 — raw JSON이 이미 저장됐으므로 다음 reindex에서 복원된다(정보 유실 0).
+    async fn best_effort_index(&self, doc: &Document, workspace_id: &str) {
+        let embedder = match self.get_embedding_provider().await {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!("raw 저장 후 임베딩 provider 미확보(인덱싱 생략, reindex로 복원): {}", e);
+                return;
+            }
+        };
+        match self.build_chunks(embedder.as_ref(), &doc.summary, &doc.facts).await {
+            Ok(chunks) => {
+                if let Err(e) = self
+                    .qdrant
+                    .upsert_chunks(
+                        workspace_id,
+                        doc.id,
+                        &doc.summary,
+                        &doc.created_at.to_rfc3339(),
+                        &doc.edges,
+                        chunks,
+                    )
+                    .await
+                {
+                    tracing::warn!("raw 문서 Qdrant 인덱싱 실패(reindex로 복원 가능): {}", e);
+                }
+            }
+            Err(e) => tracing::warn!("raw 문서 임베딩 실패(reindex로 복원 가능): {}", e),
+        }
     }
 
     /// 입력과 의미적으로 관련된 기존 문서 후보를 찾는다(요약만, 유사도 상위 소수).
@@ -1088,6 +1265,52 @@ fn decayed_score(r: &SearchResult, now: DateTime<Utc>, lambda: f32) -> f32 {
     }
 }
 
+/// LLM 파싱 없이 원문에서 요약을 만든다(최후 방어선용).
+///
+/// 원문 앞부분을 잘라 쓰되 문자 경계를 지켜(멀티바이트 안전) 최대 `MAX`자로 제한하고,
+/// 잘린 경우 말줄임표를 붙여 부분 요약임을 표시한다. 순수 함수 — mock 없이 테스트된다.
+fn fallback_summary(raw: &str) -> String {
+    const MAX: usize = 200;
+    let trimmed = raw.trim();
+    let truncated: String = trimmed.chars().take(MAX).collect();
+    if trimmed.chars().count() > MAX {
+        format!("{truncated}…")
+    } else {
+        truncated
+    }
+}
+
+/// 업데이트 병합 — 기존 원문에 새 원문을 이어 붙이되, 재파싱 입력이 무한 성장하지
+/// 않도록 총 길이에 상한을 둔다(모든 루프에 상한 불변식).
+///
+/// 상한 초과 시 **새 입력은 항상 온전히 보존**하고 기존 원문은 뒤쪽(최근)부터 남긴다.
+/// 잘려나간 이력 전체는 VersionStore 스냅샷에 남으므로 정보 유실이 없다. 이 상한이
+/// 없으면 반복 업데이트로 raw_content가 선형 성장해 결국 LLM 컨텍스트를 초과, 그 문서가
+/// 영구히 업데이트 불가가 되고 이후 입력이 소실된다. 순수 함수 — mock 없이 테스트된다.
+fn merge_for_update(existing_raw: &str, new_raw: &str) -> String {
+    const MAX_MERGED_CHARS: usize = 20_000;
+    const SEP: &str = "\n\n---\n\n";
+
+    let existing_len = existing_raw.chars().count();
+    let new_len = new_raw.chars().count();
+    let sep_len = SEP.chars().count();
+
+    if existing_len + sep_len + new_len <= MAX_MERGED_CHARS {
+        return format!("{existing_raw}{SEP}{new_raw}");
+    }
+
+    // 상한 초과: 새 입력 + 구분자 예산을 확보하고 기존 원문은 최근 tail만 남긴다.
+    let budget = MAX_MERGED_CHARS.saturating_sub(new_len + sep_len);
+    if budget == 0 {
+        // 새 입력만으로 이미 상한 이상 — 새 입력(최신 기억)은 절대 잃지 않으므로 그대로.
+        return new_raw.to_string();
+    }
+    let existing_chars: Vec<char> = existing_raw.chars().collect();
+    let keep_from = existing_chars.len().saturating_sub(budget);
+    let kept: String = existing_chars[keep_from..].iter().collect();
+    format!("{kept}{SEP}{new_raw}")
+}
+
 /// 벡터 검색 그룹핑을 위한 내부 구조체
 struct DocumentGroup {
     summary: String,
@@ -1295,5 +1518,75 @@ mod tests {
         let low = result_at(0.5, None);
         let out = apply_time_decay(vec![low, high], now, 0.1);
         assert_eq!(out[0].id, high_id);
+    }
+
+    // ──── 최후 방어선: fallback_summary (LLM 없는 요약) ────
+
+    #[test]
+    fn test_fallback_summary_short_input_trimmed_passthrough() {
+        // 짧은 입력은 트림 후 그대로 (말줄임표 없음).
+        assert_eq!(fallback_summary("  짧은 메모  "), "짧은 메모");
+    }
+
+    #[test]
+    fn test_fallback_summary_truncates_long_input() {
+        // 200자를 넘으면 200자로 자르고 말줄임표를 붙인다.
+        let long = "가".repeat(500);
+        let s = fallback_summary(&long);
+        assert_eq!(s.chars().count(), 201, "200자 + 말줄임표");
+        assert!(s.ends_with('…'));
+    }
+
+    #[test]
+    fn test_fallback_summary_multibyte_safe() {
+        // 멀티바이트 경계에서 잘려도 패닉 없이 유효한 문자열이어야 한다(바이트 슬라이싱 금지).
+        let emoji = "🧠".repeat(300);
+        let s = fallback_summary(&emoji);
+        assert!(s.chars().count() <= 201);
+        assert!(s.starts_with('🧠'));
+    }
+
+    #[test]
+    fn test_fallback_summary_empty_input() {
+        assert_eq!(fallback_summary("   "), "");
+    }
+
+    // ──── Update 병합 상한: merge_for_update (무한 성장 방지) ────
+
+    #[test]
+    fn test_merge_for_update_under_cap_appends_full() {
+        // 상한 이하면 기존+새 원문을 구분자로 온전히 이어 붙인다.
+        let m = merge_for_update("기존 내용", "새 내용");
+        assert!(m.contains("기존 내용"));
+        assert!(m.contains("새 내용"));
+        assert!(m.contains("---"), "구분자로 이어 붙여야 한다");
+    }
+
+    #[test]
+    fn test_merge_for_update_caps_growth_keeps_new_whole() {
+        // 기존 원문이 상한을 넘길 만큼 크면, 새 입력은 온전히 보존하고 기존은 최근만 남긴다.
+        let existing = "A".repeat(30_000);
+        let new = "새로운 최신 입력";
+        let m = merge_for_update(&existing, new);
+        assert!(m.chars().count() <= 20_000, "총 길이가 상한 이하여야 한다");
+        assert!(m.ends_with(new), "새 입력이 끝에 온전히 보존되어야 한다");
+    }
+
+    #[test]
+    fn test_merge_for_update_repeated_updates_stay_bounded() {
+        // 반복 업데이트로 raw_content가 무한 성장하지 않아야 한다(시한폭탄 방지 불변식).
+        let mut acc = String::from("초기");
+        for i in 0..100 {
+            acc = merge_for_update(&acc, &"업데이트 ".repeat(50));
+            assert!(acc.chars().count() <= 20_000, "누적이 상한을 넘으면 안 된다 (회차 {i})");
+        }
+    }
+
+    #[test]
+    fn test_merge_for_update_huge_new_input_preserved() {
+        // 새 입력 자체가 상한보다 커도 통째로 보존한다(최신 기억 우선).
+        let new = "B".repeat(25_000);
+        let m = merge_for_update("기존", &new);
+        assert!(m.contains(&new), "상한보다 큰 새 입력도 온전히 보존");
     }
 }
