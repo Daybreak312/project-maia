@@ -14,6 +14,7 @@ use crate::core::search_agent::{
 };
 use crate::llm::{create_llm_provider, create_embedding_provider, LlmProvider, EmbeddingProvider};
 use crate::models::{Document, DocumentSource, Edge, RelationType, api::{AgentSearchMeta, IngestResponse, IngestOutcome, SearchResponse, SearchResult}};
+use crate::patrol::decay::apply_edge_decay;
 use crate::settings::SettingsManager;
 use crate::storage::{DocumentStore, QdrantStorage, SearchHit, ChunkData, VersionStore};
 
@@ -1004,6 +1005,66 @@ impl Indexer {
         Ok(removed)
     }
 
+    // ──── Patrol 지원 (Phase 5) ────
+
+    /// 워크스페이스의 raw 문서 전체를 반환한다(Patrol 신호 수집용).
+    /// list_recent를 큰 상한으로 재사용한다 — 개인 규모에서 전 문서를 담기 충분하다.
+    pub async fn all_documents(&self, workspace_id: &str) -> Result<Vec<Document>> {
+        self.documents.list_recent(usize::MAX, workspace_id).await
+    }
+
+    /// **복구 가능한 삭제** — 삭제 전에 현재 상태를 버전으로 보관한 뒤 삭제한다.
+    ///
+    /// Review Queue의 "삭제" 판단이 쓰는 경로다. 버전 스냅샷이 남아 잘못된 삭제도 복구할
+    /// 수 있다(파괴 전 복구 가능성 보장). 이미 없는 문서는 성공으로 본다(멱등 — 판단
+    /// 재제출/경합에서 이중 삭제가 에러가 되지 않게).
+    pub async fn soft_delete_document(&self, workspace_id: &str, id: Uuid) -> Result<()> {
+        if !self.documents.exists(id, workspace_id).await {
+            return Ok(()); // 이미 삭제됨 — 멱등 성공
+        }
+        let doc = self.documents.load(id, workspace_id).await?;
+        // 삭제 전 버전 보관(복구 가능성). 실패 시 삭제하지 않는다(안전망 우선).
+        self.versions.archive(&doc, workspace_id).await?;
+        self.delete_from_workspace(id, workspace_id).await
+    }
+
+    /// 워크스페이스 전 문서의 엣지에 **시간 감쇠**를 자동 재계산한다(수학적 유지보수).
+    ///
+    /// 가중치가 바뀐 문서만 raw JSON(SSoT)을 저장하고, Qdrant payload는 best-effort로
+    /// 동기화한다(payload는 파생물 — 실패해도 reindex로 복원). 감쇠는 **문서 내용 변경이
+    /// 아니므로 `updated_at`을 건드리지 않는다**(staleness 기준점이 리셋되면 안 됨).
+    /// `lambda <= 0`이면 감쇠 없음(0 반환). 바뀐 엣지 총수를 반환한다.
+    pub async fn decay_workspace_edges(
+        &self,
+        workspace_id: &str,
+        lambda: f32,
+        now: DateTime<Utc>,
+    ) -> Result<usize> {
+        if lambda <= 0.0 {
+            return Ok(0);
+        }
+        let docs = self.documents.list_recent(usize::MAX, workspace_id).await?;
+        let mut total_changed = 0usize;
+        for mut doc in docs {
+            let changed = apply_edge_decay(&mut doc, now, lambda);
+            if changed == 0 {
+                continue;
+            }
+            // raw JSON 먼저 저장(SSoT). updated_at은 의도적으로 보존.
+            self.documents.save(&doc, workspace_id).await?;
+            // payload 동기화는 best-effort — 실패해도 raw가 진실이라 reindex로 복원된다.
+            if let Err(e) = self
+                .qdrant
+                .update_edges_payload(workspace_id, doc.id, &doc.edges)
+                .await
+            {
+                tracing::warn!("엣지 감쇠 payload 동기화 실패 {}(reindex로 복원): {}", doc.id, e);
+            }
+            total_changed += changed;
+        }
+        Ok(total_changed)
+    }
+
     // ──── 커넥터 유입 (Phase 4) ────
 
     /// 커넥터 신규 항목을 Parsed 모드로 유입한다 — LLM 파싱 + 임베딩 + 출처 각인 +
@@ -1369,6 +1430,27 @@ impl Indexer {
         })
     }
 
+}
+
+/// Indexer를 Patrol의 문서 실행기로 노출한다(전 문서 조회·복구 가능 삭제·엣지 감쇠).
+/// 러너/스케줄러 패턴과 동일하게, 단위 테스트는 이 trait을 mock으로 대체해 Qdrant·LLM
+/// 없이 Patrol 오케스트레이션(신호 수집·탐지·enqueue·판단·감쇠)을 검증한다.
+#[async_trait]
+impl crate::patrol::PatrolExecutor for Indexer {
+    async fn all_documents(&self, workspace_id: &str) -> Result<Vec<Document>> {
+        Indexer::all_documents(self, workspace_id).await
+    }
+    async fn soft_delete_document(&self, workspace_id: &str, id: Uuid) -> Result<()> {
+        Indexer::soft_delete_document(self, workspace_id, id).await
+    }
+    async fn decay_workspace_edges(
+        &self,
+        workspace_id: &str,
+        lambda: f32,
+        now: DateTime<Utc>,
+    ) -> Result<usize> {
+        Indexer::decay_workspace_edges(self, workspace_id, lambda, now).await
+    }
 }
 
 /// Indexer를 Search Agent의 검색 백엔드로 노출한다. 에이전트 파이프라인이 Qdrant·
