@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Result};
+use chrono::{DateTime, Utc};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -393,7 +394,7 @@ impl Indexer {
         created
     }
 
-    /// Hybrid Search: 벡터 검색 + 키워드 검색 결합
+    /// Hybrid Search: 벡터 검색 + 키워드 검색 결합 (시간 인식 없음, 기본)
     pub async fn search(
         &self,
         query: String,
@@ -401,10 +402,15 @@ impl Indexer {
         offset: usize,
         mode: Option<String>,
     ) -> Result<SearchResponse> {
-        self.search_in_workspace(query, limit, offset, mode, DEFAULT_WORKSPACE).await
+        self.search_in_workspace(query, limit, offset, mode, DEFAULT_WORKSPACE, TimeSearchOptions::default())
+            .await
     }
 
     /// 특정 워크스페이스에서 검색한다.
+    ///
+    /// 시간 인식 처리 순서: 기간 필터(created_at) → 관련성 필터(원본 cosine) →
+    /// 시간 감쇠 재정렬(opt-in). 감쇠는 순위만 바꾸고 표시 점수는 원본 유사도를
+    /// 유지하므로, 오래됐지만 매우 관련있는 문서가 임계값에서 사라지지 않는다.
     pub async fn search_in_workspace(
         &self,
         query: String,
@@ -412,6 +418,7 @@ impl Indexer {
         offset: usize,
         mode: Option<String>,
         workspace_id: &str,
+        time: TimeSearchOptions,
     ) -> Result<SearchResponse> {
         let search_mode: SearchMode = mode
             .as_deref()
@@ -426,8 +433,18 @@ impl Indexer {
             SearchMode::Hybrid => self.hybrid_search(&query, limit + offset, workspace_id).await?,
         };
 
-        // 관련성 기반 동적 필터링
+        // 1. 기간 필터 (created_at 기준)
+        let results = apply_period_filter(results, time.since, time.until);
+
+        // 2. 관련성 기반 동적 필터링 (원본 cosine 기준)
         let filtered = filter_by_relevance(results);
+
+        // 3. 시간 감쇠 재정렬 (opt-in) — 관련성 통과 결과의 순위만 최신 우선으로 조정
+        let filtered = if time.decay {
+            apply_time_decay(filtered, Utc::now(), time.lambda)
+        } else {
+            filtered
+        };
         let filtered_total = filtered.len();
 
         // 페이지네이션 적용
@@ -472,6 +489,7 @@ impl Indexer {
                 summary: hit.summary.clone(),
                 best_score: 0.0,
                 matched_facts: Vec::new(),
+                created_at: hit.created_at,
             });
 
             if hit.score > group.best_score {
@@ -498,6 +516,7 @@ impl Indexer {
                 relevance_score: group.best_score,
                 workspace: workspace_id.to_string(),
                 matched_facts: group.matched_facts,
+                created_at: group.created_at,
             })
             .collect();
 
@@ -546,6 +565,7 @@ impl Indexer {
                     relevance_score: (score / max_score).min(1.0),
                     workspace: workspace_id.to_string(),
                     matched_facts: vec![],
+                    created_at: doc.created_at,
                 })
             })
             .collect();
@@ -610,6 +630,7 @@ impl Indexer {
                     relevance_score: score,
                     workspace: workspace_id.to_string(),
                     matched_facts: doc.matched_facts.clone(),
+                    created_at: doc.created_at,
                 })
             })
             .collect();
@@ -868,11 +889,12 @@ impl Indexer {
         offset: usize,
         mode: Option<String>,
         workspace_ids: &[String],
+        time: TimeSearchOptions,
     ) -> Result<SearchResponse> {
         // 단일 대상이면 일반 검색으로 위임 (불필요한 오케스트레이션 회피)
         if workspace_ids.len() == 1 {
             return self
-                .search_in_workspace(query, limit, offset, mode, &workspace_ids[0])
+                .search_in_workspace(query, limit, offset, mode, &workspace_ids[0], time)
                 .await;
         }
 
@@ -882,10 +904,16 @@ impl Indexer {
             .unwrap_or_default();
 
         // 각 워크스페이스에서 상위 (limit+offset)개 후보를 수집한다.
+        // (각 워크스페이스 검색에서 기간 필터는 적용되지만 감쇠 재정렬은 최종 병합 후
+        //  한 번에 하므로, 개별 검색에는 감쇠를 끄고 병합 결과에 적용한다.)
+        let per_ws_time = TimeSearchOptions {
+            decay: false,
+            ..time.clone()
+        };
         let mut merged: Vec<SearchResult> = Vec::new();
         for ws in workspace_ids {
             match self
-                .search_in_workspace(query.clone(), limit + offset, 0, mode.clone(), ws)
+                .search_in_workspace(query.clone(), limit + offset, 0, mode.clone(), ws, per_ws_time.clone())
                 .await
             {
                 Ok(resp) => merged.extend(resp.results),
@@ -896,12 +924,17 @@ impl Indexer {
             }
         }
 
-        // relevance_score 내림차순 재정렬 (동일 임베딩 공간이라 비교 유효)
-        merged.sort_by(|a, b| {
-            b.relevance_score
-                .partial_cmp(&a.relevance_score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        // 병합 결과 재정렬: 감쇠가 켜져 있으면 시간 감쇠 순위로, 아니면 relevance 내림차순.
+        // (동일 임베딩 공간이라 워크스페이스 간 점수 비교가 유효)
+        if time.decay {
+            merged = apply_time_decay(merged, Utc::now(), time.lambda);
+        } else {
+            merged.sort_by(|a, b| {
+                b.relevance_score
+                    .partial_cmp(&a.relevance_score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
 
         let total = merged.len();
         let paginated: Vec<_> = merged.into_iter().skip(offset).take(limit).collect();
@@ -983,17 +1016,92 @@ fn filter_by_relevance(results: Vec<SearchResult>) -> Vec<SearchResult> {
     filtered
 }
 
+/// 시간 인식 검색 옵션.
+#[derive(Debug, Clone, Default)]
+pub struct TimeSearchOptions {
+    /// 시간 감쇠 재정렬 적용 여부 (opt-in).
+    pub decay: bool,
+    /// 감쇠 강도 lambda (exp(-lambda*age_days)). decay=false면 무시.
+    pub lambda: f32,
+    /// 기간 필터 시작 (이 시각 포함 이후).
+    pub since: Option<DateTime<Utc>>,
+    /// 기간 필터 끝 (이 시각 포함 이전).
+    pub until: Option<DateTime<Utc>>,
+}
+
+/// 시간 감쇠 계수: `exp(-lambda * age_days)`.
+///
+/// lambda ≤ 0이면 1.0(감쇠 없음). 미래 시각(age < 0)은 age=0으로 clamp한다.
+/// age가 커질수록 0에 수렴하므로 최신 문서일수록 계수가 크다.
+pub fn time_decay_factor(created_at: DateTime<Utc>, now: DateTime<Utc>, lambda: f32) -> f32 {
+    if lambda <= 0.0 {
+        return 1.0;
+    }
+    let age_secs = (now - created_at).num_seconds().max(0) as f32;
+    let age_days = age_secs / 86_400.0;
+    (-lambda * age_days).exp()
+}
+
+/// created_at 기준 기간 필터를 적용한다.
+///
+/// since/until이 모두 없으면 그대로 반환. 필터가 지정되면 created_at이 없는 결과는
+/// 기간 만족 여부를 판단할 수 없으므로 보수적으로 제외한다.
+pub fn apply_period_filter(
+    results: Vec<SearchResult>,
+    since: Option<DateTime<Utc>>,
+    until: Option<DateTime<Utc>>,
+) -> Vec<SearchResult> {
+    if since.is_none() && until.is_none() {
+        return results;
+    }
+    results
+        .into_iter()
+        .filter(|r| match r.created_at {
+            Some(ts) => since.map_or(true, |s| ts >= s) && until.map_or(true, |u| ts <= u),
+            None => false,
+        })
+        .collect()
+}
+
+/// 시간 감쇠로 결과를 재정렬한다.
+///
+/// 표시 점수(relevance_score)는 원본 유사도를 유지하고, 정렬 순서만 감쇠 점수
+/// (relevance × decay_factor)로 결정한다 — "동일 유사도면 최신 우선". created_at이
+/// 없는 결과는 감쇠 계수 1.0으로 취급한다(감쇠에서 제외).
+pub fn apply_time_decay(
+    mut results: Vec<SearchResult>,
+    now: DateTime<Utc>,
+    lambda: f32,
+) -> Vec<SearchResult> {
+    results.sort_by(|a, b| {
+        let sa = decayed_score(a, now, lambda);
+        let sb = decayed_score(b, now, lambda);
+        sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    results
+}
+
+fn decayed_score(r: &SearchResult, now: DateTime<Utc>, lambda: f32) -> f32 {
+    match r.created_at {
+        Some(ts) => r.relevance_score * time_decay_factor(ts, now, lambda),
+        None => r.relevance_score,
+    }
+}
+
 /// 벡터 검색 그룹핑을 위한 내부 구조체
 struct DocumentGroup {
     summary: String,
     best_score: f32,
     matched_facts: Vec<String>,
+    created_at: Option<DateTime<Utc>>,
 }
 
 #[cfg(test)]
 mod tests {
-    use super::cross_workspace_targets;
+    use super::*;
     use crate::auth::{AuthContext, Permission};
+    use crate::models::api::SearchResult;
+    use chrono::Duration;
     use std::collections::HashSet;
 
     fn existing(ids: &[&str]) -> HashSet<String> {
@@ -1086,5 +1194,106 @@ mod tests {
             &existing(&["personal", "work"]),
         );
         assert_eq!(targets, vec!["personal".to_string(), "work".to_string()]);
+    }
+
+    // ──── 시간 인식 검색 (감쇠·기간 필터) ────
+
+    fn result_at(score: f32, created_at: Option<DateTime<Utc>>) -> SearchResult {
+        SearchResult {
+            id: Uuid::new_v4(),
+            summary: String::new(),
+            relevance_score: score,
+            workspace: "default".to_string(),
+            matched_facts: vec![],
+            created_at,
+        }
+    }
+
+    #[test]
+    fn test_time_decay_factor_no_lambda_is_one() {
+        let now = Utc::now();
+        assert_eq!(time_decay_factor(now - Duration::days(100), now, 0.0), 1.0);
+    }
+
+    #[test]
+    fn test_time_decay_factor_recent_higher_than_old() {
+        let now = Utc::now();
+        let recent = time_decay_factor(now - Duration::days(1), now, 0.1);
+        let old = time_decay_factor(now - Duration::days(30), now, 0.1);
+        assert!(recent > old, "최신일수록 감쇠 계수가 커야 한다");
+        assert!(recent <= 1.0 && old > 0.0);
+    }
+
+    #[test]
+    fn test_time_decay_factor_future_clamped_to_one() {
+        let now = Utc::now();
+        let f = time_decay_factor(now + Duration::days(5), now, 0.1);
+        assert!((f - 1.0).abs() < 1e-6, "미래 시각은 1.0으로 clamp");
+    }
+
+    #[test]
+    fn test_apply_period_filter_no_bounds_passthrough() {
+        let out = apply_period_filter(vec![result_at(0.9, Some(Utc::now()))], None, None);
+        assert_eq!(out.len(), 1);
+    }
+
+    #[test]
+    fn test_apply_period_filter_since() {
+        let now = Utc::now();
+        let old = result_at(0.9, Some(now - Duration::days(10)));
+        let recent = result_at(0.9, Some(now - Duration::days(1)));
+        let out = apply_period_filter(vec![old, recent], Some(now - Duration::days(5)), None);
+        assert_eq!(out.len(), 1, "since 이후 문서만 남아야 한다");
+    }
+
+    #[test]
+    fn test_apply_period_filter_until() {
+        let now = Utc::now();
+        let old = result_at(0.9, Some(now - Duration::days(10)));
+        let recent = result_at(0.9, Some(now - Duration::days(1)));
+        let out = apply_period_filter(vec![old, recent], None, Some(now - Duration::days(5)));
+        assert_eq!(out.len(), 1, "until 이전 문서만 남아야 한다");
+    }
+
+    #[test]
+    fn test_apply_period_filter_excludes_missing_created_at() {
+        let out = apply_period_filter(
+            vec![result_at(0.9, None)],
+            Some(Utc::now() - Duration::days(1)),
+            None,
+        );
+        assert!(out.is_empty(), "created_at 없는 결과는 기간 필터 시 제외");
+    }
+
+    #[test]
+    fn test_apply_time_decay_recent_first_on_equal_score() {
+        // 동일 유사도, 다른 시각 → 최신이 상위 (PRD 인수 조건).
+        let now = Utc::now();
+        let old = result_at(0.8, Some(now - Duration::days(365)));
+        let old_id = old.id;
+        let recent = result_at(0.8, Some(now - Duration::days(1)));
+        let recent_id = recent.id;
+        let out = apply_time_decay(vec![old, recent], now, 0.1);
+        assert_eq!(out[0].id, recent_id, "최신 문서가 상위여야 한다");
+        assert_eq!(out[1].id, old_id);
+    }
+
+    #[test]
+    fn test_apply_time_decay_preserves_display_score() {
+        // 표시 점수(relevance_score)는 감쇠하지 않고 원본 유사도를 유지한다.
+        let now = Utc::now();
+        let out = apply_time_decay(vec![result_at(0.75, Some(now - Duration::days(10)))], now, 0.1);
+        assert!((out[0].relevance_score - 0.75).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_apply_time_decay_missing_created_at_uses_raw_score() {
+        // created_at이 없으면 감쇠 없이 원본 점수로 정렬 (높은 점수 상위).
+        let now = Utc::now();
+        let high = result_at(0.9, None);
+        let high_id = high.id;
+        let low = result_at(0.5, None);
+        let out = apply_time_decay(vec![low, high], now, 0.1);
+        assert_eq!(out[0].id, high_id);
     }
 }

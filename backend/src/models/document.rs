@@ -264,6 +264,16 @@ pub mod api {
         /// Some(true): 설정 목록 기반 교차 검색을 명시적으로 요청.
         #[serde(default)]
         pub cross_workspace: Option<bool>,
+        /// 시간 감쇠 적용 여부 (opt-in). true면 동일 유사도에서 최신 문서가 상위에 온다.
+        /// 감쇠 강도(lambda)는 워크스페이스 설정(time_decay_lambda)을 따른다.
+        #[serde(default)]
+        pub time_decay: Option<bool>,
+        /// 기간 필터: 이 시각(포함) 이후 생성된 문서만 (created_at 기준).
+        #[serde(default)]
+        pub since: Option<DateTime<Utc>>,
+        /// 기간 필터: 이 시각(포함) 이전 생성된 문서만.
+        #[serde(default)]
+        pub until: Option<DateTime<Utc>>,
     }
 
     fn default_limit() -> usize {
@@ -297,6 +307,9 @@ pub mod api {
         pub workspace: String,
         #[serde(skip_serializing_if = "Vec::is_empty")]
         pub matched_facts: Vec<String>,
+        /// 문서 생성 시각 (시간 인식 검색·표시용). Qdrant payload에서 유래.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub created_at: Option<DateTime<Utc>>,
     }
 
     #[derive(Debug, Serialize)]

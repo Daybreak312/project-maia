@@ -8,6 +8,7 @@ use qdrant_client::qdrant::{
     FieldType, Filter, SetPayloadPointsBuilder,
 };
 use std::collections::{HashMap, HashSet};
+use chrono::{DateTime, Utc};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
@@ -270,6 +271,7 @@ impl QdrantStorage {
                 let edges = extract_string(&payload, "edges")
                     .map(|s| edges_from_payload(&s))
                     .unwrap_or_default();
+                let created_at = parse_created_at(&payload);
 
                 Some(SearchHit {
                     id,
@@ -278,6 +280,7 @@ impl QdrantStorage {
                     chunk_text,
                     score: point.score,
                     edges,
+                    created_at,
                 })
             })
             .collect();
@@ -397,6 +400,7 @@ impl QdrantStorage {
                 let edges = extract_string(payload, "edges")
                     .map(|s| edges_from_payload(&s))
                     .unwrap_or_default();
+                let created_at = parse_created_at(payload);
 
                 all_hits.push(SearchHit {
                     id,
@@ -405,6 +409,7 @@ impl QdrantStorage {
                     chunk_text,
                     score: 0.0,
                     edges,
+                    created_at,
                 });
             }
 
@@ -465,6 +470,15 @@ pub struct SearchHit {
     pub score: f32,
     /// summary chunk payload에서 파싱한 비정규화 엣지 (fact chunk에서는 빈 벡터).
     pub edges: Vec<Edge>,
+    /// payload의 created_at (rfc3339) 파싱값. 시간 인식 검색용. 파싱 불가 시 None.
+    pub created_at: Option<DateTime<Utc>>,
+}
+
+/// payload의 created_at 문자열(rfc3339)을 UTC DateTime으로 파싱한다.
+fn parse_created_at(payload: &HashMap<String, Value>) -> Option<DateTime<Utc>> {
+    extract_string(payload, "created_at")
+        .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+        .map(|dt| dt.with_timezone(&Utc))
 }
 
 /// 엣지 목록을 payload 저장용 JSON 문자열로 직렬화한다.
