@@ -20,16 +20,23 @@ use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+use auth::ApiKeyManager;
 use config::Config;
 use core::Indexer;
 use settings::SettingsManager;
 use storage::{DocumentStore, QdrantStorage};
+use workspace::WorkspaceManager;
 
 /// 애플리케이션 상태
 pub struct AppState {
     pub indexer: Indexer,
     pub settings: Arc<SettingsManager>,
+    /// 마스터 API 키 (MAIA_API_KEY). None이면 인증 비활성(개발 모드).
     pub api_key: Option<String>,
+    /// 워크스페이스 CRUD 관리자
+    pub workspaces: Arc<WorkspaceManager>,
+    /// API 키 발급/조회/인증 관리자
+    pub api_keys: Arc<ApiKeyManager>,
 }
 
 #[tokio::main]
@@ -50,9 +57,18 @@ async fn main() -> anyhow::Result<()> {
     // 설정 관리자 초기화
     let settings = Arc::new(SettingsManager::new(&config.data_dir).await?);
 
+    // 워크스페이스 관리자 초기화 + default 워크스페이스 보장(레거시 마이그레이션 포함)
+    let workspaces = Arc::new(WorkspaceManager::new(&config.data_dir).await?);
+    workspaces.ensure_default().await?;
+
+    // API 키 관리자 초기화 (파일 기반, Qdrant 독립)
+    let api_keys = Arc::new(ApiKeyManager::new(&config.data_dir).await?);
+
     // 스토리지 초기화
+    // DocumentStore는 data_dir에 루팅되어 `{data_dir}/workspaces/{id}/documents`에 저장한다
+    // (WorkspaceManager와 동일 루트 — 경로 정합성 보장).
     let qdrant = Arc::new(QdrantStorage::new(&config.qdrant_url).await?);
-    let documents = Arc::new(DocumentStore::new(format!("{}/raw", config.data_dir)).await?);
+    let documents = Arc::new(DocumentStore::new(&config.data_dir).await?);
 
     // Indexer 초기화
     let indexer = Indexer::new(settings.clone(), qdrant, documents);
@@ -67,6 +83,8 @@ async fn main() -> anyhow::Result<()> {
         indexer,
         settings,
         api_key: config.api_key,
+        workspaces,
+        api_keys,
     });
 
     // 인증이 필요한 API 라우트
@@ -92,6 +110,15 @@ async fn main() -> anyhow::Result<()> {
             "/api/settings/models/:provider/test",
             post(api::settings::test_api_key),
         )
+        // 워크스페이스 관리 (admin 전용 — 핸들러에서 강제)
+        .route("/api/workspaces", get(api::list_workspaces_handler))
+        .route("/api/workspaces", post(api::create_workspace_handler))
+        .route("/api/workspaces/:id", get(api::get_workspace_handler))
+        .route("/api/workspaces/:id", delete(api::delete_workspace_handler))
+        // API 키 관리 (admin 전용 — 핸들러에서 강제)
+        .route("/api/keys", get(api::list_keys_handler))
+        .route("/api/keys", post(api::create_key_handler))
+        .route("/api/keys/:key_id", delete(api::revoke_key_handler))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_api_key,

@@ -1,11 +1,13 @@
 use axum::{
     extract::{Path, State},
     http::StatusCode,
-    Json,
+    Extension, Json,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
+use crate::api::require_admin;
+use crate::auth::AuthContext;
 use crate::llm::ProviderType;
 use crate::settings::{SettingsManager, SettingsResponse};
 use crate::AppState;
@@ -27,11 +29,13 @@ pub struct UpdateSettingsRequest {
     pub embedding_provider: Option<ProviderType>,
 }
 
-/// PUT /api/settings - 설정 변경
+/// PUT /api/settings - 설정 변경 (admin)
 pub async fn update_settings(
     State(state): State<Arc<AppState>>,
+    Extension(ctx): Extension<AuthContext>,
     Json(req): Json<UpdateSettingsRequest>,
 ) -> Result<Json<SettingsResponse>, (StatusCode, String)> {
+    require_admin(&ctx)?;
     if let Some(provider) = req.parsing_provider {
         // 해당 provider의 API Key가 있는지 확인
         if !state.settings.is_provider_available(provider).await {
@@ -65,12 +69,14 @@ pub struct SetApiKeyRequest {
     pub api_key: String,
 }
 
-/// POST /api/settings/models/{provider}/key - API Key 설정
+/// POST /api/settings/models/{provider}/key - API Key 설정 (admin)
 pub async fn set_api_key(
     State(state): State<Arc<AppState>>,
+    Extension(ctx): Extension<AuthContext>,
     Path(provider): Path<ProviderType>,
     Json(req): Json<SetApiKeyRequest>,
 ) -> Result<Json<SettingsResponse>, (StatusCode, String)> {
+    require_admin(&ctx)?;
     state.settings.set_api_key(provider, req.api_key).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -78,11 +84,13 @@ pub async fn set_api_key(
     Ok(Json(settings.to_response()))
 }
 
-/// DELETE /api/settings/models/{provider}/key - API Key 삭제
+/// DELETE /api/settings/models/{provider}/key - API Key 삭제 (admin)
 pub async fn delete_api_key(
     State(state): State<Arc<AppState>>,
+    Extension(ctx): Extension<AuthContext>,
     Path(provider): Path<ProviderType>,
 ) -> Result<Json<SettingsResponse>, (StatusCode, String)> {
+    require_admin(&ctx)?;
     state.settings.remove_api_key(provider).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
