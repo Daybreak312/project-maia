@@ -1,13 +1,20 @@
 use anyhow::{anyhow, Result};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::core::search::{BM25Scorer, SearchMode, reciprocal_rank_fusion};
+use crate::core::ingest_agent::{CandidateDoc, IngestAgent, IngestStrategy, DEFAULT_EDGE_WEIGHT};
 use crate::llm::{create_llm_provider, create_embedding_provider, LlmProvider, EmbeddingProvider};
-use crate::models::{Document, Edge, api::{IngestResponse, SearchResponse, SearchResult}};
+use crate::models::{Document, Edge, RelationType, api::{IngestResponse, IngestOutcome, SearchResponse, SearchResult}};
 use crate::settings::SettingsManager;
 use crate::storage::{DocumentStore, QdrantStorage, SearchHit, ChunkData, VersionStore};
+
+/// smart ingest 시 판단에 참고할 최대 후보 문서 수 (프롬프트 비용·지연 억제).
+const MAX_INGEST_CANDIDATES: usize = 5;
+
+/// 관련 후보로 채택할 최소 유사도 (이 미만은 판단·엣지 후보에서 제외).
+const CANDIDATE_MIN_SCORE: f32 = 0.5;
 
 /// RRF 상수 (일반적으로 60 사용)
 const RRF_K: f32 = 60.0;
@@ -164,6 +171,226 @@ impl Indexer {
             entities: doc.entities,
             facts: doc.facts,
         })
+    }
+
+    /// Smart Ingest — 저장 전에 에이전트가 신규/업데이트/분할/중복을 판단하고 실행한다.
+    ///
+    /// **정보 유실 0 불변식**: 어느 단계든(LLM 미설정/후보 검색 실패/판단 실패) 실패하면
+    /// raw 저장으로 폴백하며 응답에 `fallback=true`로 표시한다. 저장 실행은 기존 인덱싱
+    /// 파이프라인(`ingest_to_workspace`/`update_in_workspace`)을 실행기로 재사용한다.
+    ///
+    /// **LLM 호출 상한**: New/Update는 판단 1 + 관계 판단 1 = 2회. Split은 판단 1회
+    /// (세그먼트 수 비례 관계 판단을 피해 기본 RELATED_TO로 연결). Duplicate는 판단 1회.
+    pub async fn smart_ingest_to_workspace(
+        &self,
+        raw_content: String,
+        workspace_id: &str,
+    ) -> Result<IngestOutcome> {
+        let agent = IngestAgent::new();
+
+        // 1. LLM provider 확보 — 실패 시 raw 폴백 (판단 자체가 불가)
+        let llm = match self.get_llm_provider().await {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::warn!("LLM provider 미확보, raw 폴백: {}", e);
+                return self
+                    .raw_fallback(raw_content, workspace_id, format!("LLM 미설정으로 raw 저장: {e}"))
+                    .await;
+            }
+        };
+
+        // 2. 관련 후보 검색 (실패해도 빈 후보로 판단 계속 — 최소한 New는 가능)
+        let candidates = match self.find_candidates(&raw_content, workspace_id).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("후보 검색 실패, 후보 없이 진행: {}", e);
+                Vec::new()
+            }
+        };
+
+        // 3. 전략 판단 — 실패 시 raw 폴백
+        let decision = match agent.decide(llm.as_ref(), &raw_content, &candidates).await {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!("에이전트 판단 실패, raw 폴백: {}", e);
+                return self
+                    .raw_fallback(
+                        raw_content,
+                        workspace_id,
+                        format!("에이전트 판단 실패로 raw 저장: {e}"),
+                    )
+                    .await;
+            }
+        };
+
+        let reason = decision.reason.clone();
+        tracing::info!("Smart ingest 전략: {} — {}", decision.strategy.label(), reason);
+
+        match decision.strategy {
+            IngestStrategy::New => {
+                let resp = self.ingest_to_workspace(raw_content, workspace_id).await?;
+                let new_id = resp.id;
+                let edges = self
+                    .create_auto_edges(llm.as_ref(), workspace_id, new_id, &resp.summary, &candidates, true)
+                    .await;
+                Ok(IngestOutcome::from_response(resp, "new", vec![new_id], edges, false, reason))
+            }
+            IngestStrategy::Update { target } => {
+                // 병합 전략 = append: 기존 원문에 새 원문을 이어 붙여 재파싱한다(정보 누적).
+                // update_in_workspace가 덮어쓰기 전에 이전 버전을 보관한다.
+                let existing = self.documents.load(target, workspace_id).await?;
+                let merged = format!("{}\n\n---\n\n{}", existing.raw_content, raw_content);
+                let resp = self.update_in_workspace(target, merged, workspace_id).await?;
+                let others: Vec<CandidateDoc> =
+                    candidates.iter().filter(|c| c.id != target).cloned().collect();
+                let edges = self
+                    .create_auto_edges(llm.as_ref(), workspace_id, target, &resp.summary, &others, true)
+                    .await;
+                Ok(IngestOutcome::from_response(resp, "update", vec![target], edges, false, reason))
+            }
+            IngestStrategy::Split { segments } => {
+                let mut document_ids = Vec::new();
+                let mut total_edges = 0;
+                let mut primary: Option<IngestResponse> = None;
+                for segment in segments {
+                    let resp = self.ingest_to_workspace(segment, workspace_id).await?;
+                    let seg_id = resp.id;
+                    document_ids.push(seg_id);
+                    // Split은 관계 판단 없이 RELATED_TO로 연결 (LLM 호출 수를 상수로 유지).
+                    let edges = self
+                        .create_auto_edges(llm.as_ref(), workspace_id, seg_id, &resp.summary, &candidates, false)
+                        .await;
+                    total_edges += edges;
+                    if primary.is_none() {
+                        primary = Some(resp);
+                    }
+                }
+                let primary = primary.ok_or_else(|| anyhow!("split 세그먼트가 비어 있습니다"))?;
+                Ok(IngestOutcome::from_response(
+                    primary,
+                    "split",
+                    document_ids,
+                    total_edges,
+                    false,
+                    reason,
+                ))
+            }
+            IngestStrategy::Duplicate { of } => {
+                // 중복이어도 원문은 보관한다(정보 유실 0). 자동 삭제/병합은 하지 않고
+                // (Phase 5 Review Queue의 사람 몫), 원본과 엣지로만 연결해 중복을 추적한다.
+                let resp = self.ingest_to_workspace(raw_content, workspace_id).await?;
+                let new_id = resp.id;
+                let dup_target = vec![CandidateDoc {
+                    id: of,
+                    summary: String::new(),
+                }];
+                let edges = self
+                    .create_auto_edges(llm.as_ref(), workspace_id, new_id, &resp.summary, &dup_target, false)
+                    .await;
+                Ok(IngestOutcome::from_response(
+                    resp,
+                    "duplicate",
+                    vec![new_id],
+                    edges,
+                    false,
+                    reason,
+                ))
+            }
+        }
+    }
+
+    /// raw 저장 폴백 — 판단을 우회하고 기존 파이프라인으로 저장한 뒤 fallback=true로 표시.
+    async fn raw_fallback(
+        &self,
+        raw_content: String,
+        workspace_id: &str,
+        reason: String,
+    ) -> Result<IngestOutcome> {
+        let resp = self.ingest_to_workspace(raw_content, workspace_id).await?;
+        let id = resp.id;
+        Ok(IngestOutcome::from_response(resp, "raw", vec![id], 0, true, reason))
+    }
+
+    /// 입력과 의미적으로 관련된 기존 문서 후보를 찾는다(요약만, 유사도 상위 소수).
+    async fn find_candidates(
+        &self,
+        content: &str,
+        workspace_id: &str,
+    ) -> Result<Vec<CandidateDoc>> {
+        let embedder = self.get_embedding_provider().await?;
+        let query_embedding = embedder.embed(content).await?;
+        // 같은 문서의 여러 chunk가 히트할 수 있어 넉넉히 over-fetch 후 document 단위로 dedup.
+        let hits = self
+            .qdrant
+            .search(workspace_id, query_embedding, MAX_INGEST_CANDIDATES * 4)
+            .await?;
+
+        let mut seen: HashSet<Uuid> = HashSet::new();
+        let mut candidates = Vec::new();
+        for hit in hits {
+            if hit.score < CANDIDATE_MIN_SCORE {
+                continue;
+            }
+            if seen.insert(hit.id) {
+                candidates.push(CandidateDoc {
+                    id: hit.id,
+                    summary: hit.summary,
+                });
+                if candidates.len() >= MAX_INGEST_CANDIDATES {
+                    break;
+                }
+            }
+        }
+        Ok(candidates)
+    }
+
+    /// 출발 문서에서 후보 문서들로 자동 엣지를 생성한다. 생성된 엣지 수를 반환.
+    ///
+    /// `judge=true`면 관계 타입을 LLM으로 판단하고, `false`면 RELATED_TO 기본을 쓴다.
+    /// 개별 엣지 저장 실패는 침묵하지 않되(warn) 전체를 중단시키지 않는다(best-effort).
+    async fn create_auto_edges(
+        &self,
+        llm: &dyn LlmProvider,
+        workspace_id: &str,
+        source_id: Uuid,
+        source_summary: &str,
+        candidates: &[CandidateDoc],
+        judge: bool,
+    ) -> usize {
+        let targets: Vec<CandidateDoc> = candidates
+            .iter()
+            .filter(|c| c.id != source_id)
+            .cloned()
+            .collect();
+        if targets.is_empty() {
+            return 0;
+        }
+
+        let relations: Vec<(Uuid, RelationType)> = if judge {
+            IngestAgent::new()
+                .judge_relations(llm, source_summary, &targets)
+                .await
+        } else {
+            targets
+                .iter()
+                .map(|t| (t.id, RelationType::RelatedTo))
+                .collect()
+        };
+
+        let mut created = 0;
+        for (target_id, relation) in relations {
+            let edge = Edge::new(target_id, relation, DEFAULT_EDGE_WEIGHT);
+            match self
+                .add_edge_to_document(workspace_id, source_id, edge)
+                .await
+            {
+                Ok(_) => created += 1,
+                Err(e) => {
+                    tracing::warn!("자동 엣지 생성 실패 {}→{}: {}", source_id, target_id, e)
+                }
+            }
+        }
+        created
     }
 
     /// Hybrid Search: 벡터 검색 + 키워드 검색 결합

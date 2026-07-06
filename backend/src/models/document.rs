@@ -198,6 +198,56 @@ pub mod api {
         pub facts: Vec<String>,
     }
 
+    /// Ingest Agent 판단 결과를 포함한 확장 응답.
+    ///
+    /// 기존 `IngestResponse`의 필드(id/summary/entities/facts)를 그대로 포함하는
+    /// 상위집합이라, 이 필드만 읽던 기존 클라이언트(MCP/frontend)와 하위호환된다.
+    /// 여기에 전략 메타데이터(strategy/document_ids/edges_created/fallback/reason)가
+    /// 덧붙는다. `mode=raw` 우회 경로도 이 형태로 응답한다(strategy="raw").
+    #[derive(Debug, Serialize)]
+    pub struct IngestOutcome {
+        // ── 대표 문서 (분할 시 첫 번째) — IngestResponse 호환 필드 ──
+        pub id: Uuid,
+        pub summary: String,
+        pub entities: Vec<Entity>,
+        pub facts: Vec<String>,
+        // ── 전략 메타데이터 ──
+        /// "new" | "update" | "split" | "duplicate" | "raw"
+        pub strategy: String,
+        /// 이 입력으로 영향받은 모든 문서 ID (분할 시 여러 개)
+        pub document_ids: Vec<Uuid>,
+        /// 자동 생성된 엣지 수
+        pub edges_created: usize,
+        /// 에이전트 판단을 우회/실패해 raw 저장했는지 여부
+        pub fallback: bool,
+        /// 판단 근거(정상) 또는 폴백 사유
+        pub reason: String,
+    }
+
+    impl IngestOutcome {
+        /// 기존 `IngestResponse`를 전략 메타데이터로 감싸 `IngestOutcome`을 만든다.
+        pub fn from_response(
+            resp: IngestResponse,
+            strategy: impl Into<String>,
+            document_ids: Vec<Uuid>,
+            edges_created: usize,
+            fallback: bool,
+            reason: impl Into<String>,
+        ) -> Self {
+            Self {
+                id: resp.id,
+                summary: resp.summary,
+                entities: resp.entities,
+                facts: resp.facts,
+                strategy: strategy.into(),
+                document_ids,
+                edges_created,
+                fallback,
+                reason: reason.into(),
+            }
+        }
+    }
+
     #[derive(Debug, Deserialize)]
     pub struct SearchRequest {
         pub query: String,
@@ -420,5 +470,50 @@ mod tests {
     fn test_remove_edge_nonexistent_returns_zero() {
         let mut doc = make_doc();
         assert_eq!(doc.remove_edge(Uuid::new_v4()), 0);
+    }
+
+    // ──── IngestOutcome (전략 메타데이터 응답) ────
+
+    #[test]
+    fn test_ingest_outcome_from_response() {
+        let resp = api::IngestResponse {
+            id: Uuid::new_v4(),
+            summary: "s".to_string(),
+            entities: vec![],
+            facts: vec!["f".to_string()],
+        };
+        let id = resp.id;
+        let outcome = api::IngestOutcome::from_response(resp, "new", vec![id], 3, false, "판단 근거");
+
+        assert_eq!(outcome.id, id);
+        assert_eq!(outcome.summary, "s");
+        assert_eq!(outcome.facts, vec!["f"]);
+        assert_eq!(outcome.strategy, "new");
+        assert_eq!(outcome.document_ids, vec![id]);
+        assert_eq!(outcome.edges_created, 3);
+        assert!(!outcome.fallback);
+        assert_eq!(outcome.reason, "판단 근거");
+    }
+
+    #[test]
+    fn test_ingest_outcome_serialize_backward_compatible() {
+        // 직렬화에 기존 IngestResponse 필드가 모두 포함되어야 한다(하위호환).
+        let resp = api::IngestResponse {
+            id: Uuid::new_v4(),
+            summary: "sum".to_string(),
+            entities: vec![],
+            facts: vec![],
+        };
+        let outcome = api::IngestOutcome::from_response(resp, "raw", vec![], 0, true, "폴백");
+        let json = serde_json::to_value(&outcome).unwrap();
+
+        // 기존 클라이언트가 읽던 필드
+        assert!(json.get("id").is_some());
+        assert!(json.get("summary").is_some());
+        assert!(json.get("entities").is_some());
+        assert!(json.get("facts").is_some());
+        // 새 메타데이터
+        assert_eq!(json.get("strategy").unwrap(), "raw");
+        assert_eq!(json.get("fallback").unwrap(), true);
     }
 }

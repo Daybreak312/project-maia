@@ -40,6 +40,15 @@ pub trait LlmProvider: Send + Sync {
     /// 자연어 텍스트를 파싱하여 구조화된 데이터 반환
     async fn parse(&self, content: &str) -> Result<ParsedContent>;
 
+    /// 자유 형식 프롬프트에 대한 원문 텍스트 응답을 생성한다 (에이전트 판단용).
+    ///
+    /// `parse`가 고정 스키마(summary/entities/facts)를 강제하는 것과 달리,
+    /// `complete`는 임의 프롬프트에 대한 응답 문자열을 그대로 반환한다. 호출
+    /// 측(IngestAgent 등)이 응답을 구조화 파싱하고, 실패 시 폴백을 책임진다.
+    /// 이 메서드는 `LlmProvider`를 mock으로 대체해 에이전트 로직을 테스트하는
+    /// 확장점이기도 하다.
+    async fn complete(&self, prompt: &str) -> Result<String>;
+
     /// API Key 유효성 검증
     async fn validate_api_key(&self) -> Result<bool>;
 }

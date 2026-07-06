@@ -92,6 +92,47 @@ impl LlmProvider for OpenAiChatProvider {
         })
     }
 
+    async fn complete(&self, prompt: &str) -> Result<String> {
+        let request = ChatRequest {
+            model: self.model.clone(),
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: prompt.to_string(),
+            }],
+            // 자유 형식 응답 (json_object 강제하지 않음).
+            response_format: None,
+        };
+
+        let response = self
+            .client
+            .post(format!("{}/chat/completions", OPENAI_API_BASE))
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("Content-Type", "application/json")
+            .json(&request)
+            .send()
+            .await
+            .context("Failed to call OpenAI API")?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let error_text = response.text().await.unwrap_or_default();
+            anyhow::bail!("OpenAI API error ({}): {}", status, error_text);
+        }
+
+        let response: ChatResponse = response
+            .json()
+            .await
+            .context("Failed to parse OpenAI response")?;
+
+        let text = response
+            .choices
+            .first()
+            .map(|c| c.message.content.clone())
+            .unwrap_or_default();
+
+        Ok(text)
+    }
+
     async fn validate_api_key(&self) -> Result<bool> {
         let response = self
             .client

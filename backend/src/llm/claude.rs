@@ -91,6 +91,48 @@ impl LlmProvider for ClaudeProvider {
         })
     }
 
+    async fn complete(&self, prompt: &str) -> Result<String> {
+        let request = AnthropicRequest {
+            model: self.model.clone(),
+            // 판단 응답(전략+근거, 분할 세그먼트 포함)을 담기에 넉넉한 상한.
+            max_tokens: 2048,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: prompt.to_string(),
+            }],
+        };
+
+        let response = self
+            .client
+            .post(ANTHROPIC_API_URL)
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", "2023-06-01")
+            .header("content-type", "application/json")
+            .json(&request)
+            .send()
+            .await
+            .context("Failed to call Anthropic API")?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let error_text = response.text().await.unwrap_or_default();
+            anyhow::bail!("Anthropic API error ({}): {}", status, error_text);
+        }
+
+        let response: AnthropicResponse = response
+            .json()
+            .await
+            .context("Failed to parse Anthropic response")?;
+
+        let text = response
+            .content
+            .first()
+            .map(|c| c.text.clone())
+            .unwrap_or_default();
+
+        Ok(text)
+    }
+
     async fn validate_api_key(&self) -> Result<bool> {
         // 간단한 검증: 빈 메시지로 API 호출 시도
         let request = AnthropicRequest {
