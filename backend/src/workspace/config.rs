@@ -1,6 +1,8 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use super::connector_config::ConnectorInstance;
+
 /// 워크스페이스 설정 — 각 워크스페이스의 동작을 정의하는 핵심 구조체.
 /// 파일 저장: `data/workspaces/{id}/config.json`
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -12,6 +14,10 @@ pub struct WorkspaceConfig {
     pub patrol: PatrolConfig,
     pub parsing: ParsingConfig,
     pub search: SearchConfig,
+    /// 이 워크스페이스에 등록된 커넥터 인스턴스 목록 (Phase 4).
+    /// `#[serde(default)]`로 이 필드가 없는 기존 config.json도 로드된다(하위호환).
+    #[serde(default)]
+    pub connectors: Vec<ConnectorInstance>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -87,6 +93,8 @@ impl WorkspaceConfig {
             patrol,
             parsing,
             search,
+            // 커넥터는 명시 등록되기 전까지 비어 있다(신규 워크스페이스 기본).
+            connectors: Vec::new(),
         }
     }
 
@@ -233,6 +241,29 @@ mod tests {
         let config: WorkspaceConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.search.graph_expansion_depth, 1, "누락 필드는 기본값 1");
         assert_eq!(config.search.deep_search_time_limit_ms, 15_000, "누락 필드는 기본값 15초");
+    }
+
+    #[test]
+    fn test_config_deserialize_legacy_without_connectors() {
+        // connectors 필드가 없는 Phase 3 이전 config.json도 로드되어야 한다(하위호환).
+        // 이 불변식이 깨지면 기동 시 기존 워크스페이스 파싱이 실패해 브릭된다.
+        let json = r#"{
+            "id": "legacy",
+            "name": "Legacy",
+            "created_at": "2026-04-01T00:00:00Z",
+            "template": "personal",
+            "patrol": {"frequency": "weekly", "strictness": 0.3},
+            "parsing": {"entity_priorities": [], "fact_depth": "deep", "llm_provider": null},
+            "search": {"time_decay_lambda": 0.01, "default_mode": "hybrid", "cross_workspace": []}
+        }"#;
+        let config: WorkspaceConfig = serde_json::from_str(json).unwrap();
+        assert!(config.connectors.is_empty(), "누락된 connectors는 빈 벡터로 기본값 처리");
+    }
+
+    #[test]
+    fn test_new_workspace_has_no_connectors() {
+        let config = WorkspaceConfig::default_workspace();
+        assert!(config.connectors.is_empty(), "신규 워크스페이스는 커넥터 없음");
     }
 
     #[test]
