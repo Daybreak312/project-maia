@@ -24,7 +24,7 @@ use auth::ApiKeyManager;
 use config::Config;
 use core::Indexer;
 use settings::SettingsManager;
-use storage::{DocumentStore, QdrantStorage, VersionStore};
+use storage::{DocumentStore, QdrantStorage, SearchLogStore, VersionStore};
 use workspace::WorkspaceManager;
 
 /// 애플리케이션 상태
@@ -37,6 +37,8 @@ pub struct AppState {
     pub workspaces: Arc<WorkspaceManager>,
     /// API 키 발급/조회/인증 관리자
     pub api_keys: Arc<ApiKeyManager>,
+    /// 검색 로그 저장소 (워크스페이스별 일 단위 JSONL 축적)
+    pub search_logs: Arc<SearchLogStore>,
 }
 
 #[tokio::main]
@@ -71,6 +73,8 @@ async fn main() -> anyhow::Result<()> {
     let documents = Arc::new(DocumentStore::new(&config.data_dir).await?);
     // 업데이트 시 이전 문서 상태를 보관하는 버전 저장소 (동일 data_dir 루트 공유).
     let versions = Arc::new(VersionStore::new(&config.data_dir));
+    // 검색 로그 저장소 (동일 data_dir 루트 공유, 워크스페이스별 일 단위 JSONL).
+    let search_logs = Arc::new(SearchLogStore::new(&config.data_dir));
 
     // Indexer 초기화
     let indexer = Indexer::new(settings.clone(), qdrant, documents, versions);
@@ -87,6 +91,7 @@ async fn main() -> anyhow::Result<()> {
         api_key: config.api_key,
         workspaces,
         api_keys,
+        search_logs,
     });
 
     // 인증이 필요한 API 라우트
