@@ -38,15 +38,17 @@ project-maia/
 │   │   │
 │   │   ├── core/               # 비즈니스 로직
 │   │   │   ├── mod.rs
-│   │   │   ├── indexer.rs      # 인덱싱·검색·smart_ingest 오케스트레이션, 시간 인식
+│   │   │   ├── indexer.rs      # 인덱싱·검색·smart_ingest·deep_search 오케스트레이션 + SearchBackend 구현
 │   │   │   ├── ingest_agent.rs # Ingest Agent: 신규/업데이트/분할/중복 판단 + 관계 판단
+│   │   │   ├── search_agent.rs # Search Agent: 충분성 평가·쿼리 재작성·그래프 확장·합성 (SearchBackend trait)
 │   │   │   └── search.rs       # BM25, RRF, 하이브리드 검색
 │   │   │
 │   │   ├── storage/            # 데이터 레이어
 │   │   │   ├── mod.rs
 │   │   │   ├── qdrant.rs       # Qdrant 벡터 검색/저장, 엣지 payload 비정규화
 │   │   │   ├── documents.rs    # 원본 문서 파일 저장, 그래프 이웃 BFS 탐색
-│   │   │   └── versions.rs     # 업데이트 시 이전 버전 스냅샷 보관
+│   │   │   ├── versions.rs     # 업데이트 시 이전 버전 스냅샷 보관
+│   │   │   └── search_log.rs   # 검색 로그 워크스페이스별 일 단위 JSONL 축적 (실패 무해)
 │   │   │
 │   │   └── models/
 │   │       ├── mod.rs
@@ -186,7 +188,8 @@ project-maia/
 
 | Tool | Description | Maia API |
 |------|-------------|----------|
-| `search_context` | 개인 지식 베이스 검색 | `POST /search` |
+| `search_context` | 개인 지식 베이스 검색 (1회성) | `POST /search` |
+| `deep_search` | 능동 회상 (충분성 평가·재작성·그래프 확장) | `POST /search?agent=true` (body `agent:true`) |
 | `ingest_information` | 새 정보 저장 (에이전트 전략 표시) | `POST /ingest` |
 | `get_document` | 문서 원문 조회 | `GET /documents/{id}` |
 | `list_recent_documents` | 최근 문서 목록 | `GET /recent` |
@@ -195,7 +198,8 @@ project-maia/
 모든 tool은 선택적 `workspace` 인자를 받는다. 미지정 시 `MAIA_WORKSPACE` 환경변수,
 그것도 없으면 서버가 API 키의 기본 워크스페이스를 사용한다.
 `ingest_information` 응답에는 에이전트 판단 전략(new/update/split/duplicate/raw)과
-폴백 여부가 표시된다.
+폴백 여부가 표시된다. `deep_search` 응답에는 탐색 과정 요약(라운드 수·시도 쿼리·그래프
+확장 여부·폴백 여부)과 각 확장 결과의 유래(`expanded_from`)가 포함된다.
 
 ## Indexing Architecture (Atomic Fact Chunking)
 
@@ -257,6 +261,48 @@ smart_ingest(raw)
 - **테스트**: 프롬프트 빌더·응답 파서는 순수 함수, `decide`/`judge_relations`는 mock provider로
   각 분기·강등·재시도·폴백을 고정.
 
+## Search Agent (검색 회상)
+
+검색을 1회성 조회에서, 충분해질 때까지 스스로 각도를 바꿔 탐색하는 능동 프로세스로 바꾼다.
+opt-in — `POST /search` body에 `agent:true`면 활성화, 미지정 시 기존 단일 검색 그대로.
+
+```
+deep_search(query)
+  ├─ 1. 초기 hybrid 검색 (LLM 무의존, 기존 교차 워크스페이스 파이프라인 재사용)
+  ├─ 2. 재작성 루프 (상한: 재작성 3회 / LLM 5회 / 시간 상한 / 동일 쿼리 금지)
+  │      ├ 충분성 평가 (LLM) — 보수적: 애매하면 '충분'으로 조기 종료
+  │      └ [부족] 쿼리 재작성 (LLM) → 재검색, 결과 누적
+  ├─ 3. 그래프 이웃 확장 (폴백 아닐 때만, 상위 결과의 이웃, depth=워크스페이스 설정)
+  │      └ 확장 결과는 expanded_from으로 유래 표시, 점수는 origin×edge_weight로 감쇠
+  └─ 4. 합성: id 중복 제거(최고 점수·동점 시 직접 우선) → 점수 재정렬 → 상위 N 절사
+```
+
+- **판단·합성 분리** (`core/search_agent.rs`): 충분성 평가·재작성은 `LlmProvider` 경유
+  (프롬프트 중앙화), 합성·확장 점수는 순수 함수. 실제 검색·확장 I/O는 `SearchBackend`
+  trait로 주입 — `Indexer`가 구현하고, 단위 테스트는 mock backend + mock LLM으로 전
+  분기(충분/부족/재작성/확장/합성/폴백/상한)를 고정한다(Qdrant·실 LLM 무의존).
+- **폴백 필수**: LLM 실패·미설정 시 초기 hybrid 결과를 **그대로** 반환하고(그래프 확장
+  생략) `fallback=true` 표시. 에러가 아니라 결과 + 폴백. 초기 검색 자체가 실패하면 빈
+  결과 + 폴백(500 금지).
+- **상한 불변식**: 재작성 ≤ 3회, 충분성+재작성 LLM 호출 ≤ 5회, 파이프라인 시간 상한
+  (워크스페이스 `deep_search_time_limit_ms`, 초과 시 부분 결과), 결과 총량 상한
+  (`DEFAULT_DEEP_SEARCH_MAX_RESULTS`). 동일 쿼리 재검색 금지로 루프가 반드시 종료.
+- **응답**: 기존 `SearchResponse`(results/sources_used/total/mode) + `agent` 메타데이터
+  (`rounds/queries/graph_expanded/expansion_count/fallback/reason`). `mode="agent"`.
+  확장 결과는 `SearchResult.expanded_from`으로 유래 표시(둘 다 하위호환 — 기존 검색은
+  `agent:null`, 직접 결과는 `expanded_from:null`로 직렬화 생략).
+
+## Search Logging (검색 로그 축적)
+
+모든 검색(기존·agent)이 워크스페이스별로 로그에 남아 Phase 5 거버넌스 신호가 된다.
+
+- **SearchLogStore** (`storage/search_log.rs`): `workspaces/{id}/search_logs/{YYYY-MM-DD}.jsonl`
+  일 단위 append(무한 성장 방지·롤업 용이). 레코드: 시각·워크스페이스·쿼리·모드·결과 수·
+  최고 점수·zero-result 여부·소요 시간·(agent 모드 시) 라운드 수.
+- **실패 무해**: `append_best_effort`가 기록 실패를 삼킨다(warn만). 로그 장애가 검색을
+  실패시키지 않는다. 파생 지표(결과 수·최고 점수·zero-result)는 순수 함수(`derive_metrics`).
+- API 핸들러(`api/search.rs`)가 검색 소요 시간을 측정해 응답 성공 시 best-effort로 축적.
+
 ## Versioning (버전 보관)
 
 업데이트 경로에서 이전 문서 상태를 보관한다(잘못된 업데이트의 안전망).
@@ -282,6 +328,9 @@ smart_ingest(raw)
 | **Hybrid** (기본) | Vector + Keyword → RRF 결합 | 의미 + 키워드 동시 고려, 가장 정확 |
 | **Vector (Semantic)** | 쿼리 임베딩 → Qdrant 코사인 유사도 | 의미가 비슷한 문서 매칭 |
 | **Keyword (BM25)** | 전체 문서 로드 → BM25 스코어링 | 정확한 단어 일치 기반 |
+
+위 세 모드는 단일 라운드다. `agent:true`는 이 hybrid 검색을 실행기로 삼아 다중 라운드
++ 그래프 확장으로 능동 회상한다 → [Search Agent (검색 회상)](#search-agent-검색-회상) 참조.
 
 ## Port Assignments
 
