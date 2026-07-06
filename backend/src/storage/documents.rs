@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 use tokio::fs;
+use tokio::sync::{Mutex, MutexGuard};
 use uuid::Uuid;
 
 use crate::models::{Document, RelationType};
@@ -36,12 +37,24 @@ pub struct NeighborNode {
 /// 저장 경로: `{data_dir}/workspaces/{workspace_id}/documents/{doc_id}.json`
 pub struct DocumentStore {
     data_dir: PathBuf,
+    /// 문서 쓰기 트랜잭션(load→수정→save) 직렬화 락.
+    ///
+    /// **lost-update 방지**: raw JSON이 그래프 엣지의 SSoT인데 `save`는 락 없는 전체
+    /// 덮어쓰기다. 여러 라이터(엣지 감쇠 재계산·엣지 추가/제거·재파싱 업데이트)가 같은
+    /// 문서를 동시에 read-modify-write하면 늦게 저장하는 쪽이 앞선 수정을 조용히 덮어
+    /// **엣지가 비가역 소실**된다(reindex도 오염된 raw를 읽어 복원 불가). 이 락으로 모든
+    /// 쓰기 트랜잭션을 직렬화해 그 경합을 제거한다. review/freshness/history 저장소와
+    /// 동일한 파일 쓰기 직렬화 패턴이다.
+    write_lock: Mutex<()>,
 }
 
 impl DocumentStore {
     pub async fn new(data_dir: impl Into<PathBuf>) -> Result<Self> {
         let data_dir = data_dir.into();
-        Ok(Self { data_dir })
+        Ok(Self {
+            data_dir,
+            write_lock: Mutex::new(()),
+        })
     }
 
     /// 워크스페이스의 문서 디렉토리 경로
@@ -94,6 +107,51 @@ impl DocumentStore {
             .await
             .context("Failed to delete document file")?;
         Ok(())
+    }
+
+    /// 문서를 **원자적으로** load→수정→save 한다.
+    ///
+    /// 같은 저장소의 다른 쓰기 트랜잭션과 [`write_lock`](Self::write_lock)으로 직렬화되어
+    /// 동시 수정의 lost-update를 제거한다(예: 엣지 감쇠 재저장이 방금 추가된 엣지를 덮어씀).
+    /// `mutate`는 **락 아래에서 디스크로부터 갓 로드된 최신 문서**를 받으므로, 스냅샷이
+    /// 아니라 항상 현재 상태를 기준으로 수정한다(stale 스냅샷 저장 회귀 차단).
+    ///
+    /// - `mutate`가 `true`를 반환할 때만 저장한다(불필요한 쓰기 억제).
+    /// - 문서가 없으면 `Ok(None)`(경합 중 삭제/멱등 재제출 대응 — 에러 아님).
+    /// - 저장(또는 미변경)된 최신 문서를 반환한다.
+    ///
+    /// `mutate`는 동기 클로저다 — 로드와 저장 **사이에 비동기 작업**(예: 버전 보관)이 필요한
+    /// 복합 트랜잭션은 [`write_guard`](Self::write_guard)로 직접 임계 구역을 구성하라.
+    pub async fn update<F>(
+        &self,
+        id: Uuid,
+        workspace_id: &str,
+        mutate: F,
+    ) -> Result<Option<Document>>
+    where
+        F: FnOnce(&mut Document) -> bool,
+    {
+        let _guard = self.write_lock.lock().await;
+        if !self.exists(id, workspace_id).await {
+            return Ok(None); // 경합 중 삭제됨 — 멱등 처리(이중 판단/재제출 안전)
+        }
+        let mut doc = self.load(id, workspace_id).await?;
+        if mutate(&mut doc) {
+            self.save(&doc, workspace_id).await?;
+        }
+        Ok(Some(doc))
+    }
+
+    /// 쓰기 트랜잭션 임계 구역 가드.
+    ///
+    /// `load→(비동기 작업)→save`를 이 가드 아래에서 수행하면 다른 쓰기와 직렬화된다.
+    /// 버전 보관처럼 로드와 저장 사이에 비동기 작업이 끼는 복합 트랜잭션용 탈출구다 —
+    /// 순수 동기 수정은 [`update`](Self::update)를 쓰라.
+    ///
+    /// **주의(재진입 금지):** 이 가드를 쥔 채 같은 저장소의 `update`/`write_guard`를 다시
+    /// 호출하면 자기 자신을 기다려 데드락한다. 가드 아래에서는 `load`/`save`만 직접 부른다.
+    pub async fn write_guard(&self) -> MutexGuard<'_, ()> {
+        self.write_lock.lock().await
     }
 
     pub async fn list_recent(&self, limit: usize, workspace_id: &str) -> Result<Vec<Document>> {
@@ -412,6 +470,134 @@ mod tests {
         assert_eq!(b_docs.len(), 1);
         assert_eq!(a_docs[0].raw_content, "a");
         assert_eq!(b_docs[0].raw_content, "b");
+    }
+
+    // ──── 쓰기 직렬화 (lost-update 방지) ────
+
+    #[tokio::test]
+    async fn test_update_applies_and_saves() {
+        use crate::models::{Edge, RelationType};
+        let (_tmp, store) = setup().await;
+        let doc = make_doc("x");
+        let id = doc.id;
+        store.save(&doc, "default").await.unwrap();
+
+        let target = Uuid::new_v4();
+        let updated = store
+            .update(id, "default", |d| {
+                d.add_edge(Edge::new(target, RelationType::RelatedTo, 0.5));
+                true
+            })
+            .await
+            .unwrap();
+
+        assert!(updated.is_some(), "존재하는 문서 update는 최신 문서를 반환");
+        let loaded = store.load(id, "default").await.unwrap();
+        assert_eq!(loaded.edges.len(), 1);
+        assert_eq!(loaded.edges[0].target, target);
+    }
+
+    #[tokio::test]
+    async fn test_update_missing_returns_none() {
+        // 경합 중 삭제/멱등 재제출 — 없는 문서 update는 에러가 아니라 None이어야 한다.
+        let (_tmp, store) = setup().await;
+        let out = store
+            .update(Uuid::new_v4(), "default", |_| true)
+            .await
+            .unwrap();
+        assert!(out.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_update_skips_save_when_unchanged() {
+        // 클로저가 false를 반환하면 저장을 생략해 불필요한 쓰기를 억제한다.
+        use crate::models::{Edge, RelationType};
+        let (_tmp, store) = setup().await;
+        let doc = make_doc("x");
+        let id = doc.id;
+        store.save(&doc, "default").await.unwrap();
+
+        store
+            .update(id, "default", |d| {
+                d.add_edge(Edge::new(Uuid::new_v4(), RelationType::RelatedTo, 0.5));
+                false // 변경 없음으로 신고 → 저장 생략
+            })
+            .await
+            .unwrap();
+
+        let loaded = store.load(id, "default").await.unwrap();
+        assert!(loaded.edges.is_empty(), "false 반환 시 디스크는 그대로여야 한다");
+    }
+
+    #[tokio::test]
+    async fn test_update_reads_fresh_state_not_snapshot() {
+        // update는 스냅샷이 아니라 최신 디스크 상태를 로드해 수정한다.
+        // (감쇠 벌크 스냅샷이 stale 상태를 덮어쓰던 회귀의 핵심 가드.)
+        use crate::models::{Edge, RelationType};
+        let (_tmp, store) = setup().await;
+        let doc = make_doc("x");
+        let id = doc.id;
+        store.save(&doc, "default").await.unwrap();
+
+        // 앞선 라이터가 엣지 하나 추가.
+        store
+            .update(id, "default", |d| {
+                d.add_edge(Edge::new(Uuid::new_v4(), RelationType::RelatedTo, 0.9));
+                true
+            })
+            .await
+            .unwrap();
+
+        // 후속 update의 클로저는 직전 엣지가 보이는 최신 상태를 받아야 한다.
+        store
+            .update(id, "default", |d| {
+                assert_eq!(d.edges.len(), 1, "update는 최신 상태(직전 엣지 포함)를 읽어야 한다");
+                d.add_edge(Edge::new(Uuid::new_v4(), RelationType::RelatedTo, 0.9));
+                true
+            })
+            .await
+            .unwrap();
+
+        let loaded = store.load(id, "default").await.unwrap();
+        assert_eq!(loaded.edges.len(), 2, "두 수정이 모두 누적되어야 한다");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_concurrent_updates_no_lost_edges() {
+        // write_lock이 동시 load-modify-save를 직렬화해 서로의 엣지를 덮어쓰지 않아야 한다.
+        // (감쇠·add_edge 동시 실행의 엣지 무음 소실 회귀 가드 — "기억을 잃으면 안 된다".)
+        use crate::models::{Edge, RelationType};
+        use std::sync::Arc;
+        let (_tmp, store) = setup().await;
+        let store = Arc::new(store);
+        let doc = make_doc("shared");
+        let id = doc.id;
+        store.save(&doc, "default").await.unwrap();
+
+        let n: u128 = 24;
+        let mut handles = Vec::new();
+        for i in 0..n {
+            let s = store.clone();
+            handles.push(tokio::spawn(async move {
+                let target = Uuid::from_u128(i + 1); // 결정적·상이한 대상
+                s.update(id, "default", move |d| {
+                    d.add_edge(Edge::new(target, RelationType::RelatedTo, 0.5));
+                    true
+                })
+                .await
+                .unwrap();
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        let loaded = store.load(id, "default").await.unwrap();
+        assert_eq!(
+            loaded.edges.len(),
+            n as usize,
+            "동시 수정 {n}건이 모두 반영되어야 한다 (lost-update 없음)"
+        );
     }
 
     // ──── 소스 기반 조회 (커넥터 중복 방지) ────
