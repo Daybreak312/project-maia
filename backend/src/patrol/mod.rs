@@ -16,7 +16,9 @@
 
 pub mod decay;
 pub mod detectors;
+pub mod feedback;
 pub mod freshness;
+pub mod metrics;
 pub mod review;
 
 use std::path::Path;
