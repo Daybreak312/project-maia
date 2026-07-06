@@ -176,10 +176,20 @@ pub fn generate_raw_key() -> String {
 // ApiKeyManager — 키 CRUD + 파일 시스템 영속화
 // ──────────────────────────────────────────────────────────────
 
+/// `last_used_at` 디스크 반영 최소 간격(초).
+///
+/// 인증된 모든 요청이 요청당 파일 전체를 재작성하는 쓰기 증폭을 막기 위해, 이 간격
+/// 안의 갱신은 디스크에 반영하지 않는다. `last_used_at`은 "안 쓰는 키 찾기"용 관측
+/// 필드라 이 정도 granularity("최근 N초 내 사용")로 충분하다.
+const LAST_USED_PERSIST_INTERVAL_SECS: i64 = 60;
+
 /// API Key 관리자. `data/api_keys.json`에 키를 영속화하고 메모리 캐시를 유지한다.
 pub struct ApiKeyManager {
     keys_path: PathBuf,
     keys: RwLock<Vec<ApiKey>>,
+    /// 저장 직렬화 락. 동시 `save()`가 temp 파일/쓰기 순서를 침범하지 않도록 하고,
+    /// 락 안에서 최신 인메모리 상태를 다시 읽어 폐기 직후 잔존 스냅샷 부활을 막는다.
+    save_lock: tokio::sync::Mutex<()>,
 }
 
 impl ApiKeyManager {
@@ -192,8 +202,31 @@ impl ApiKeyManager {
             let content = fs::read_to_string(&keys_path)
                 .await
                 .context("Failed to read api_keys.json")?;
-            serde_json::from_str(&content)
-                .context("Failed to parse api_keys.json")?
+            match serde_json::from_str::<Vec<ApiKey>>(&content) {
+                Ok(keys) => keys,
+                Err(e) => {
+                    // 손상된 키 파일로 부팅을 막지 않는다: 손상본을 백업하고 빈 목록으로
+                    // degrade한다(torn write/재배포 크래시 대비). 침묵 금지 — error로
+                    // 명시하고, 마스터키(MAIA_API_KEY)로 복구할 수 있게 남긴다.
+                    // (대조: SettingsManager::new도 unwrap_or_default로 graceful.)
+                    let file_name = keys_path
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("api_keys.json");
+                    let backup = keys_path.with_file_name(format!("{}.corrupt", file_name));
+                    if let Err(re) = fs::rename(&keys_path, &backup).await {
+                        tracing::error!("손상된 api_keys.json 백업 실패: {}", re);
+                    }
+                    tracing::error!(
+                        "api_keys.json 파싱 실패({}). 손상 파일을 {:?}로 백업하고 빈 키 \
+                         목록으로 시작합니다. 마스터키(MAIA_API_KEY)로 접속해 키를 \
+                         재발급하세요.",
+                        e,
+                        backup
+                    );
+                    Vec::new()
+                }
+            }
         } else {
             Vec::new()
         };
@@ -201,6 +234,7 @@ impl ApiKeyManager {
         Ok(Self {
             keys_path,
             keys: RwLock::new(keys),
+            save_lock: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -286,30 +320,65 @@ impl ApiKeyManager {
 
     /// `last_used_at`을 현재 시각으로 갱신한다.
     /// 미들웨어에서 `tokio::spawn`으로 비동기 호출하여 응답 지연을 방지한다.
+    ///
+    /// 요청당 전체 파일 재작성(쓰기 증폭)을 막기 위해, 마지막 반영이
+    /// `LAST_USED_PERSIST_INTERVAL_SECS`보다 오래됐을 때만 갱신하고 디스크에 flush한다.
     pub async fn update_last_used(&self, key_id: &str) -> Result<()> {
-        {
+        let should_save = {
             let mut keys = self.keys.write().await;
-            if let Some(key) = keys.iter_mut().find(|k| k.key_id == key_id) {
-                key.last_used_at = Some(Utc::now());
+            match keys.iter_mut().find(|k| k.key_id == key_id) {
+                Some(key) => {
+                    let now = Utc::now();
+                    let stale = key.last_used_at.map_or(true, |prev| {
+                        now.signed_duration_since(prev).num_seconds()
+                            >= LAST_USED_PERSIST_INTERVAL_SECS
+                    });
+                    if stale {
+                        key.last_used_at = Some(now);
+                    }
+                    stale
+                }
+                None => false,
             }
-        }
+        };
 
-        self.save().await
+        if should_save {
+            self.save().await?;
+        }
+        Ok(())
     }
 
-    /// 현재 키 목록을 디스크에 영속화한다.
+    /// 현재 키 목록을 디스크에 원자적으로 영속화한다.
+    ///
+    /// temp 파일에 쓴 뒤 `rename`으로 교체해 torn write(쓰기 도중 크래시로 인한
+    /// 잘린 파일 → 부팅 브릭)를 방지한다. `save_lock`으로 동시 저장을 직렬화하고,
+    /// 락 안에서 최신 인메모리 상태를 다시 직렬화하므로 폐기 직후 잔존 스냅샷이
+    /// 되살아나는 경합도 막는다.
     async fn save(&self) -> Result<()> {
-        let keys = self.keys.read().await;
-        let content = serde_json::to_string_pretty(&*keys)?;
-        drop(keys);
+        let _guard = self.save_lock.lock().await;
+
+        let content = {
+            let keys = self.keys.read().await;
+            serde_json::to_string_pretty(&*keys)?
+        };
 
         if let Some(parent) = self.keys_path.parent() {
             fs::create_dir_all(parent).await?;
         }
 
-        fs::write(&self.keys_path, content)
+        let file_name = self
+            .keys_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("api_keys.json");
+        let tmp_path = self.keys_path.with_file_name(format!("{}.tmp", file_name));
+
+        fs::write(&tmp_path, content)
             .await
-            .context("Failed to write api_keys.json")?;
+            .context("Failed to write api_keys.json.tmp")?;
+        fs::rename(&tmp_path, &self.keys_path)
+            .await
+            .context("Failed to persist api_keys.json")?;
 
         Ok(())
     }
@@ -938,5 +1007,59 @@ mod tests {
         assert_eq!(key.workspaces, vec!["ws-a", "ws-b"]);
         assert_eq!(key.permissions, Permission::ReadWrite);
         assert!(key.expires_at.is_some());
+    }
+
+    // ──── 영속화 하드닝 (원자적 저장 / graceful degrade / 쓰기 증폭 억제) ────
+
+    #[tokio::test]
+    async fn test_manager_corrupt_file_degrades_gracefully() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("api_keys.json");
+        // 손상된(파싱 불가) JSON 기록 — torn write 시뮬레이션
+        fs::write(&path, "{ this is not valid json ]").await.unwrap();
+
+        // 부팅이 막히지 않고 빈 목록으로 degrade해야 한다 (하드 실패 아님)
+        let manager = ApiKeyManager::new(tmp.path().to_str().unwrap()).await.unwrap();
+        assert!(manager.list_keys().await.is_empty());
+
+        // 손상 파일은 .corrupt로 백업되어 보존된다 (복구 가능)
+        let backup = tmp.path().join("api_keys.json.corrupt");
+        assert!(backup.exists(), "손상 파일은 .corrupt로 백업되어야 한다");
+    }
+
+    #[tokio::test]
+    async fn test_manager_save_is_atomic_no_temp_left() {
+        let (tmp, manager) = setup_manager().await;
+        manager.create_key("A".to_string(), vec!["default".to_string()], Permission::ReadOnly, None).await.unwrap();
+        manager.create_key("B".to_string(), vec!["work".to_string()], Permission::ReadOnly, None).await.unwrap();
+
+        // 원자적 저장(temp+rename) 후 .tmp 파일이 남지 않아야 한다
+        let tmp_path = tmp.path().join("api_keys.json.tmp");
+        assert!(!tmp_path.exists(), "저장 후 .tmp 파일이 남으면 안 된다");
+
+        // 데이터는 온전히 재로드된다
+        let m2 = ApiKeyManager::new(tmp.path().to_str().unwrap()).await.unwrap();
+        assert_eq!(m2.list_keys().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_manager_update_last_used_coarsened() {
+        let (_tmp, manager) = setup_manager().await;
+        let (key, _) = manager.create_key(
+            "Coarse".to_string(),
+            vec!["default".to_string()],
+            Permission::ReadOnly,
+            None,
+        ).await.unwrap();
+
+        // 첫 갱신은 None → Some (임계값 무관하게 반영)
+        manager.update_last_used(&key.key_id).await.unwrap();
+        let first = manager.list_keys().await[0].last_used_at;
+        assert!(first.is_some());
+
+        // 임계값(60s) 안의 재갱신은 값을 바꾸지 않는다 (쓰기 증폭 억제)
+        manager.update_last_used(&key.key_id).await.unwrap();
+        let second = manager.list_keys().await[0].last_used_at;
+        assert_eq!(first, second, "임계값 내 재갱신은 last_used_at을 변경하지 않아야 한다");
     }
 }
