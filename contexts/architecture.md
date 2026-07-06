@@ -259,13 +259,18 @@ Payload Indexes: document_id (Keyword), chunk_type (Keyword)
   복원**하는 것이 핵심 불변식(단위 테스트로 고정: raw 보존 + payload 왕복 + build_chunk_payload).
 - **엣지 동기 갱신 순서**: raw JSON을 먼저 저장하고 성공 시에만 payload를 동기화한다.
   raw 실패 시 Qdrant는 호출조차 되지 않아 "둘 다 미반영"이 관측된다.
-- **쓰기 직렬화 (lost-update 방지)**: `DocumentStore`의 문서 쓰기 트랜잭션(load→수정→save)은
-  `write_lock`으로 직렬화된다(`DocumentStore::update` 동기 클로저 / `write_guard` 복합 트랜잭션).
-  raw JSON이 엣지의 SSoT인데 `save`는 락 없는 전체 덮어쓰기라, **엣지 감쇠 재계산·엣지 추가/제거·
-  재파싱 업데이트**가 같은 문서를 동시에 write하면 늦은 쪽이 앞선 엣지를 조용히 소실시킨다(reindex도
-  오염된 raw를 읽어 복원 불가 — "기억을 잃으면 안 된다" 위반). 모든 라이터가 이 락을 공유해 경합을
-  제거한다. 감쇠·업데이트는 계산(LLM 파싱·임베딩)을 락 밖에서 끝내고 임계 구역은 최신 재로드→저장으로
-  짧게 유지한다. review/freshness/history 저장소와 동일한 파일 쓰기 직렬화 패턴.
+- **쓰기 직렬화 (lost-update·부활 방지)**: `DocumentStore`의 문서 쓰기 트랜잭션(load→수정→save)은
+  `write_lock`으로 직렬화된다(`DocumentStore::update` 동기 클로저 / `write_guard` 복합 트랜잭션 /
+  `delete_serialized` 삭제). raw JSON이 엣지의 SSoT인데 `save`는 락 없는 전체 덮어쓰기라, **엣지 감쇠
+  재계산·엣지 추가/제거·재파싱 업데이트**가 같은 문서를 동시에 write하면 늦은 쪽이 앞선 엣지를 조용히
+  소실시킨다(reindex도 오염된 raw를 읽어 복원 불가 — "기억을 잃으면 안 된다" 위반). **삭제도 이 락에
+  참여한다**(`delete_serialized`): 참여하지 않으면 감쇠/엣지추가의 load→save 사이에 삭제가 파일을 지우고
+  뒤늦은 save가 삭제 문서를 raw JSON에 **부활**시켜 SSoT(살아있음)와 Qdrant(삭제됨)가 영구 불일치하고
+  reindex가 소유자가 파기한 지식을 되살린다("삭제=삭제" 붕괴). 생성·수정·삭제 **모든 라이터가 이 락을
+  공유**해 경합을 제거한다(`update`의 "락 아래 exists 체크"가 삭제와 갱신을 상호 배제 — 삭제가 먼저면
+  save 생략, 갱신이 먼저면 삭제가 방금 저장된 파일 제거). 감쇠·업데이트는 계산(LLM 파싱·임베딩)을 락
+  밖에서 끝내고 임계 구역은 최신 재로드→저장으로 짧게 유지하며, 삭제도 Qdrant 제거(파생물)를 임계 구역
+  밖에 둔다. review/freshness/history 저장소와 동일한 파일 쓰기 직렬화 패턴.
 - **이웃 탐색** (`storage/documents.rs::neighbors`): raw JSON 기반 BFS. depth `[1, 5]` 클램프,
   결과 200개 상한, `visited` 집합으로 순환 안전, 최단 depth 보장, dangling 엣지 스킵.
 
