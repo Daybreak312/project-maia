@@ -7,7 +7,7 @@ project-maia/
 ├── backend/                    # Rust RAG 서버
 │   ├── Cargo.toml
 │   ├── src/
-│   │   ├── main.rs             # 진입점, axum 서버, AppState(indexer/settings/workspaces/api_keys)
+│   │   ├── main.rs             # 진입점, axum 서버, AppState(indexer/settings/workspaces/api_keys/connector_runner) + 커넥터 스케줄러 기동
 │   │   ├── config.rs           # 환경설정 (SERVER_PORT, QDRANT_URL, DATA_DIR, MAIA_API_KEY)
 │   │   ├── settings.rs         # 설정 관리 (LLM API Key, Provider 선택)
 │   │   │
@@ -17,7 +17,8 @@ project-maia/
 │   │   │
 │   │   ├── workspace/          # 워크스페이스 시스템
 │   │   │   ├── mod.rs
-│   │   │   ├── config.rs       # WorkspaceConfig (patrol/parsing/search + cross_workspace), 템플릿
+│   │   │   ├── config.rs       # WorkspaceConfig (patrol/parsing/search/connectors + cross_workspace), 템플릿
+│   │   │   ├── connector_config.rs # ConnectorInstance/ConnectorSpec/LocalDirectoryConfig (커넥터 등록 스키마)
 │   │   │   └── manager.rs      # WorkspaceManager CRUD, default 보호, 레거시 마이그레이션
 │   │   │
 │   │   ├── llm/                # AI Provider 추상화 레이어
@@ -33,6 +34,7 @@ project-maia/
 │   │   │   ├── documents.rs    # CRUD /documents, GET /recent, POST /api/reindex (workspace 스코프)
 │   │   │   ├── graph.rs        # 이웃 조회 GET /documents/:id/neighbors, 수동 엣지 추가/삭제
 │   │   │   ├── workspaces.rs   # 워크스페이스 CRUD API (admin 전용)
+│   │   │   ├── connectors.rs   # 커넥터 관리 API (목록/상태=워크스페이스 접근, 등록/삭제/즉시실행=admin)
 │   │   │   ├── keys.rs         # API 키 발급/조회/폐기 API (admin 전용)
 │   │   │   └── settings.rs     # 설정 API (mutation은 admin)
 │   │   │
@@ -43,6 +45,13 @@ project-maia/
 │   │   │   ├── search_agent.rs # Search Agent: 충분성 평가·쿼리 재작성·그래프 확장·합성 (SearchBackend trait)
 │   │   │   └── search.rs       # BM25, RRF, 하이브리드 검색
 │   │   │
+│   │   ├── connectors/         # 유입 파이프라인 (Phase 4)
+│   │   │   ├── mod.rs          # Connector/ConnectorIngest trait, ConnectorItem, build_connector 팩토리
+│   │   │   ├── local_dir.rs    # 로컬 디렉토리 커넥터 (증분 스캔·확장자/제외·크기 상한·심볼릭 링크 방어)
+│   │   │   ├── sync_state.rs   # 커넥터별 마지막 실행·커서·결과 요약 영속화
+│   │   │   ├── runner.rs       # 동기화/대량 적재 (동시성 제한·진행 관측·실패 격리·중단 재개)
+│   │   │   └── scheduler.rs    # 주기 실행 + 오류/패닉 격리 (기동 시 자동 시작)
+│   │   │
 │   │   ├── storage/            # 데이터 레이어
 │   │   │   ├── mod.rs
 │   │   │   ├── qdrant.rs       # Qdrant 벡터 검색/저장, 엣지 payload 비정규화
@@ -52,13 +61,14 @@ project-maia/
 │   │   │
 │   │   └── models/
 │   │       ├── mod.rs
-│   │       └── document.rs     # Document(+edges), Entity, Edge/RelationType, API DTO
+│   │       └── document.rs     # Document(+edges, +source), Entity, Edge/RelationType, DocumentSource, API DTO
 │   │
 │   ├── static/                 # 레거시 정적 프론트엔드 (Vanilla HTML)
 │   ├── data/                   # 런타임 데이터 (Volume)
 │   │   ├── workspaces/{id}/    # 워크스페이스별 격리 저장
-│   │   │   ├── config.json     #   워크스페이스 설정
-│   │   │   └── documents/      #   원본 문서 JSON (Single Source of Truth)
+│   │   │   ├── config.json     #   워크스페이스 설정 (커넥터 인스턴스 등록 포함)
+│   │   │   ├── documents/      #   원본 문서 JSON (Single Source of Truth)
+│   │   │   └── connectors/     #   커넥터별 동기화 상태 {connector_id}.json (마지막 실행·커서·결과)
 │   │   ├── raw/                # 레거시 flat 문서 (기동 시 default로 마이그레이션)
 │   │   ├── api_keys.json       # API 키(해시만) 저장
 │   │   ├── settings.json       # LLM API Key 및 Provider 설정
@@ -302,6 +312,54 @@ deep_search(query)
 - **실패 무해**: `append_best_effort`가 기록 실패를 삼킨다(warn만). 로그 장애가 검색을
   실패시키지 않는다. 파생 지표(결과 수·최고 점수·zero-result)는 순수 함수(`derive_metrics`).
 - API 핸들러(`api/search.rs`)가 검색 소요 시간을 측정해 응답 성공 시 best-effort로 축적.
+
+## Connectors (유입 파이프라인)
+
+소유자의 지식이 사는 로컬 마크다운 생태계에서 Maia로 정보가 스스로 흘러들어오게 하는 유입
+계층(Phase 4). 모든 유입은 소스 식별자 기반 중복 방지를 거쳐 신규/업데이트로 분기된다.
+
+```
+스케줄러(주기) ─┐
+               ├─▶ ConnectorRunner.run_sync ─▶ Connector.fetch_changes(cursor) ─▶ [변경 항목]
+API 트리거(수동)┘        │                                                          │
+                        │  동시성 제한(buffer_unordered) + 항목별 태스크 격리        ▼
+                        └─▶ ConnectorIngest(=Indexer).ingest_item ──▶ 소스 dedup 분기
+                                                                       ├ 없음   → 신규(Created)
+                                                                       ├ 변경   → 업데이트(Updated)
+                                                                       └ 무변경 → 스킵(Skipped)
+```
+
+- **커넥터 공통 계약** (`connectors/mod.rs`): `Connector` trait = 증분 변경분 조회
+  (`fetch_changes(cursor) -> FetchResult{items, next_cursor}`) + 소스 타입. 커서 의미는
+  커넥터가 온전히 소유한다(불투명 문자열). 새 타입은 trait 구현 + `build_connector` 팩토리에
+  한 줄 추가로 열린다(개방-폐쇄). 등록 스키마(`ConnectorInstance`/`ConnectorSpec`)는
+  `workspace` 모듈이 소유해 `WorkspaceConfig.connectors`에 저장된다.
+- **로컬 디렉토리 커넥터** (`connectors/local_dir.rs`): 등록 디렉토리를 명시적 스택으로 순회
+  (async 재귀 회피)하며 수정 시각 > 커서인 파일만 유입. 확장자 필터·glob 제외 패턴·크기 상한
+  스킵. **심볼릭 링크 방어**: 등록 루트는 canonicalize로 따르되 순회 중 발견된 링크는 따르지
+  않는다(등록 범위 밖 읽기 차단). 깨진 인코딩·읽기 실패 파일은 스킵·기록(장애 격리). 읽기 전용.
+- **유입 실행** (`Indexer: ConnectorIngest`): 저장은 기존 인덱싱 파이프라인을 재사용한다.
+  `(source_type, source_id)` 일치 문서를 `DocumentStore::find_by_source`로 찾아
+  — 없으면 신규(파싱+임베딩+출처 각인+그래프 자동 연결), 원본이 더 새로우면 내용 교체 업데이트
+  (edges·created_at 보존, 출처 갱신), 더 새롭지 않으면 스킵. **1파일=1문서** 매핑으로 재유입 시
+  문서 난립을 원천 차단한다(분할 위임 대신 업데이트 경로 결정성을 택함). 모드: `Parsed`(LLM 파싱,
+  품질) / `Raw`(폴백 요약, rate limit 보호·대량 적재 우선).
+- **동기화 상태·커서** (`connectors/sync_state.rs`): `workspaces/{ws}/connectors/{id}.json`에
+  마지막 실행 시각·커서·결과 요약(처리/신규/갱신/스킵/실패 + 실패 목록 상한)을 영속화.
+- **러너** (`connectors/runner.rs`): 동기화·대량 적재를 공유(대량 적재 = 커서 무시 `full` 동기화).
+  `buffer_unordered`로 동시성 제한(LLM rate limit 보호), 항목별 `tokio::spawn`으로 패닉까지
+  격리, 인메모리 진행 상태를 항목 완료마다 갱신(상태 API 실시간 관측). **커서는 실패 0일 때만
+  전진** — 중단(상태 미저장)·부분 실패 시 다음 실행이 재스캔하고 이미 유입된 항목은 소스 dedup
+  으로 스킵되어 이어서 처리된다(중단 재개·정보 유실 0).
+- **스케줄러** (`connectors/scheduler.rs`): 고정 틱(기본 30s)마다 모든 워크스페이스의 활성
+  커넥터를 훑어 `마지막 실행 + 주기 <= now`인 것을 실행. 각 실행을 태스크로 격리해 실패·패닉이
+  루프나 서버를 죽이지 않는다. 기동 시 첫 틱 즉시 발생(자동 시작). 설정 변경은 다음 틱에 반영.
+- **출처 메타데이터** (`Document.source`): `{source_type, source_id, modified_at, connector_id}`.
+  raw JSON(SSoT)에 저장돼 reindex에서 살아남고, `GET /documents/{id}`로 출처를 확인한다.
+  `#[serde(default)]`로 기존 문서와 하위호환.
+- **API** (`api/connectors.rs`): 목록 `GET /api/connectors`, 상태 `GET .../:id/status`
+  (워크스페이스 접근), 등록 `POST /api/connectors`, 삭제 `DELETE .../:id`, 즉시 실행
+  `POST .../:id/sync`(admin). 즉시 실행은 백그라운드 태스크로 spawn해 요청 경로와 격리(202 반환).
 
 ## Versioning (버전 보관)
 
