@@ -134,11 +134,33 @@ Input can be any natural language text. The system automatically extracts: summa
   async ({ content, workspace }) => {
     const res = await client.ingest(content, resolveWorkspace(workspace));
 
-    const parts = [
-      `Saved successfully (id: ${res.id})`,
-      ``,
-      `Summary: ${res.summary}`,
-    ];
+    const parts = [`Saved successfully (id: ${res.id})`];
+
+    // Phase 2: 에이전트 판단 전략 표시 (구버전 서버는 strategy 미포함 → 생략)
+    if (res.strategy) {
+      const label: Record<string, string> = {
+        new: "new document",
+        update: "updated existing document",
+        split: "split into multiple documents",
+        duplicate: "detected as duplicate (original kept, linked)",
+        raw: "raw store (agent bypassed)",
+      };
+      parts.push(`Strategy: ${res.strategy} — ${label[res.strategy] ?? res.strategy}`);
+      if (res.document_ids && res.document_ids.length > 1) {
+        parts.push(`Documents affected: ${res.document_ids.length}`);
+      }
+      if (typeof res.edges_created === "number" && res.edges_created > 0) {
+        parts.push(`Edges created: ${res.edges_created}`);
+      }
+      if (res.fallback) {
+        parts.push(`⚠ Fallback: agent judgement unavailable, stored as raw (no info lost)`);
+      }
+      if (res.reason) {
+        parts.push(`Reason: ${res.reason}`);
+      }
+    }
+
+    parts.push(``, `Summary: ${res.summary}`);
 
     if (res.entities.length > 0) {
       parts.push(`Entities:`);
@@ -152,6 +174,63 @@ Input can be any natural language text. The system automatically extracts: summa
 
     return {
       content: [{ type: "text" as const, text: parts.join("\n") }],
+    };
+  },
+);
+
+// ─── Tool: get_neighbors ─────────────────────────────────────────────
+server.tool(
+  "get_neighbors",
+  `Explore documents connected to a given document in the user's knowledge graph.
+
+Use this to walk relationships from a starting document — after finding a document via
+search_context, call this to discover related context the search didn't surface directly.
+Relations: related_to, updates, contradicts, references, part_of.
+
+depth=1 returns direct neighbors; depth=2 walks two hops (e.g. interview note → prep note
+→ related tech doc). Cycles are handled safely.`,
+  {
+    id: z.string().uuid().describe("Starting document UUID (from a search result)"),
+    depth: z
+      .number()
+      .int()
+      .min(1)
+      .max(5)
+      .default(1)
+      .describe("Traversal depth (1 = direct neighbors, capped at 5)"),
+    workspace: workspaceArg,
+  },
+  async ({ id, depth, workspace }) => {
+    const res = await client.neighbors(id, depth, resolveWorkspace(workspace));
+
+    if (res.neighbors.length === 0) {
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `No connected documents found for ${id} within depth ${res.depth}.`,
+          },
+        ],
+      };
+    }
+
+    const formatted = res.neighbors
+      .map((n, i) =>
+        [
+          `[${i + 1}] ${n.summary}`,
+          `    relation: ${n.relation} (depth ${n.depth}, via ${n.via})`,
+          `    id: ${n.id}`,
+        ].join("\n"),
+      )
+      .join("\n\n");
+
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: `Connected documents (depth ${res.depth}, ${res.neighbors.length} found):\n\n${formatted}`,
+        },
+      ],
     };
   },
 );

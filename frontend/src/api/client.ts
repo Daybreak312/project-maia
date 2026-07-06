@@ -1,6 +1,7 @@
 import type {
   Document,
   IngestResponse,
+  NeighborsResponse,
   SearchResponse,
   SearchOptions,
   ListResponse,
@@ -106,6 +107,12 @@ export const api = {
 
   // Documents
   getDocument: (id: string) => request<Document>(withWorkspace(`/documents/${id}`)),
+
+  // 그래프 이웃 조회 (연결된 문서)
+  getNeighbors: (id: string, depth = 1) =>
+    request<NeighborsResponse>(
+      withWorkspace(`/documents/${id}/neighbors?depth=${depth}`),
+    ),
 
   updateDocument: (id: string, content: string) =>
     request<IngestResponse>(withWorkspace(`/documents/${id}`), {
