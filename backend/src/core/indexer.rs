@@ -5,7 +5,7 @@ use uuid::Uuid;
 
 use crate::core::search::{BM25Scorer, SearchMode, reciprocal_rank_fusion};
 use crate::llm::{create_llm_provider, create_embedding_provider, LlmProvider, EmbeddingProvider};
-use crate::models::{Document, api::{IngestResponse, SearchResponse, SearchResult}};
+use crate::models::{Document, Edge, api::{IngestResponse, SearchResponse, SearchResult}};
 use crate::settings::SettingsManager;
 use crate::storage::{DocumentStore, QdrantStorage, SearchHit, ChunkData};
 
@@ -142,13 +142,14 @@ impl Indexer {
         tracing::info!("Saving document...");
         self.documents.save(&doc, workspace_id).await?;
 
-        // 5. Qdrant에 chunk 벡터 저장
+        // 5. Qdrant에 chunk 벡터 저장 (신규 문서라 edges는 비어 있음)
         tracing::info!("Indexing {} chunks to Qdrant (workspace: {})...", chunks.len(), workspace_id);
         self.qdrant.upsert_chunks(
             workspace_id,
             doc.id,
             &doc.summary,
             &doc.created_at.to_rfc3339(),
+            &doc.edges,
             chunks,
         ).await?;
 
@@ -456,7 +457,7 @@ impl Indexer {
         tracing::info!("Saving updated document...");
         self.documents.save(&doc, workspace_id).await?;
 
-        // 5. 기존 chunk 전부 삭제 후 새 chunk 저장
+        // 5. 기존 chunk 전부 삭제 후 새 chunk 저장 (보존된 edges를 payload에 재비정규화)
         tracing::info!("Updating Qdrant index...");
         self.qdrant.delete_by_document_id(workspace_id, id).await?;
         self.qdrant.upsert_chunks(
@@ -464,6 +465,7 @@ impl Indexer {
             id,
             &doc.summary,
             &doc.created_at.to_rfc3339(),
+            &doc.edges,
             chunks,
         ).await?;
 
@@ -496,6 +498,52 @@ impl Indexer {
         Ok(())
     }
 
+    /// 문서에 엣지를 추가한다.
+    ///
+    /// **동기화 순서 불변식:** raw JSON을 먼저 갱신하고(SSoT), 성공한 뒤에만 Qdrant
+    /// summary payload를 재동기화한다. raw 저장이 실패하면 Qdrant는 호출조차 되지
+    /// 않아 "둘 다 미반영"이 관측된다. payload 동기화만 실패하는 경우 raw와 순간
+    /// 불일치하나, payload는 파생물이므로 reindex로 언제든 복원된다.
+    pub async fn add_edge_to_document(
+        &self,
+        workspace_id: &str,
+        source_id: Uuid,
+        edge: Edge,
+    ) -> Result<Document> {
+        // 1. raw JSON 로드 → 엣지 추가 → 저장 (SSoT 먼저)
+        let mut doc = self.documents.load(source_id, workspace_id).await?;
+        doc.add_edge(edge);
+        doc.updated_at = chrono::Utc::now();
+        self.documents.save(&doc, workspace_id).await?;
+
+        // 2. Qdrant summary payload의 edges 재동기화 (파생물 갱신)
+        self.qdrant
+            .update_edges_payload(workspace_id, source_id, &doc.edges)
+            .await?;
+
+        Ok(doc)
+    }
+
+    /// 문서에서 특정 대상 문서로 향하는 엣지를 모두 제거한다. 제거된 개수를 반환한다.
+    /// 제거할 엣지가 없으면 저장/동기화를 생략한다(불필요한 쓰기 억제).
+    pub async fn remove_edge_from_document(
+        &self,
+        workspace_id: &str,
+        source_id: Uuid,
+        target_id: Uuid,
+    ) -> Result<usize> {
+        let mut doc = self.documents.load(source_id, workspace_id).await?;
+        let removed = doc.remove_edge(target_id);
+        if removed > 0 {
+            doc.updated_at = chrono::Utc::now();
+            self.documents.save(&doc, workspace_id).await?;
+            self.qdrant
+                .update_edges_payload(workspace_id, source_id, &doc.edges)
+                .await?;
+        }
+        Ok(removed)
+    }
+
     /// 파일 시스템의 모든 문서를 Qdrant에 재인덱싱
     /// 컬렉션을 완전히 재생성하여 구 스키마 데이터도 정리
     pub async fn reindex_all(&self) -> Result<usize> {
@@ -522,11 +570,13 @@ impl Indexer {
             match self.build_chunks(embedder.as_ref(), &doc.summary, &doc.facts).await {
                 Ok(chunks) => {
                     let chunk_count = chunks.len();
+                    // reindex 엣지 생존의 핵심: raw JSON의 edges를 payload로 복원한다.
                     if let Err(e) = self.qdrant.upsert_chunks(
                         workspace_id,
                         doc.id,
                         &doc.summary,
                         &doc.created_at.to_rfc3339(),
+                        &doc.edges,
                         chunks,
                     ).await {
                         tracing::error!("Failed to index {}: {}", doc.id, e);

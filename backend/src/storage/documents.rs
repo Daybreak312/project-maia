@@ -245,6 +245,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_save_and_load_preserves_edges() {
+        // raw JSON이 그래프 엣지의 SSoT — 저장/로드 왕복에서 보존되어야 한다.
+        // (이 보존이 reindex 엣지 생존의 raw 측 불변식이다.)
+        use crate::models::{Edge, RelationType};
+        let (_tmp, store) = setup().await;
+        let mut doc = make_doc("with edges");
+        let target = Uuid::new_v4();
+        doc.add_edge(Edge::new(target, RelationType::Updates, 0.7));
+        let id = doc.id;
+
+        store.save(&doc, "default").await.unwrap();
+        let loaded = store.load(id, "default").await.unwrap();
+
+        assert_eq!(loaded.edges.len(), 1);
+        assert_eq!(loaded.edges[0].target, target);
+        assert_eq!(loaded.edges[0].relation, RelationType::Updates);
+        assert!((loaded.edges[0].weight - 0.7).abs() < f32::EPSILON);
+    }
+
+    #[tokio::test]
     async fn test_list_recent_workspace_isolation() {
         let (_tmp, store) = setup().await;
 
