@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use uuid::Uuid;
 
+use crate::connectors::{ConnectorIngest, ConnectorIngestMode, ConnectorItem, ItemOutcome};
 use crate::core::search::{BM25Scorer, SearchMode, reciprocal_rank_fusion};
 use crate::core::ingest_agent::{CandidateDoc, IngestAgent, IngestStrategy, DEFAULT_EDGE_WEIGHT};
 use crate::core::search_agent::{
@@ -12,7 +13,7 @@ use crate::core::search_agent::{
     DEFAULT_DEEP_SEARCH_MAX_RESULTS,
 };
 use crate::llm::{create_llm_provider, create_embedding_provider, LlmProvider, EmbeddingProvider};
-use crate::models::{Document, Edge, RelationType, api::{AgentSearchMeta, IngestResponse, IngestOutcome, SearchResponse, SearchResult}};
+use crate::models::{Document, DocumentSource, Edge, RelationType, api::{AgentSearchMeta, IngestResponse, IngestOutcome, SearchResponse, SearchResult}};
 use crate::settings::SettingsManager;
 use crate::storage::{DocumentStore, QdrantStorage, SearchHit, ChunkData, VersionStore};
 
@@ -395,7 +396,7 @@ impl Indexer {
 
         // 일부(또는 전부) 세그먼트 실패 — 원문 전체를 raw dead-letter로 보존한다.
         tracing::warn!("분할 세그먼트 {}개 실패 — 원문을 raw dead-letter로 보존", failed);
-        let dead_letter = self.persist_raw_document(raw_content, workspace_id).await?;
+        let dead_letter = self.persist_raw_document(raw_content, workspace_id, None).await?;
         document_ids.push(dead_letter.id);
         let rep = primary.unwrap_or_else(|| IngestResponse {
             id: dead_letter.id,
@@ -420,7 +421,7 @@ impl Indexer {
         workspace_id: &str,
         reason: String,
     ) -> Result<IngestOutcome> {
-        let doc = self.persist_raw_document(raw_content, workspace_id).await?;
+        let doc = self.persist_raw_document(raw_content, workspace_id, None).await?;
         let id = doc.id;
         Ok(IngestOutcome::from_response(
             IngestResponse {
@@ -450,9 +451,12 @@ impl Indexer {
         &self,
         raw_content: String,
         workspace_id: &str,
+        source: Option<DocumentSource>,
     ) -> Result<Document> {
         let summary = fallback_summary(&raw_content);
-        let doc = Document::new(raw_content, summary, Vec::new(), Vec::new());
+        let mut doc = Document::new(raw_content, summary, Vec::new(), Vec::new());
+        // 커넥터 유입이면 출처를 각인한다(중복 방지 키·provenance).
+        doc.source = source;
 
         // SSoT 저장 — 외부 서비스에 의존하지 않는 유일한 필수 단계.
         self.documents.save(&doc, workspace_id).await?;
@@ -887,6 +891,9 @@ impl Indexer {
             entities: parsed.entities.clone(),
             facts: parsed.facts.clone(),
             edges: existing.edges.clone(),
+            // 출처는 edges와 마찬가지로 재파싱 업데이트에서 보존한다(커넥터 유입 문서의
+            // provenance 유지). 커넥터 업데이트 경로는 이후 명시적으로 갱신한다.
+            source: existing.source.clone(),
             created_at: existing.created_at,
             updated_at: now,
         };
@@ -995,6 +1002,191 @@ impl Indexer {
                 .await?;
         }
         Ok(removed)
+    }
+
+    // ──── 커넥터 유입 (Phase 4) ────
+
+    /// 커넥터 신규 항목을 Parsed 모드로 유입한다 — LLM 파싱 + 임베딩 + 출처 각인 +
+    /// 그래프 자동 연결(RELATED_TO, LLM 관계 판단 없이 상수 호출).
+    ///
+    /// **실패 시맨틱**: 파싱/임베딩 *계산* 실패는 `Err`(항목 실패 → 러너가 재시도).
+    /// Qdrant *쓰기* 실패는 best-effort로 흡수한다 — raw JSON이 SSoT로 저장됐으므로
+    /// reindex로 인덱스를 복원할 수 있다(정보 유실 0). raw 저장 자체가 실패하면 `Err`.
+    async fn ingest_connector_new_parsed(
+        &self,
+        content: String,
+        source: DocumentSource,
+        workspace_id: &str,
+    ) -> Result<Uuid> {
+        let llm = self.get_llm_provider().await?;
+        let parsed = llm.parse(&content).await?;
+        let embedder = self.get_embedding_provider().await?;
+        // 임베딩(계산)은 raw 저장 전에 끝낸다 — 여기서 실패하면 아무것도 안 바뀌어 재시도가 안전하다.
+        let chunks = self
+            .build_chunks(embedder.as_ref(), &parsed.summary, &parsed.facts)
+            .await?;
+        // 그래프 연결 후보는 원문 임베딩으로 확보한다(content 이동 전).
+        let candidates = self.find_candidates(&content, workspace_id).await.unwrap_or_default();
+
+        let doc = Document::new(
+            content,
+            parsed.summary.clone(),
+            parsed.entities.clone(),
+            parsed.facts.clone(),
+        )
+        .with_source(source);
+        let id = doc.id;
+
+        // raw JSON(SSoT) 저장 — 실패하면 Err(정보 유실 방지).
+        self.documents.save(&doc, workspace_id).await?;
+
+        // Qdrant 인덱싱은 best-effort — 실패해도 raw는 남아 reindex로 복원된다.
+        if let Err(e) = self
+            .qdrant
+            .upsert_chunks(
+                workspace_id,
+                id,
+                &doc.summary,
+                &doc.created_at.to_rfc3339(),
+                &doc.edges,
+                chunks,
+            )
+            .await
+        {
+            tracing::warn!("커넥터 문서 {} Qdrant 인덱싱 실패(raw 저장됨, reindex로 복원): {}", id, e);
+        }
+
+        // 자동 엣지 (RELATED_TO, judge 없이 — 대량 유입에서 LLM 호출 상수 유지).
+        self.create_auto_edges(llm.as_ref(), workspace_id, id, &doc.summary, &candidates, false)
+            .await;
+
+        Ok(id)
+    }
+
+    /// 기존(동일 소스) 문서를 새 원문으로 갱신한다 — 내용 교체(append 아님), 출처 갱신,
+    /// edges·created_at 보존. 파일은 자기 콘텐츠의 SSoT이므로 커넥터 업데이트는 병합이
+    /// 아니라 교체다.
+    ///
+    /// **실패 시맨틱**: Parsed의 파싱/임베딩 계산 실패는 저장 전에 `Err`(재시도 안전).
+    /// 이전 버전은 덮어쓰기 전에 archive된다.
+    async fn update_connector_source(
+        &self,
+        id: Uuid,
+        content: String,
+        source: DocumentSource,
+        mode: ConnectorIngestMode,
+        workspace_id: &str,
+    ) -> Result<()> {
+        let existing = self.documents.load(id, workspace_id).await?;
+
+        // Parsed는 파싱·임베딩을 저장 전에 끝낸다(실패해도 문서 미변경 → 재시도 안전).
+        let (summary, entities, facts, chunks) = match mode {
+            ConnectorIngestMode::Parsed => {
+                let llm = self.get_llm_provider().await?;
+                let parsed = llm.parse(&content).await?;
+                let embedder = self.get_embedding_provider().await?;
+                let chunks = self
+                    .build_chunks(embedder.as_ref(), &parsed.summary, &parsed.facts)
+                    .await?;
+                (parsed.summary, parsed.entities, parsed.facts, Some(chunks))
+            }
+            ConnectorIngestMode::Raw => (fallback_summary(&content), Vec::new(), Vec::new(), None),
+        };
+
+        // 덮어쓰기 전에 이전 버전 보관(안전망). 실패 시 업데이트 중단.
+        self.versions.archive(&existing, workspace_id).await?;
+
+        let doc = Document {
+            id,
+            raw_content: content,
+            summary: summary.clone(),
+            entities,
+            facts,
+            // 그래프 엣지는 재유입 업데이트에서 보존한다.
+            edges: existing.edges.clone(),
+            // 출처를 새 수정 시각으로 갱신한다(다음 스캔의 "변경 없음" 판단 기준).
+            source: Some(source),
+            created_at: existing.created_at,
+            updated_at: chrono::Utc::now(),
+        };
+
+        self.documents.save(&doc, workspace_id).await?;
+
+        // Qdrant 재동기화: 기존 chunk 삭제 후 새로 upsert (best-effort — raw는 SSoT).
+        if let Err(e) = self.qdrant.delete_by_document_id(workspace_id, id).await {
+            tracing::warn!("커넥터 업데이트 {} 기존 chunk 삭제 실패(계속): {}", id, e);
+        }
+        match chunks {
+            Some(chunks) => {
+                if let Err(e) = self
+                    .qdrant
+                    .upsert_chunks(
+                        workspace_id,
+                        id,
+                        &doc.summary,
+                        &doc.created_at.to_rfc3339(),
+                        &doc.edges,
+                        chunks,
+                    )
+                    .await
+                {
+                    tracing::warn!("커넥터 업데이트 {} Qdrant 인덱싱 실패(reindex로 복원): {}", id, e);
+                }
+            }
+            // Raw 모드는 폴백 요약을 best-effort 인덱싱.
+            None => self.best_effort_index(&doc, workspace_id).await,
+        }
+
+        Ok(())
+    }
+
+    /// 커넥터 항목 하나를 유입한다 — 소스 식별자 기반 중복 방지의 핵심 결정 지점.
+    ///
+    /// 1. `(source_type, source_id)` 일치 문서 조회.
+    /// 2. 있고 원본이 더 새롭지 않으면 → `Skipped`(재유입 안전성).
+    /// 3. 있고 더 새로우면 → 업데이트 경로(`Updated`) — 신규 문서 난립 금지.
+    /// 4. 없으면 → 신규(`Created`).
+    async fn ingest_connector_item_inner(
+        &self,
+        workspace_id: &str,
+        source_type: &str,
+        connector_id: &str,
+        item: ConnectorItem,
+        mode: ConnectorIngestMode,
+    ) -> Result<ItemOutcome> {
+        let existing = self
+            .documents
+            .find_by_source(source_type, &item.source_id, workspace_id)
+            .await?;
+
+        if let Some(existing) = existing {
+            // 변경 없음(원본이 더 새롭지 않음) → 재유입하지 않는다.
+            if let Some(src) = &existing.source {
+                if src.modified_at >= item.modified_at {
+                    return Ok(ItemOutcome::Skipped);
+                }
+            }
+            // 변경됨 → 업데이트 경로.
+            let source = item.to_source(source_type, connector_id);
+            self.update_connector_source(existing.id, item.content, source, mode, workspace_id)
+                .await?;
+            return Ok(ItemOutcome::Updated(existing.id));
+        }
+
+        // 신규 유입.
+        let source = item.to_source(source_type, connector_id);
+        let id = match mode {
+            ConnectorIngestMode::Parsed => {
+                self.ingest_connector_new_parsed(item.content, source, workspace_id)
+                    .await?
+            }
+            ConnectorIngestMode::Raw => {
+                self.persist_raw_document(item.content, workspace_id, Some(source))
+                    .await?
+                    .id
+            }
+        };
+        Ok(ItemOutcome::Created(id))
     }
 
     /// 파일 시스템의 모든 문서를 Qdrant에 재인덱싱
@@ -1229,6 +1421,26 @@ impl SearchBackend for Indexer {
             }
         }
         Ok(out)
+    }
+}
+
+/// 커넥터 유입 실행기 — 러너/스케줄러가 이 trait 경유로 Indexer의 파싱·임베딩·저장
+/// 파이프라인을 재사용한다(에이전트는 판단만, 저장은 기존 인덱싱 재사용 원칙).
+///
+/// `Box<dyn Connector>`/`Arc<dyn ConnectorIngest>`로 쓰이므로 `#[async_trait]`가 필요하다
+/// (네이티브 AFIT는 dyn 비호환).
+#[async_trait]
+impl ConnectorIngest for Indexer {
+    async fn ingest_item(
+        &self,
+        workspace_id: &str,
+        source_type: &str,
+        connector_id: &str,
+        item: ConnectorItem,
+        mode: ConnectorIngestMode,
+    ) -> Result<ItemOutcome> {
+        self.ingest_connector_item_inner(workspace_id, source_type, connector_id, item, mode)
+            .await
     }
 }
 
