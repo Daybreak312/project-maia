@@ -73,6 +73,9 @@ impl Document {
         {
             existing.weight = edge.weight;
             existing.created_at = edge.created_at;
+            // 관계 재확인 = 새 기준. 다음 감쇠가 이 새 weight로부터 재계산하도록
+            // base를 리셋한다(옛 base로 잘못 감쇠되는 것 방지).
+            existing.base_weight = None;
         } else {
             self.edges.push(edge);
         }
@@ -151,6 +154,12 @@ pub struct Edge {
     pub relation: RelationType,
     /// 가중치 (0.0 ~ 1.0). 관련도·확신도를 표현하며 Phase 5에서 감쇠 재계산된다.
     pub weight: f32,
+    /// 감쇠의 **기준 가중치** — 생성 시점의 원본 가중치. Phase 5의 시간 감쇠는 이
+    /// base로부터 created_at 나이만큼 매번 재계산하므로 반복 실행해도 결과가 같다(멱등).
+    /// None이면 `weight`를 base로 간주하고 최초 감쇠 시 고정한다(구버전 엣지 하위호환).
+    /// 감쇠 전에는 직렬화에서 생략된다(기존 JSON 노이즈 방지).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_weight: Option<f32>,
     /// 엣지 생성 시각
     pub created_at: DateTime<Utc>,
 }
@@ -163,6 +172,8 @@ impl Edge {
             target,
             relation,
             weight: weight.clamp(0.0, 1.0),
+            // 생성 시 base는 아직 고정하지 않는다(최초 감쇠 시 현재 weight로 고정).
+            base_weight: None,
             created_at: Utc::now(),
         }
     }
@@ -555,6 +566,47 @@ mod tests {
         assert!((Edge::new(t, RelationType::RelatedTo, 1.5).weight - 1.0).abs() < f32::EPSILON);
         assert!((Edge::new(t, RelationType::RelatedTo, -0.3).weight - 0.0).abs() < f32::EPSILON);
         assert!((Edge::new(t, RelationType::RelatedTo, 0.5).weight - 0.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_edge_new_has_no_base_weight() {
+        // 생성 시 base는 미고정(None) — 최초 감쇠 시 현재 weight로 고정된다.
+        let e = Edge::new(Uuid::new_v4(), RelationType::RelatedTo, 0.5);
+        assert!(e.base_weight.is_none());
+    }
+
+    #[test]
+    fn test_edge_omits_base_weight_when_none() {
+        // 감쇠 전 엣지는 base_weight를 직렬화하지 않는다(기존 JSON 노이즈 방지·하위호환).
+        let e = Edge::new(Uuid::new_v4(), RelationType::RelatedTo, 0.5);
+        let json = serde_json::to_value(&e).unwrap();
+        assert!(json.get("base_weight").is_none(), "None base_weight는 생략되어야 한다");
+    }
+
+    #[test]
+    fn test_edge_loads_legacy_json_without_base_weight() {
+        // base_weight 필드가 없는 Phase 4 이전 엣지 JSON도 로드되어야 한다(#[serde(default)]).
+        let legacy = format!(
+            r#"{{"target":"{}","relation":"related_to","weight":0.7,"created_at":"2026-01-01T00:00:00Z"}}"#,
+            Uuid::new_v4()
+        );
+        let edge: Edge = serde_json::from_str(&legacy).unwrap();
+        assert!(edge.base_weight.is_none(), "누락된 base_weight는 None으로 기본값 처리");
+        assert!((edge.weight - 0.7).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_add_edge_upsert_resets_base_weight() {
+        // 관계 재확인(upsert)은 base_weight를 리셋한다(새 weight가 다음 감쇠의 기준).
+        let mut doc = make_doc();
+        let target = Uuid::new_v4();
+        let mut first = Edge::new(target, RelationType::RelatedTo, 0.5);
+        first.base_weight = Some(0.9); // 이전 감쇠로 base가 고정된 상태를 모사
+        doc.add_edge(first);
+        doc.add_edge(Edge::new(target, RelationType::RelatedTo, 0.6));
+        assert_eq!(doc.edges.len(), 1);
+        assert!(doc.edges[0].base_weight.is_none(), "재확인 시 base는 리셋되어야 한다");
+        assert!((doc.edges[0].weight - 0.6).abs() < f32::EPSILON);
     }
 
     // ──── add_edge / remove_edge ────

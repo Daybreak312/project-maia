@@ -5,6 +5,7 @@ mod connectors;
 mod core;
 mod llm;
 mod models;
+mod patrol;
 mod settings;
 mod storage;
 mod workspace;
