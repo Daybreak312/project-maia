@@ -92,6 +92,12 @@ pub mod api {
         /// 검색 모드: "vector", "keyword", "hybrid" (기본값: hybrid)
         #[serde(default)]
         pub mode: Option<String>,
+        /// 교차 워크스페이스 검색 제어.
+        /// None: 워크스페이스 설정(cross_workspace)을 따름 (기본).
+        /// Some(false): 대상 워크스페이스 단일 검색으로 강제.
+        /// Some(true): 설정 목록 기반 교차 검색을 명시적으로 요청.
+        #[serde(default)]
+        pub cross_workspace: Option<bool>,
     }
 
     fn default_limit() -> usize {
@@ -121,6 +127,8 @@ pub mod api {
         pub id: Uuid,
         pub summary: String,
         pub relevance_score: f32,
+        /// 이 결과가 나온 출처 워크스페이스 ID (교차 검색 시 구분용)
+        pub workspace: String,
         #[serde(skip_serializing_if = "Vec::is_empty")]
         pub matched_facts: Vec<String>,
     }

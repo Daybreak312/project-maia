@@ -121,6 +121,15 @@ impl AuthContext {
         self.is_master || self.workspaces.is_empty() || self.workspaces.iter().any(|w| w == workspace_id)
     }
 
+    /// 워크스페이스 미지정 시 사용할 기본 워크스페이스 ID.
+    /// 키에 바인딩된 첫 워크스페이스, 비어있으면(마스터/개발모드) `default`.
+    pub fn default_workspace(&self) -> String {
+        self.workspaces
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "default".to_string())
+    }
+
     pub fn can_write(&self) -> bool {
         self.permissions.can_write()
     }
@@ -246,6 +255,20 @@ impl ApiKeyManager {
     pub async fn find_by_hash(&self, hashed_key: &str) -> Option<ApiKey> {
         let keys = self.keys.read().await;
         keys.iter().find(|k| k.hashed_key == hashed_key).cloned()
+    }
+
+    /// 평문 토큰을 인증한다.
+    ///
+    /// 토큰을 해시하여 조회하고(해시 비교 → 타이밍 공격 완화), 만료되지 않은
+    /// 키만 반환한다. 일치하는 키가 없거나 만료되었으면 `None`.
+    pub async fn authenticate(&self, raw_token: &str) -> Option<ApiKey> {
+        let hashed = hash_key(raw_token);
+        let key = self.find_by_hash(&hashed).await?;
+        if key.is_expired() {
+            tracing::warn!("Rejected expired API key: {}", key.key_id);
+            return None;
+        }
+        Some(key)
     }
 
     /// 등록된 키가 있는지 확인한다.
@@ -780,6 +803,75 @@ mod tests {
 
         assert!(key.has_workspace_access("allowed-ws"));
         assert!(!key.has_workspace_access("denied-ws"));
+    }
+
+    // ──── authenticate ────
+
+    #[tokio::test]
+    async fn test_authenticate_valid_key() {
+        let (_tmp, manager) = setup_manager().await;
+        let (key, raw) = manager.create_key(
+            "Auth".to_string(),
+            vec!["default".to_string()],
+            Permission::ReadWrite,
+            None,
+        ).await.unwrap();
+
+        let authed = manager.authenticate(&raw).await;
+        assert!(authed.is_some());
+        assert_eq!(authed.unwrap().key_id, key.key_id);
+    }
+
+    #[tokio::test]
+    async fn test_authenticate_wrong_token() {
+        let (_tmp, manager) = setup_manager().await;
+        manager.create_key(
+            "Auth".to_string(),
+            vec!["default".to_string()],
+            Permission::ReadWrite,
+            None,
+        ).await.unwrap();
+
+        assert!(manager.authenticate("maia_wrongtoken").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_authenticate_expired_key_rejected() {
+        let (_tmp, manager) = setup_manager().await;
+        let expires = Utc::now() - Duration::seconds(5);
+        let (_, raw) = manager.create_key(
+            "Expired".to_string(),
+            vec!["default".to_string()],
+            Permission::ReadWrite,
+            Some(expires),
+        ).await.unwrap();
+
+        // 만료된 키는 검색은 되지만 authenticate는 거부해야 한다
+        assert!(manager.authenticate(&raw).await.is_none(), "만료 키는 인증되면 안 된다");
+    }
+
+    // ──── default_workspace ────
+
+    #[test]
+    fn test_default_workspace_master_is_default() {
+        assert_eq!(AuthContext::master().default_workspace(), "default");
+        assert_eq!(AuthContext::dev_mode().default_workspace(), "default");
+    }
+
+    #[test]
+    fn test_default_workspace_bound_key_first() {
+        let mut key = make_test_key();
+        key.workspaces = vec!["work".to_string(), "personal".to_string()];
+        let ctx = AuthContext::from_api_key(&key);
+        assert_eq!(ctx.default_workspace(), "work");
+    }
+
+    #[test]
+    fn test_default_workspace_empty_falls_back() {
+        let mut key = make_test_key();
+        key.workspaces = vec![];
+        let ctx = AuthContext::from_api_key(&key);
+        assert_eq!(ctx.default_workspace(), "default");
     }
 
     #[tokio::test]

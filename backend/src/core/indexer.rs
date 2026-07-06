@@ -265,6 +265,7 @@ impl Indexer {
                 id,
                 summary: group.summary,
                 relevance_score: group.best_score,
+                workspace: workspace_id.to_string(),
                 matched_facts: group.matched_facts,
             })
             .collect();
@@ -312,6 +313,7 @@ impl Indexer {
                     id: doc.id,
                     summary: doc.summary.clone(),
                     relevance_score: (score / max_score).min(1.0),
+                    workspace: workspace_id.to_string(),
                     matched_facts: vec![],
                 })
             })
@@ -375,6 +377,7 @@ impl Indexer {
                     id: doc.id,
                     summary: doc.summary.clone(),
                     relevance_score: score,
+                    workspace: workspace_id.to_string(),
                     matched_facts: doc.matched_facts.clone(),
                 })
             })
@@ -399,7 +402,17 @@ impl Indexer {
         limit: usize,
         offset: usize,
     ) -> Result<(Vec<Document>, usize)> {
-        let docs = self.documents.list_recent(1000, DEFAULT_WORKSPACE).await?;
+        self.recent_in_workspace(limit, offset, DEFAULT_WORKSPACE).await
+    }
+
+    /// 특정 워크스페이스의 최근 문서 목록 (페이지네이션 지원)
+    pub async fn recent_in_workspace(
+        &self,
+        limit: usize,
+        offset: usize,
+        workspace_id: &str,
+    ) -> Result<(Vec<Document>, usize)> {
+        let docs = self.documents.list_recent(1000, workspace_id).await?;
         let total = docs.len();
         let paginated = docs.into_iter().skip(offset).take(limit).collect();
 
@@ -529,6 +542,109 @@ impl Indexer {
         Ok(indexed)
     }
 
+    /// 워크스페이스 생성 시 Qdrant 컬렉션을 준비한다.
+    /// Qdrant 불가용 시 실패할 수 있으나, 호출 측에서 best-effort로 처리한다
+    /// (컬렉션은 최초 ingest 시 lazy 하게도 보장됨).
+    pub async fn provision_workspace_collection(&self, workspace_id: &str) -> Result<()> {
+        self.qdrant.create_workspace_collection(workspace_id).await
+    }
+
+    /// 워크스페이스 삭제 시 Qdrant 컬렉션을 정리한다.
+    pub async fn purge_workspace_collection(&self, workspace_id: &str) -> Result<()> {
+        self.qdrant.delete_workspace_collection(workspace_id).await
+    }
+
+    /// 교차 워크스페이스 검색.
+    ///
+    /// 주어진 워크스페이스들 각각에서 hybrid 검색을 수행한 뒤(각 결과에 출처
+    /// 워크스페이스가 스탬프됨), relevance_score 기준으로 병합·재정렬한다.
+    /// 각 워크스페이스 검색은 이미 내부적으로 RRF 융합을 마쳐 raw cosine 점수를
+    /// 부여하며, 동일 임베딩 공간이므로 워크스페이스 간 점수 비교가 유효하다.
+    ///
+    /// `workspace_ids`는 호출 전에 접근 권한·존재 여부로 이미 필터링되어 있어야 한다.
+    pub async fn search_across_workspaces(
+        &self,
+        query: String,
+        limit: usize,
+        offset: usize,
+        mode: Option<String>,
+        workspace_ids: &[String],
+    ) -> Result<SearchResponse> {
+        // 단일 대상이면 일반 검색으로 위임 (불필요한 오케스트레이션 회피)
+        if workspace_ids.len() == 1 {
+            return self
+                .search_in_workspace(query, limit, offset, mode, &workspace_ids[0])
+                .await;
+        }
+
+        let mode_label = mode
+            .as_deref()
+            .and_then(|m| m.parse::<SearchMode>().ok())
+            .unwrap_or_default();
+
+        // 각 워크스페이스에서 상위 (limit+offset)개 후보를 수집한다.
+        let mut merged: Vec<SearchResult> = Vec::new();
+        for ws in workspace_ids {
+            match self
+                .search_in_workspace(query.clone(), limit + offset, 0, mode.clone(), ws)
+                .await
+            {
+                Ok(resp) => merged.extend(resp.results),
+                Err(e) => {
+                    // 부분 실패는 침묵하지 않되, 전체 검색을 중단시키지 않는다.
+                    tracing::warn!("Cross-workspace search failed for '{}': {}", ws, e);
+                }
+            }
+        }
+
+        // relevance_score 내림차순 재정렬 (동일 임베딩 공간이라 비교 유효)
+        merged.sort_by(|a, b| {
+            b.relevance_score
+                .partial_cmp(&a.relevance_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        let total = merged.len();
+        let paginated: Vec<_> = merged.into_iter().skip(offset).take(limit).collect();
+        let sources_used: Vec<_> = paginated.iter().map(|r| r.id).collect();
+
+        Ok(SearchResponse {
+            results: paginated,
+            sources_used,
+            total,
+            mode: format!("{:?}", mode_label).to_lowercase(),
+        })
+    }
+
+}
+
+/// 교차 검색 대상 워크스페이스 집합을 계산한다.
+///
+/// (primary + 워크스페이스 설정의 cross_workspace 목록) 중에서
+/// - 인증 컨텍스트가 접근 가능하고 (`can_access_workspace`)
+/// - 실제로 존재하는(`existing`)
+/// 워크스페이스만 남긴다. primary는 항상 첫 번째에 위치하며 중복은 제거된다.
+///
+/// 순수 함수 — 단위 테스트로 격리 검증한다.
+pub fn cross_workspace_targets(
+    primary: &str,
+    cross_list: &[String],
+    ctx: &crate::auth::AuthContext,
+    existing: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    let mut targets: Vec<String> = Vec::new();
+
+    // primary를 맨 앞에 두고, 이어서 cross_list를 순회한다.
+    for ws in std::iter::once(primary).chain(cross_list.iter().map(|s| s.as_str())) {
+        if targets.iter().any(|t| t == ws) {
+            continue; // 중복 제거
+        }
+        if existing.contains(ws) && ctx.can_access_workspace(ws) {
+            targets.push(ws.to_string());
+        }
+    }
+
+    targets
 }
 
 /// 검색 결과를 관련성 기준으로 동적 필터링
@@ -573,4 +689,103 @@ struct DocumentGroup {
     summary: String,
     best_score: f32,
     matched_facts: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cross_workspace_targets;
+    use crate::auth::{AuthContext, Permission};
+    use std::collections::HashSet;
+
+    fn existing(ids: &[&str]) -> HashSet<String> {
+        ids.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn cross(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// 특정 워크스페이스만 접근 가능한 (마스터 아님) 키 컨텍스트
+    fn scoped(workspaces: &[&str]) -> AuthContext {
+        AuthContext {
+            key_id: "test".to_string(),
+            permissions: Permission::ReadWrite,
+            workspaces: workspaces.iter().map(|s| s.to_string()).collect(),
+            is_master: false,
+        }
+    }
+
+    #[test]
+    fn test_targets_primary_only_when_no_cross() {
+        let ctx = scoped(&["personal"]);
+        let targets =
+            cross_workspace_targets("personal", &[], &ctx, &existing(&["personal", "work"]));
+        assert_eq!(targets, vec!["personal".to_string()]);
+    }
+
+    #[test]
+    fn test_targets_includes_allowed_cross() {
+        let ctx = scoped(&["personal", "work"]);
+        let targets = cross_workspace_targets(
+            "personal",
+            &cross(&["work"]),
+            &ctx,
+            &existing(&["personal", "work"]),
+        );
+        // primary 우선, 이어서 허용된 교차 워크스페이스
+        assert_eq!(targets, vec!["personal".to_string(), "work".to_string()]);
+    }
+
+    #[test]
+    fn test_targets_excludes_inaccessible_cross() {
+        // 키가 personal만 접근 가능 — 설정에 work가 있어도 제외되어야 한다 (스코프 교집합)
+        let ctx = scoped(&["personal"]);
+        let targets = cross_workspace_targets(
+            "personal",
+            &cross(&["work"]),
+            &ctx,
+            &existing(&["personal", "work"]),
+        );
+        assert_eq!(targets, vec!["personal".to_string()]);
+        assert!(!targets.contains(&"work".to_string()), "접근 불가 워크스페이스는 교차 대상에서 제외");
+    }
+
+    #[test]
+    fn test_targets_excludes_nonexistent_cross() {
+        let ctx = scoped(&["personal", "ghost"]);
+        let targets = cross_workspace_targets(
+            "personal",
+            &cross(&["ghost"]),
+            &ctx,
+            &existing(&["personal"]), // ghost는 존재하지 않음
+        );
+        assert_eq!(targets, vec!["personal".to_string()]);
+    }
+
+    #[test]
+    fn test_targets_master_includes_all_configured_existing() {
+        let ctx = AuthContext::master();
+        let targets = cross_workspace_targets(
+            "personal",
+            &cross(&["work", "archive"]),
+            &ctx,
+            &existing(&["personal", "work", "archive"]),
+        );
+        assert_eq!(
+            targets,
+            vec!["personal".to_string(), "work".to_string(), "archive".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_targets_dedup_primary_in_cross_list() {
+        let ctx = scoped(&["personal", "work"]);
+        let targets = cross_workspace_targets(
+            "personal",
+            &cross(&["personal", "work"]), // primary가 목록에 중복 포함
+            &ctx,
+            &existing(&["personal", "work"]),
+        );
+        assert_eq!(targets, vec!["personal".to_string(), "work".to_string()]);
+    }
 }

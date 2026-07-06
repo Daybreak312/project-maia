@@ -222,6 +222,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_same_id_coexists_across_workspaces() {
+        // 동일 문서 ID가 서로 다른 워크스페이스에서 충돌 없이 존재해야 한다.
+        let (_tmp, store) = setup().await;
+        let shared_id = Uuid::new_v4();
+
+        let mut doc_a = make_doc("personal content");
+        doc_a.id = shared_id;
+        let mut doc_b = make_doc("work content");
+        doc_b.id = shared_id;
+
+        store.save(&doc_a, "personal").await.unwrap();
+        store.save(&doc_b, "work").await.unwrap();
+
+        // 각 워크스페이스에서 같은 ID를 로드해도 서로 다른 내용이 나와야 한다
+        let loaded_a = store.load(shared_id, "personal").await.unwrap();
+        let loaded_b = store.load(shared_id, "work").await.unwrap();
+
+        assert_eq!(loaded_a.raw_content, "personal content");
+        assert_eq!(loaded_b.raw_content, "work content");
+        assert_eq!(loaded_a.id, loaded_b.id, "ID는 같지만 격리되어 있어야 한다");
+    }
+
+    #[tokio::test]
     async fn test_list_recent_workspace_isolation() {
         let (_tmp, store) = setup().await;
 
