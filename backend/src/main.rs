@@ -28,6 +28,13 @@ use connectors::runner::ConnectorRunner;
 use connectors::scheduler::ConnectorScheduler;
 use connectors::sync_state::SyncStateStore;
 use core::Indexer;
+use patrol::feedback::FeedbackStore;
+use patrol::freshness::FreshnessStore;
+use patrol::history::PatrolHistoryStore;
+use patrol::metrics::MetricsStore;
+use patrol::review::ReviewQueueStore;
+use patrol::scheduler::PatrolScheduler;
+use patrol::{Patrol, PatrolExecutor};
 use settings::SettingsManager;
 use storage::{DocumentStore, QdrantStorage, SearchLogStore, VersionStore};
 use workspace::WorkspaceManager;
@@ -49,6 +56,8 @@ pub struct AppState {
     pub connector_runner: Arc<ConnectorRunner>,
     /// 커넥터 동기화 상태 저장소 (상태 조회·삭제)
     pub sync_state: Arc<SyncStateStore>,
+    /// Patrol 거버넌스 파사드 (실행/판단/피드백/메트릭 — Phase 5)
+    pub patrol: Arc<Patrol>,
 }
 
 #[tokio::main]
@@ -106,6 +115,33 @@ async fn main() -> anyhow::Result<()> {
     ));
     scheduler.start();
 
+    // Patrol(Phase 5) 저장소 + 오케스트레이터 + 스케줄러 — 모두 동일 data_dir 루트 공유.
+    let reviews = Arc::new(ReviewQueueStore::new(&config.data_dir));
+    let feedback = Arc::new(FeedbackStore::new(&config.data_dir));
+    let freshness = Arc::new(FreshnessStore::new(&config.data_dir));
+    let metrics = Arc::new(MetricsStore::new(&config.data_dir));
+    let patrol_history = Arc::new(PatrolHistoryStore::new(&config.data_dir));
+    // Indexer를 문서 실행기로 주입(전 문서 조회·복구 가능 삭제·엣지 감쇠).
+    let patrol_executor: Arc<dyn PatrolExecutor> = indexer.clone();
+    let patrol = Arc::new(Patrol::new(
+        patrol_executor,
+        workspaces.clone(),
+        search_logs.clone(),
+        sync_state.clone(),
+        reviews,
+        feedback,
+        freshness,
+        metrics,
+        patrol_history.clone(),
+    ));
+    // Patrol 스케줄러 기동 — 워크스페이스 patrol 주기로 자동 실행(오류 격리).
+    let patrol_scheduler = Arc::new(PatrolScheduler::new(
+        patrol.clone(),
+        workspaces.clone(),
+        patrol_history,
+    ));
+    patrol_scheduler.start();
+
     // AppState 생성
     if config.api_key.is_some() {
         tracing::info!("API key authentication enabled");
@@ -121,6 +157,7 @@ async fn main() -> anyhow::Result<()> {
         search_logs,
         connector_runner,
         sync_state,
+        patrol,
     });
 
     // 인증이 필요한 API 라우트
@@ -165,6 +202,13 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/keys", get(api::list_keys_handler))
         .route("/api/keys", post(api::create_key_handler))
         .route("/api/keys/:key_id", delete(api::revoke_key_handler))
+        // Patrol·거버넌스 (Phase 5): 실행/판단/피드백은 write, 조회는 워크스페이스 접근
+        .route("/api/patrol/run", post(api::run_patrol_handler))
+        .route("/api/patrol/history", get(api::patrol_history_handler))
+        .route("/api/review", get(api::list_reviews_handler))
+        .route("/api/review/judge", post(api::judge_reviews_handler))
+        .route("/api/feedback", post(api::submit_feedback_handler))
+        .route("/api/metrics", get(api::metrics_handler))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_api_key,
