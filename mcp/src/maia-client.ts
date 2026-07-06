@@ -12,6 +12,24 @@ export interface SearchResult {
   /** 이 결과가 나온 출처 워크스페이스 (교차 검색 시 구분용) */
   workspace?: string;
   matched_facts?: string[];
+  /** 그래프 확장으로 추가된 결과의 유래 — 어느 검색 결과 문서의 이웃인지 (agent 검색). */
+  expanded_from?: string;
+}
+
+/** agent(deep) 검색의 탐색 과정 요약 (구버전 서버·기존 검색은 미포함). */
+export interface AgentSearchMeta {
+  /** 수행된 검색 라운드 수 (초기 1회 + 재작성 재검색). */
+  rounds: number;
+  /** 실제 시도된 쿼리 목록 (원 쿼리가 첫 번째). */
+  queries: string[];
+  /** 그래프 이웃 확장이 수행되었는지 여부. */
+  graph_expanded: boolean;
+  /** 그래프 확장으로 결과에 추가된 문서 수. */
+  expansion_count: number;
+  /** LLM 판단 실패/미설정으로 폴백(초기 결과 반환)했는지 여부. */
+  fallback: boolean;
+  /** 종료/폴백 사유. */
+  reason: string;
 }
 
 export interface SearchResponse {
@@ -19,6 +37,8 @@ export interface SearchResponse {
   sources_used: string[];
   total: number;
   mode: string;
+  /** agent 검색 메타데이터 (기존 검색은 미포함). */
+  agent?: AgentSearchMeta;
 }
 
 export interface IngestResponse {
@@ -87,6 +107,17 @@ export class MaiaClient {
       limit,
       offset: 0,
       mode,
+    });
+  }
+
+  /**
+   * agent(deep) 검색 — 서버의 Search Agent가 충분성 평가·쿼리 재작성·그래프 확장으로
+   * 능동 탐색한다. 기존 `/search`에 `agent: true`를 실어 opt-in한다(엔드포인트 동일).
+   */
+  async deepSearch(query: string, workspace?: string): Promise<SearchResponse> {
+    return this.post(this.withWorkspace("/search", workspace), {
+      query,
+      agent: true,
     });
   }
 
