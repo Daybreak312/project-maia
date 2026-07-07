@@ -187,6 +187,11 @@ async fn main() -> anyhow::Result<()> {
             "/api/settings/models/:provider/test",
             post(api::settings::test_api_key),
         )
+        // Codex는 키가 아니라 auth.json 임포트로 활성화된다(파싱 전용 구독 provider).
+        .route(
+            "/api/settings/models/codex/import",
+            post(api::settings::import_codex),
+        )
         // 워크스페이스 관리 (admin 전용 — 핸들러에서 강제)
         .route("/api/workspaces", get(api::list_workspaces_handler))
         .route("/api/workspaces", post(api::create_workspace_handler))

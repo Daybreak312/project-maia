@@ -1,18 +1,22 @@
 mod gemini;
 mod claude;
 mod openai;
+mod codex;
+mod local;
 
 pub use gemini::GeminiProvider;
 pub use claude::ClaudeProvider;
 pub use openai::{OpenAiChatProvider, OpenAiEmbeddingProvider};
+pub use codex::{CodexAuth, CodexProvider, CodexTokenStore, parse_codex_auth_json};
+pub use local::{LocalEmbeddingProvider, LOCAL_EMBED_DIM, LOCAL_EMBED_MODEL};
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-use crate::models::ParsedContent;
+use crate::models::{Entity, ParsedContent};
 
 /// 외부 LLM/임베딩 HTTP 요청의 전체 타임아웃(초).
 ///
@@ -51,12 +55,21 @@ fn build_http_client_with(timeout: Duration, connect_timeout: Duration) -> Clien
 }
 
 /// LLM Provider 종류
+///
+/// - `Gemini`/`Claude`/`OpenAi`: 파싱+임베딩(claude 제외) 가능한 종량제/구독 키 provider.
+/// - `Codex`: ChatGPT 구독 OAuth 기반 **파싱 전용** provider(임베딩 불가).
+/// - `Local`: 외부 호출 없는 로컬 **임베딩 전용** provider(파싱 불가).
+///
+/// 파싱/임베딩 교차 선택 제약은 [`ProviderType::valid_for_parsing`]/
+/// [`ProviderType::valid_for_embedding`]에서 단일 지점으로 판정한다.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ProviderType {
     Gemini,
     Claude,
     OpenAi,
+    Codex,
+    Local,
 }
 
 impl std::fmt::Display for ProviderType {
@@ -65,7 +78,33 @@ impl std::fmt::Display for ProviderType {
             ProviderType::Gemini => write!(f, "gemini"),
             ProviderType::Claude => write!(f, "claude"),
             ProviderType::OpenAi => write!(f, "openai"),
+            ProviderType::Codex => write!(f, "codex"),
+            ProviderType::Local => write!(f, "local"),
         }
+    }
+}
+
+impl ProviderType {
+    /// 파싱 provider로 선택 가능한가. `local`은 임베딩 전용이라 불가.
+    pub fn valid_for_parsing(&self) -> bool {
+        !matches!(self, ProviderType::Local)
+    }
+
+    /// 임베딩 provider로 선택 가능한가. `codex`는 파싱 전용, `claude`는 임베딩 미지원.
+    pub fn valid_for_embedding(&self) -> bool {
+        matches!(
+            self,
+            ProviderType::Gemini | ProviderType::OpenAi | ProviderType::Local
+        )
+    }
+
+    /// 사용자가 키/토큰을 직접 등록하는 provider인가.
+    /// `codex`는 auth.json 임포트, `local`은 키 불요라 별도 경로를 쓴다.
+    pub fn uses_api_key(&self) -> bool {
+        matches!(
+            self,
+            ProviderType::Gemini | ProviderType::Claude | ProviderType::OpenAi
+        )
     }
 }
 
@@ -97,8 +136,20 @@ pub trait EmbeddingProvider: Send + Sync {
     /// Provider 타입 반환
     fn provider_type(&self) -> ProviderType;
 
-    /// 텍스트를 벡터로 변환
+    /// **문서(passage)** 텍스트를 벡터로 변환한다.
+    ///
+    /// 문서 청크(summary/fact) 인덱싱에 쓰인다. e5 계열처럼 문서/쿼리 비대칭
+    /// 임베딩을 요구하는 모델은 이 경로에 `passage: ` 접두를 붙인다.
     async fn embed(&self, text: &str) -> Result<Vec<f32>>;
+
+    /// **쿼리** 텍스트를 벡터로 변환한다.
+    ///
+    /// 기본 구현은 문서 임베딩과 동일하다(gemini/openai는 문서/쿼리를 구분하지
+    /// 않는다). e5 계열은 이 경로에 `query: ` 접두를 붙이도록 오버라이드한다.
+    /// 검색·후보 탐색 경로가 문서 인덱싱과 대칭이 되도록 별도 진입점을 둔다.
+    async fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
+        self.embed(text).await
+    }
 
     /// 벡터 차원 수 반환
     fn dimension(&self) -> usize;
@@ -107,23 +158,84 @@ pub trait EmbeddingProvider: Send + Sync {
     async fn validate_api_key(&self) -> Result<bool>;
 }
 
-/// LLM Provider 생성 팩토리
-pub fn create_llm_provider(provider_type: ProviderType, api_key: String) -> Box<dyn LlmProvider> {
+/// 키 기반 LLM Provider 생성 팩토리.
+///
+/// `codex`/`local`은 단순 키가 아니라 토큰 저장소·data_dir 컨텍스트가 필요하므로
+/// 이 팩토리로 만들지 않는다(호출 측 `Indexer::llm_provider_for`가 분기). 그
+/// 계약을 명시적 에러로 못박아, 잘못된 경로로 생성되는 것을 컴파일이 아닌
+/// 런타임에서라도 분명히 드러낸다(침묵 실패 금지).
+pub fn create_llm_provider(
+    provider_type: ProviderType,
+    api_key: String,
+) -> Result<Box<dyn LlmProvider>> {
     match provider_type {
-        ProviderType::Gemini => Box::new(GeminiProvider::new(api_key)),
-        ProviderType::Claude => Box::new(ClaudeProvider::new(api_key)),
-        ProviderType::OpenAi => Box::new(OpenAiChatProvider::new(api_key)),
+        ProviderType::Gemini => Ok(Box::new(GeminiProvider::new(api_key))),
+        ProviderType::Claude => Ok(Box::new(ClaudeProvider::new(api_key))),
+        ProviderType::OpenAi => Ok(Box::new(OpenAiChatProvider::new(api_key))),
+        ProviderType::Codex => Err(anyhow!(
+            "codex는 토큰 저장소 컨텍스트가 필요합니다 (Indexer::llm_provider_for 경유)"
+        )),
+        ProviderType::Local => Err(anyhow!("local은 임베딩 전용입니다 (파싱 provider로 사용 불가)")),
     }
 }
 
-/// Embedding Provider 생성 팩토리
-pub fn create_embedding_provider(provider_type: ProviderType, api_key: String) -> Box<dyn EmbeddingProvider> {
+/// 키 기반 Embedding Provider 생성 팩토리.
+///
+/// `local`은 data_dir 컨텍스트가 필요하므로 이 팩토리 밖(`Indexer`)에서 생성한다.
+/// `claude`/`codex`는 임베딩을 지원하지 않아 명시적 에러를 반환한다.
+pub fn create_embedding_provider(
+    provider_type: ProviderType,
+    api_key: String,
+) -> Result<Box<dyn EmbeddingProvider>> {
     match provider_type {
-        ProviderType::Gemini => Box::new(gemini::GeminiEmbeddingProvider::new(api_key)),
-        ProviderType::OpenAi => Box::new(OpenAiEmbeddingProvider::new(api_key)),
-        // Claude는 임베딩 미지원, OpenAI로 폴백
-        ProviderType::Claude => Box::new(OpenAiEmbeddingProvider::new(api_key)),
+        ProviderType::Gemini => Ok(Box::new(gemini::GeminiEmbeddingProvider::new(api_key))),
+        ProviderType::OpenAi => Ok(Box::new(OpenAiEmbeddingProvider::new(api_key))),
+        ProviderType::Claude => Err(anyhow!("claude는 임베딩을 지원하지 않습니다")),
+        ProviderType::Codex => Err(anyhow!("codex는 임베딩 provider로 사용할 수 없습니다")),
+        ProviderType::Local => Err(anyhow!(
+            "local은 data_dir 컨텍스트가 필요합니다 (Indexer::embedding_provider_for 경유)"
+        )),
     }
+}
+
+/// LLM 원문 응답(JSON)을 [`ParsedContent`]로 변환하는 공용 파서.
+///
+/// 코드블록 제거 → JSON 파싱 → entity 타입 매핑을 한 곳에 모아, provider별로
+/// 중복되던 `ParsedContentRaw` 매핑 로직을 통일한다(신규 codex provider가 재사용).
+pub fn parse_llm_json(text: &str) -> Result<ParsedContent> {
+    let json_str = extract_json(text);
+    let parsed: ParsedContentRaw =
+        serde_json::from_str(json_str).map_err(|e| anyhow!("LLM 응답 JSON 파싱 실패: {e}"))?;
+    Ok(ParsedContent {
+        summary: parsed.summary,
+        entities: parsed
+            .entities
+            .into_iter()
+            .map(|e| Entity {
+                entity_type: parse_entity_type(&e.entity_type),
+                value: e.value,
+                context: e.context,
+            })
+            .collect(),
+        facts: parsed.facts,
+    })
+}
+
+/// provider 공용 파싱 응답 스키마 (JSON 역직렬화용).
+#[derive(Debug, Deserialize)]
+struct ParsedContentRaw {
+    summary: String,
+    #[serde(default)]
+    entities: Vec<EntityRaw>,
+    #[serde(default)]
+    facts: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct EntityRaw {
+    entity_type: String,
+    value: String,
+    context: Option<String>,
 }
 
 /// 파싱 프롬프트 생성 (모든 provider 공용)
@@ -198,6 +310,64 @@ mod tests {
     fn test_build_http_client_ok() {
         // 공용 클라이언트가 패닉/실패 없이 생성되어야 한다(타임아웃 설정 경로).
         let _client = build_http_client();
+    }
+
+    // ──── provider 교차 선택 제약 (FR5 validation 단일 지점) ────
+
+    #[test]
+    fn test_valid_for_parsing() {
+        // local은 임베딩 전용 → 파싱 불가. 나머지는 파싱 가능.
+        assert!(ProviderType::Gemini.valid_for_parsing());
+        assert!(ProviderType::Claude.valid_for_parsing());
+        assert!(ProviderType::OpenAi.valid_for_parsing());
+        assert!(ProviderType::Codex.valid_for_parsing());
+        assert!(!ProviderType::Local.valid_for_parsing());
+    }
+
+    #[test]
+    fn test_valid_for_embedding() {
+        // codex는 파싱 전용, claude는 임베딩 미지원 → 임베딩 불가.
+        assert!(ProviderType::Gemini.valid_for_embedding());
+        assert!(ProviderType::OpenAi.valid_for_embedding());
+        assert!(ProviderType::Local.valid_for_embedding());
+        assert!(!ProviderType::Codex.valid_for_embedding());
+        assert!(!ProviderType::Claude.valid_for_embedding());
+    }
+
+    #[test]
+    fn test_uses_api_key() {
+        // 키 등록 경로를 쓰는 provider만 true. codex(import)/local(불요)은 false.
+        assert!(ProviderType::Gemini.uses_api_key());
+        assert!(ProviderType::Claude.uses_api_key());
+        assert!(ProviderType::OpenAi.uses_api_key());
+        assert!(!ProviderType::Codex.uses_api_key());
+        assert!(!ProviderType::Local.uses_api_key());
+    }
+
+    #[test]
+    fn test_provider_display_and_serde() {
+        // Display와 serde(rename lowercase)가 일치해야 프론트/설정 왕복이 안전하다.
+        assert_eq!(ProviderType::Codex.to_string(), "codex");
+        assert_eq!(ProviderType::Local.to_string(), "local");
+        assert_eq!(
+            serde_json::to_string(&ProviderType::Codex).unwrap(),
+            "\"codex\""
+        );
+        assert_eq!(
+            serde_json::from_str::<ProviderType>("\"local\"").unwrap(),
+            ProviderType::Local
+        );
+    }
+
+    #[test]
+    fn test_key_based_factories_reject_codex_local() {
+        // codex/local은 키 팩토리로 만들 수 없다(전용 경로 강제 — 침묵 실패 금지).
+        assert!(create_llm_provider(ProviderType::Codex, "k".into()).is_err());
+        assert!(create_llm_provider(ProviderType::Local, "k".into()).is_err());
+        assert!(create_embedding_provider(ProviderType::Codex, "k".into()).is_err());
+        assert!(create_embedding_provider(ProviderType::Local, "k".into()).is_err());
+        // claude 임베딩은 미지원.
+        assert!(create_embedding_provider(ProviderType::Claude, "k".into()).is_err());
     }
 
     /// 무응답(블랙홀) 서버에 대한 요청이 타임아웃으로 실패하는지 검증한다.

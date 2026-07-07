@@ -12,7 +12,10 @@ use crate::core::search_agent::{
     expansion_score, DeepSearchParams, ExpandOrigin, SearchAgent, SearchBackend,
     DEFAULT_DEEP_SEARCH_MAX_RESULTS,
 };
-use crate::llm::{create_llm_provider, create_embedding_provider, LlmProvider, EmbeddingProvider};
+use crate::llm::{
+    build_http_client, create_embedding_provider, create_llm_provider, CodexProvider,
+    EmbeddingProvider, LlmProvider, LocalEmbeddingProvider, ProviderType,
+};
 use crate::models::{Document, DocumentSource, Edge, RelationType, api::{AgentSearchMeta, IngestResponse, IngestOutcome, SearchResponse, SearchResult}};
 use crate::patrol::decay::apply_edge_decay;
 use crate::settings::SettingsManager;
@@ -65,32 +68,71 @@ impl Indexer {
         }
     }
 
-    /// 현재 설정에 맞는 LLM Provider 생성
+    /// 현재 설정의 파싱 provider로 LLM Provider 생성
     async fn get_llm_provider(&self) -> Result<Box<dyn LlmProvider>> {
-        let settings = self.settings.get().await;
-        let provider_type = settings.parsing_provider;
-
-        let api_key = settings
-            .api_keys
-            .get(&provider_type)
-            .cloned()
-            .ok_or_else(|| anyhow!("API key for {} is not configured", provider_type))?;
-
-        Ok(create_llm_provider(provider_type, api_key))
+        let provider_type = self.settings.get().await.parsing_provider;
+        self.llm_provider_for(provider_type).await
     }
 
-    /// 현재 설정에 맞는 Embedding Provider 생성
+    /// 지정한 provider 타입으로 LLM Provider를 조립한다(검증 엔드포인트에서도 재사용).
+    ///
+    /// codex는 단순 키가 아니라 토큰 저장소(SettingsManager) 컨텍스트를 **공유**해야
+    /// 단일 플라이트 refresh가 성립하므로 전용 경로로 만든다. local은 파싱 불가.
+    pub async fn llm_provider_for(
+        &self,
+        provider_type: ProviderType,
+    ) -> Result<Box<dyn LlmProvider>> {
+        match provider_type {
+            ProviderType::Codex => Ok(Box::new(CodexProvider::new(
+                self.settings.clone(),
+                build_http_client(),
+            ))),
+            ProviderType::Local => {
+                Err(anyhow!("local은 임베딩 전용입니다 (파싱 provider로 사용 불가)"))
+            }
+            key_based => {
+                let api_key = self
+                    .settings
+                    .get_api_key(key_based)
+                    .await
+                    .ok_or_else(|| anyhow!("API key for {} is not configured", key_based))?;
+                create_llm_provider(key_based, api_key)
+            }
+        }
+    }
+
+    /// 현재 설정의 임베딩 provider로 Embedding Provider 생성
     async fn get_embedding_provider(&self) -> Result<Box<dyn EmbeddingProvider>> {
-        let settings = self.settings.get().await;
-        let provider_type = settings.embedding_provider;
+        let provider_type = self.settings.get().await.embedding_provider;
+        self.embedding_provider_for(provider_type).await
+    }
 
-        let api_key = settings
-            .api_keys
-            .get(&provider_type)
-            .cloned()
-            .ok_or_else(|| anyhow!("API key for {} is not configured", provider_type))?;
-
-        Ok(create_embedding_provider(provider_type, api_key))
+    /// 지정한 provider 타입으로 Embedding Provider를 조립한다(검증 엔드포인트 재사용).
+    ///
+    /// 생성 시 provider의 임베딩 차원을 Qdrant 기대 차원과 동기화한다 — 이후 컬렉션
+    /// 대조가 provider 전환(차원 변경)을 즉시 감지해 "reindex 필요" 에러를 낸다(FR4).
+    pub async fn embedding_provider_for(
+        &self,
+        provider_type: ProviderType,
+    ) -> Result<Box<dyn EmbeddingProvider>> {
+        let provider: Box<dyn EmbeddingProvider> = match provider_type {
+            ProviderType::Local => {
+                Box::new(LocalEmbeddingProvider::new(self.settings.models_dir()))
+            }
+            ProviderType::Codex => {
+                return Err(anyhow!("codex는 임베딩 provider로 사용할 수 없습니다"))
+            }
+            key_based => {
+                let api_key = self
+                    .settings
+                    .get_api_key(key_based)
+                    .await
+                    .ok_or_else(|| anyhow!("API key for {} is not configured", key_based))?;
+                create_embedding_provider(key_based, api_key)?
+            }
+        };
+        self.qdrant.set_target_dim(provider.dimension() as u64).await;
+        Ok(provider)
     }
 
     /// ParsedContent + summary 텍스트로부터 ChunkData 벡터를 생성
@@ -506,7 +548,8 @@ impl Indexer {
         workspace_id: &str,
     ) -> Result<Vec<CandidateDoc>> {
         let embedder = self.get_embedding_provider().await?;
-        let query_embedding = embedder.embed(content).await?;
+        // 후보 탐색은 쿼리 임베딩 경로(e5 계열은 query: 접두).
+        let query_embedding = embedder.embed_query(content).await?;
         // 같은 문서의 여러 chunk가 히트할 수 있어 넉넉히 over-fetch 후 document 단위로 dedup.
         let hits = self
             .qdrant
@@ -660,7 +703,8 @@ impl Indexer {
         workspace_id: &str,
     ) -> Result<(Vec<SearchResult>, usize)> {
         let embedder = self.get_embedding_provider().await?;
-        let query_embedding = embedder.embed(query).await?;
+        // 검색 쿼리는 쿼리 임베딩 경로(e5 계열은 query: 접두 — 문서 인덱싱과 대칭).
+        let query_embedding = embedder.embed_query(query).await?;
 
         // over-fetch: 같은 문서의 여러 chunk가 히트할 수 있으므로
         let hits = self.qdrant.search(workspace_id, query_embedding, limit * 5).await?;
@@ -770,6 +814,15 @@ impl Indexer {
         limit: usize,
         workspace_id: &str,
     ) -> Result<(Vec<SearchResult>, usize)> {
+        // 차원 불일치 사전 감지(FR4): 하이브리드는 아래에서 vector/keyword의 개별
+        // 실패를 graceful하게 삼키므로(unwrap_or), 그대로 두면 차원 불일치가 "빈 결과"로
+        // 침묵된다(기본 검색 모드가 hybrid이라 치명적). 임베딩 provider가 가용할 때만
+        // 컬렉션 차원을 대조해 불일치면 "reindex 필요" 에러를 명시적으로 올린다. provider
+        // 구성 실패(키 미설정 등 별개 문제)는 여기서 삼켜 기존 keyword 폴백을 보존한다.
+        if self.get_embedding_provider().await.is_ok() {
+            self.qdrant.ensure_collection(workspace_id).await?;
+        }
+
         // 병렬로 두 검색 수행
         let (vector_results, keyword_results) = tokio::join!(
             self.vector_search(query, limit * 2, workspace_id),
@@ -1319,25 +1372,60 @@ impl Indexer {
     }
 
     /// 특정 워크스페이스의 Qdrant 컬렉션을 재인덱싱한다.
+    ///
+    /// **차원 마이그레이션(FR4):** embedder를 먼저 확보해 Qdrant 기대 차원을 현재
+    /// provider 차원으로 동기화한 뒤 컬렉션을 재생성한다. 따라서 gemini(3072)→
+    /// local(384) 전환 후 이 한 번의 reindex로 컬렉션이 새 차원으로 재생성되고
+    /// raw JSON(SSoT) 전량이 재임베딩된다. 문서 0건이어도 컬렉션은 새 차원으로
+    /// 재생성해, 이후 유입이 차원 불일치로 실패하지 않게 한다.
     pub async fn reindex_workspace(&self, workspace_id: &str) -> Result<usize> {
-        let docs = self.documents.list_recent(10000, workspace_id).await?;
+        // 상한 없이 raw JSON(SSoT) **전량**을 적재한다. list_recent는 created_at 내림차순
+        // 정렬 후 truncate하므로, 유한 상한을 두면 컬렉션을 drop한 뒤 가장 **오래된** 문서
+        // (인공두뇌의 초기 기반 기억)를 검색 인덱스에서 소리 없이 절단한다 — "문서 수 손실 0"
+        // AC와 "침묵 금지" 원칙 정면 위반. 자매 함수 all_documents / decay_workspace_edges도
+        // 동일하게 usize::MAX를 쓴다(개인 규모에서 전 문서를 담기 충분).
+        let docs = self.documents.list_recent(usize::MAX, workspace_id).await?;
         let total = docs.len();
+
+        // embedder를 먼저 확보 — 이 호출이 Qdrant 기대 차원을 현재 provider로 맞춘다.
+        let embedder = self.get_embedding_provider().await?;
+
+        // 컬렉션 재생성 (구 스키마/구 차원 orphan 정리 → 현재 차원으로 생성).
+        self.qdrant.recreate_collection(workspace_id).await?;
 
         if total == 0 {
             return Ok(0);
         }
 
-        // 컬렉션 재생성 (구 스키마 orphan 포인트 정리)
-        self.qdrant.recreate_collection(workspace_id).await?;
-
-        let embedder = self.get_embedding_provider().await?;
         let mut indexed = 0;
+        let mut skipped = 0; // 스냅샷 이후 삭제되어 부활을 막은 문서 수(관측용)
 
         for doc in docs {
             // summary + facts 임베딩 (facts가 비어있으면 summary chunk만)
             match self.build_chunks(embedder.as_ref(), &doc.summary, &doc.facts).await {
                 Ok(chunks) => {
                     let chunk_count = chunks.len();
+
+                    // **부활 방지(SSoT 재확인) — reindex도 "삭제=삭제" 불변식을 지킨다.**
+                    // `docs`는 T0 스냅샷이라, reindex 루프(로컬 임베딩은 문서별 직렬 → 수 분)가
+                    // 도는 동안 소유자/Review Queue가 이 문서를 삭제(delete_from_workspace →
+                    // raw JSON SSoT 제거)했을 수 있다. stale 스냅샷을 그대로 upsert하면 소유자가
+                    // 의도적으로 파기한 지식이 새 컬렉션에 **부활**한다 — search는 반환하나
+                    // get_document는 404(SSoT/파생 인덱스 영구 불일치). delete가 raw 제거를
+                    // write_lock으로 직렬화하므로 exists=false는 삭제 확정을 뜻한다. upsert 직전에
+                    // 재확인해 **지금 살아있는 문서만** 인덱싱하고, 동시 유입이 남긴 chunk가 있으면
+                    // delete_by_document_id로 현재 SSoT 기준 reconcile한다. 침묵 금지: skip을
+                    // warn으로 관측 신호화한다. (재확인~upsert 사이 극소 창에 삭제가 끼면 stale이
+                    // 남을 수 있으나, raw는 SSoT로 온전하고 재-reindex로 복원된다 — 정보 유실 0 유지.)
+                    if !self.documents.exists(doc.id, workspace_id).await {
+                        skipped += 1;
+                        if let Err(e) = self.qdrant.delete_by_document_id(workspace_id, doc.id).await {
+                            tracing::error!("Failed to reconcile deleted {}: {}", doc.id, e);
+                        }
+                        tracing::warn!("Skipped reindex of {} — 스냅샷 이후 삭제됨(부활 방지)", doc.id);
+                        continue;
+                    }
+
                     // reindex 엣지 생존의 핵심: raw JSON의 edges를 payload로 복원한다.
                     if let Err(e) = self.qdrant.upsert_chunks(
                         workspace_id,
@@ -1359,7 +1447,14 @@ impl Indexer {
             }
         }
 
-        tracing::info!("Reindex complete: {}/{} documents", indexed, total);
+        if skipped > 0 {
+            tracing::warn!(
+                "Reindex complete: {}/{} indexed, {} skipped (스냅샷 이후 삭제 — 부활 방지)",
+                indexed, total, skipped
+            );
+        } else {
+            tracing::info!("Reindex complete: {}/{} documents", indexed, total);
+        }
         Ok(indexed)
     }
 
@@ -1804,6 +1899,55 @@ mod tests {
             workspaces: workspaces.iter().map(|s| s.to_string()).collect(),
             is_master: false,
         }
+    }
+
+    /// 파싱·임베딩 provider가 **하나도 설정되지 않은** Indexer를 tempdir로 조립한다.
+    ///
+    /// 기본 설정은 gemini(파싱/임베딩)인데 API 키가 없으므로 `get_llm_provider`/
+    /// `get_embedding_provider`가 네트워크 없이 즉시 Err를 낸다 — "provider 미확보"라는
+    /// 실 장애 모드(키 삭제/전환 중)를 그대로 재현한다. Qdrant 클라이언트는 lazy라 RPC가
+    /// 없으면 연결하지 않으므로, 이 경로가 절대 닿지 않는 표준 URL로 구성만 성립시킨다.
+    async fn indexer_without_providers() -> (tempfile::TempDir, Indexer) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let data_dir = tmp.path().to_str().unwrap();
+        let settings = Arc::new(SettingsManager::new(data_dir).await.unwrap());
+        let qdrant = Arc::new(QdrantStorage::new("http://127.0.0.1:6333").await.unwrap());
+        let documents = Arc::new(DocumentStore::new(tmp.path()).await.unwrap());
+        let versions = Arc::new(VersionStore::new(tmp.path()));
+        let indexer = Indexer::new(settings, qdrant, documents, versions);
+        (tmp, indexer)
+    }
+
+    #[tokio::test]
+    async fn test_smart_ingest_preserves_raw_when_providers_unavailable() {
+        // **정보 유실 0 (최상위 불변식) 회귀 테스트.**
+        // 파싱·임베딩이 어떤 방식으로 실패해도 원문은 절대 사라지면 안 된다(PRD AC). Phase 6의
+        // 신규 실패 모드(claude OAuth 거절 / codex refresh 실패 / local 모델 init 실패)는 모두
+        // 동일한 get_llm/embedding_provider **미확보** 경로로 수렴하므로, 그 경로를 provider
+        // 미설정으로 재현해 불변식을 자동 회귀로 잠근다. smart_ingest는 LLM provider 확보 실패 시
+        // raw_fallback → persist_raw_document로 원문을 SSoT(DocumentStore)에 **선기록**하고,
+        // best_effort_index는 임베딩 provider가 없으면 Qdrant에 닿기 전에 조용히 빠져나온다 —
+        // 따라서 외부 서비스가 전면 장애여도 디스크에는 원문이 남는다.
+        let (_tmp, indexer) = indexer_without_providers().await;
+        let raw = "소유자의 잃어서는 안 될 원문 지식".to_string();
+
+        let outcome = indexer
+            .smart_ingest_to_workspace(raw.clone(), "default")
+            .await
+            .expect("provider 미확보는 에러가 아니라 raw 폴백으로 흡수되어야 한다(정보 유실 0)");
+
+        // 폴백이 명시적으로 신고되어야 한다(침묵 금지 — 응답 메타에 드러난다).
+        assert!(outcome.fallback, "provider 미확보 시 fallback=true여야 한다");
+        assert_eq!(outcome.strategy, "raw", "폴백 전략은 raw여야 한다");
+        assert_eq!(outcome.document_ids, vec![outcome.id], "raw 문서 1건이 기록되어야 한다");
+
+        // **핵심 단언: 원문이 SSoT(디스크)에 실제로 보존되었다.**
+        let saved = indexer
+            .documents
+            .load(outcome.id, "default")
+            .await
+            .expect("원문이 DocumentStore(SSoT)에 저장되어 로드 가능해야 한다");
+        assert_eq!(saved.raw_content, raw, "저장된 원문이 입력과 정확히 일치해야 한다");
     }
 
     #[test]
