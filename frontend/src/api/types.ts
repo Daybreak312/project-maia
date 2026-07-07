@@ -97,10 +97,26 @@ export interface ProviderInfo {
   api_key_preview: string | null;
 }
 
+/** Codex(구독 OAuth) 상태 — 키가 아니라 auth.json 임포트 기반. */
+export interface CodexStatus {
+  has_auth: boolean;
+  account_preview: string | null;
+  last_refresh: string | null;
+}
+
+/** 로컬 임베딩 상태 — 키 불요, 모델/차원/캐시 준비 여부. */
+export interface LocalStatus {
+  model: string;
+  dim: number;
+  cache_ready: boolean;
+}
+
 export interface SettingsResponse {
   providers: ProviderInfo[];
   parsing_provider: string | null;
   embedding_provider: string | null;
+  codex: CodexStatus;
+  local: LocalStatus;
 }
 
 // ─── 워크스페이스 ────────────────────────────────────────────────

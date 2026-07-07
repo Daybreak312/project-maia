@@ -170,6 +170,13 @@ export const api = {
       method: 'POST',
     }),
 
+  // Codex auth.json 임포트 (원문 문자열을 래퍼로 전달 — 서버가 파싱/검증)
+  importCodex: (authJson: string) =>
+    request<SettingsResponse>('/api/settings/models/codex/import', {
+      method: 'POST',
+      body: JSON.stringify({ auth_json: authJson }),
+    }),
+
   // Reindex (현재 워크스페이스 대상)
   reindex: () =>
     request<{ indexed: number }>(withWorkspace('/api/reindex'), {
