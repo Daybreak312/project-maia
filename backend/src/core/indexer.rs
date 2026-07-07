@@ -12,7 +12,10 @@ use crate::core::search_agent::{
     expansion_score, DeepSearchParams, ExpandOrigin, SearchAgent, SearchBackend,
     DEFAULT_DEEP_SEARCH_MAX_RESULTS,
 };
-use crate::llm::{create_llm_provider, create_embedding_provider, LlmProvider, EmbeddingProvider};
+use crate::llm::{
+    build_http_client, create_embedding_provider, create_llm_provider, CodexProvider,
+    EmbeddingProvider, LlmProvider, LocalEmbeddingProvider, ProviderType,
+};
 use crate::models::{Document, DocumentSource, Edge, RelationType, api::{AgentSearchMeta, IngestResponse, IngestOutcome, SearchResponse, SearchResult}};
 use crate::patrol::decay::apply_edge_decay;
 use crate::settings::SettingsManager;
@@ -65,32 +68,71 @@ impl Indexer {
         }
     }
 
-    /// 현재 설정에 맞는 LLM Provider 생성
+    /// 현재 설정의 파싱 provider로 LLM Provider 생성
     async fn get_llm_provider(&self) -> Result<Box<dyn LlmProvider>> {
-        let settings = self.settings.get().await;
-        let provider_type = settings.parsing_provider;
-
-        let api_key = settings
-            .api_keys
-            .get(&provider_type)
-            .cloned()
-            .ok_or_else(|| anyhow!("API key for {} is not configured", provider_type))?;
-
-        Ok(create_llm_provider(provider_type, api_key))
+        let provider_type = self.settings.get().await.parsing_provider;
+        self.llm_provider_for(provider_type).await
     }
 
-    /// 현재 설정에 맞는 Embedding Provider 생성
+    /// 지정한 provider 타입으로 LLM Provider를 조립한다(검증 엔드포인트에서도 재사용).
+    ///
+    /// codex는 단순 키가 아니라 토큰 저장소(SettingsManager) 컨텍스트를 **공유**해야
+    /// 단일 플라이트 refresh가 성립하므로 전용 경로로 만든다. local은 파싱 불가.
+    pub async fn llm_provider_for(
+        &self,
+        provider_type: ProviderType,
+    ) -> Result<Box<dyn LlmProvider>> {
+        match provider_type {
+            ProviderType::Codex => Ok(Box::new(CodexProvider::new(
+                self.settings.clone(),
+                build_http_client(),
+            ))),
+            ProviderType::Local => {
+                Err(anyhow!("local은 임베딩 전용입니다 (파싱 provider로 사용 불가)"))
+            }
+            key_based => {
+                let api_key = self
+                    .settings
+                    .get_api_key(key_based)
+                    .await
+                    .ok_or_else(|| anyhow!("API key for {} is not configured", key_based))?;
+                create_llm_provider(key_based, api_key)
+            }
+        }
+    }
+
+    /// 현재 설정의 임베딩 provider로 Embedding Provider 생성
     async fn get_embedding_provider(&self) -> Result<Box<dyn EmbeddingProvider>> {
-        let settings = self.settings.get().await;
-        let provider_type = settings.embedding_provider;
+        let provider_type = self.settings.get().await.embedding_provider;
+        self.embedding_provider_for(provider_type).await
+    }
 
-        let api_key = settings
-            .api_keys
-            .get(&provider_type)
-            .cloned()
-            .ok_or_else(|| anyhow!("API key for {} is not configured", provider_type))?;
-
-        Ok(create_embedding_provider(provider_type, api_key))
+    /// 지정한 provider 타입으로 Embedding Provider를 조립한다(검증 엔드포인트 재사용).
+    ///
+    /// 생성 시 provider의 임베딩 차원을 Qdrant 기대 차원과 동기화한다 — 이후 컬렉션
+    /// 대조가 provider 전환(차원 변경)을 즉시 감지해 "reindex 필요" 에러를 낸다(FR4).
+    pub async fn embedding_provider_for(
+        &self,
+        provider_type: ProviderType,
+    ) -> Result<Box<dyn EmbeddingProvider>> {
+        let provider: Box<dyn EmbeddingProvider> = match provider_type {
+            ProviderType::Local => {
+                Box::new(LocalEmbeddingProvider::new(self.settings.models_dir()))
+            }
+            ProviderType::Codex => {
+                return Err(anyhow!("codex는 임베딩 provider로 사용할 수 없습니다"))
+            }
+            key_based => {
+                let api_key = self
+                    .settings
+                    .get_api_key(key_based)
+                    .await
+                    .ok_or_else(|| anyhow!("API key for {} is not configured", key_based))?;
+                create_embedding_provider(key_based, api_key)?
+            }
+        };
+        self.qdrant.set_target_dim(provider.dimension() as u64).await;
+        Ok(provider)
     }
 
     /// ParsedContent + summary 텍스트로부터 ChunkData 벡터를 생성
@@ -506,7 +548,8 @@ impl Indexer {
         workspace_id: &str,
     ) -> Result<Vec<CandidateDoc>> {
         let embedder = self.get_embedding_provider().await?;
-        let query_embedding = embedder.embed(content).await?;
+        // 후보 탐색은 쿼리 임베딩 경로(e5 계열은 query: 접두).
+        let query_embedding = embedder.embed_query(content).await?;
         // 같은 문서의 여러 chunk가 히트할 수 있어 넉넉히 over-fetch 후 document 단위로 dedup.
         let hits = self
             .qdrant
@@ -660,7 +703,8 @@ impl Indexer {
         workspace_id: &str,
     ) -> Result<(Vec<SearchResult>, usize)> {
         let embedder = self.get_embedding_provider().await?;
-        let query_embedding = embedder.embed(query).await?;
+        // 검색 쿼리는 쿼리 임베딩 경로(e5 계열은 query: 접두 — 문서 인덱싱과 대칭).
+        let query_embedding = embedder.embed_query(query).await?;
 
         // over-fetch: 같은 문서의 여러 chunk가 히트할 수 있으므로
         let hits = self.qdrant.search(workspace_id, query_embedding, limit * 5).await?;
@@ -1319,18 +1363,26 @@ impl Indexer {
     }
 
     /// 특정 워크스페이스의 Qdrant 컬렉션을 재인덱싱한다.
+    ///
+    /// **차원 마이그레이션(FR4):** embedder를 먼저 확보해 Qdrant 기대 차원을 현재
+    /// provider 차원으로 동기화한 뒤 컬렉션을 재생성한다. 따라서 gemini(3072)→
+    /// local(384) 전환 후 이 한 번의 reindex로 컬렉션이 새 차원으로 재생성되고
+    /// raw JSON(SSoT) 전량이 재임베딩된다. 문서 0건이어도 컬렉션은 새 차원으로
+    /// 재생성해, 이후 유입이 차원 불일치로 실패하지 않게 한다.
     pub async fn reindex_workspace(&self, workspace_id: &str) -> Result<usize> {
         let docs = self.documents.list_recent(10000, workspace_id).await?;
         let total = docs.len();
+
+        // embedder를 먼저 확보 — 이 호출이 Qdrant 기대 차원을 현재 provider로 맞춘다.
+        let embedder = self.get_embedding_provider().await?;
+
+        // 컬렉션 재생성 (구 스키마/구 차원 orphan 정리 → 현재 차원으로 생성).
+        self.qdrant.recreate_collection(workspace_id).await?;
 
         if total == 0 {
             return Ok(0);
         }
 
-        // 컬렉션 재생성 (구 스키마 orphan 포인트 정리)
-        self.qdrant.recreate_collection(workspace_id).await?;
-
-        let embedder = self.get_embedding_provider().await?;
         let mut indexed = 0;
 
         for doc in docs {

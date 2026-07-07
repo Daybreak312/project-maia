@@ -14,12 +14,31 @@ use uuid::Uuid;
 
 use crate::models::Edge;
 
-const VECTOR_SIZE: u64 = 3072; // Gemini embedding-001 dimension
+/// 기본/레거시 임베딩 차원 (Gemini embedding-001 = 3072). 최초 기대 차원이며,
+/// 임베딩 provider가 확정되면 `set_target_dim`으로 현재 provider 차원에 맞춘다(FR4).
+const VECTOR_SIZE: u64 = 3072;
 
 /// 워크스페이스 ID로부터 Qdrant 컬렉션 이름을 생성한다.
 /// 규칙: `documents_{workspace_id}`
 pub fn collection_name(workspace_id: &str) -> String {
     format!("documents_{}", workspace_id)
+}
+
+/// 기존 컬렉션 차원과 현재 provider 기대 차원을 대조한다(순수 함수 — 단위 테스트 대상).
+///
+/// - 컬렉션이 없으면(None) 통과 — 신규 생성 예정.
+/// - 차원이 일치하면 통과.
+/// - 불일치면 **침묵 실패·자동 재생성 없이** 명시적 에러(FR4). 재생성은 reindex의
+///   명시적 책임이므로 여기서 데이터를 날리지 않는다.
+fn dimension_check(existing: Option<u64>, target: u64) -> Result<()> {
+    if let Some(dim) = existing {
+        if dim != target {
+            anyhow::bail!(
+                "embedding dimension mismatch (collection={dim}d, provider={target}d) — run POST /api/reindex"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// 하나의 chunk(summary 또는 fact)에 대한 임베딩 데이터
@@ -32,8 +51,12 @@ pub struct ChunkData {
 
 pub struct QdrantStorage {
     client: Qdrant,
-    /// 이미 존재를 확인한 컬렉션 캐시 (불필요한 Qdrant API 호출 방지)
+    /// 이미 존재+차원 일치를 확인한 컬렉션 캐시 (불필요한 Qdrant API 호출 방지).
+    /// `set_target_dim`이 차원 변경 시 이 캐시를 비워, 캐시된 항목은 항상 현재
+    /// 기대 차원과 일치가 확인된 것임을 보장한다.
     ensured_collections: RwLock<HashSet<String>>,
+    /// 현재 임베딩 provider가 기대하는 벡터 차원. 컬렉션 생성·대조의 기준.
+    target_dim: RwLock<u64>,
 }
 
 impl QdrantStorage {
@@ -45,15 +68,48 @@ impl QdrantStorage {
             .build()
             .context("Failed to create Qdrant client")?;
 
-        let storage = Self {
+        // default 컬렉션 보장은 **lazy**로 미룬다(new에서 강제하지 않음). 시작 시점의
+        // 기대 차원(VECTOR_SIZE)이 이미 마이그레이션된 컬렉션의 실제 차원과 다르면
+        // 여기서 대조 에러가 나 서버가 못 뜨는 문제를 피한다. 컬렉션은 최초 검색/유입
+        // (ensure_collection 경유) 시 현재 provider 차원으로 보장된다.
+        Ok(Self {
             client,
             ensured_collections: RwLock::new(HashSet::new()),
-        };
+            target_dim: RwLock::new(VECTOR_SIZE),
+        })
+    }
 
-        // 하위 호환: default 워크스페이스 컬렉션 보장
-        storage.ensure_collection("default").await?;
+    /// 현재 임베딩 provider가 기대하는 벡터 차원을 설정한다(FR4).
+    ///
+    /// 차원이 바뀌면 "존재+차원 일치" 캐시를 무효화해, 다음 ensure가 실제 컬렉션과
+    /// 다시 대조하도록 한다(전환 후 첫 검색이 불일치를 즉시 감지).
+    pub async fn set_target_dim(&self, dim: u64) {
+        let mut cur = self.target_dim.write().await;
+        if *cur != dim {
+            *cur = dim;
+            self.ensured_collections.write().await.clear();
+            tracing::info!("Qdrant 기대 임베딩 차원 변경: {}", dim);
+        }
+    }
 
-        Ok(storage)
+    /// 컬렉션의 실제 벡터 차원을 조회한다(없으면 None). named-vector 구성은 None.
+    async fn collection_dim(&self, col_name: &str) -> Result<Option<u64>> {
+        let info = self
+            .client
+            .collection_info(col_name)
+            .await
+            .context("Failed to fetch collection info")?;
+        let dim = info
+            .result
+            .and_then(|r| r.config)
+            .and_then(|c| c.params)
+            .and_then(|p| p.vectors_config)
+            .and_then(|vc| vc.config)
+            .and_then(|cfg| match cfg {
+                Config::Params(vp) => Some(vp.size),
+                Config::ParamsMap(_) => None,
+            });
+        Ok(dim)
     }
 
     /// 특정 워크스페이스의 컬렉션이 존재하는지 확인하고, 없으면 생성한다.
@@ -69,6 +125,8 @@ impl QdrantStorage {
             }
         }
 
+        let target = *self.target_dim.read().await;
+
         // Qdrant에서 실제 존재 여부 확인
         let collections = self.client.list_collections().await?;
         let exists = collections
@@ -82,14 +140,20 @@ impl QdrantStorage {
                     CreateCollectionBuilder::new(&col_name)
                         .vectors_config(VectorsConfig {
                             config: Some(Config::Params(
-                                VectorParamsBuilder::new(VECTOR_SIZE, Distance::Cosine).build()
+                                VectorParamsBuilder::new(target, Distance::Cosine).build()
                             )),
                         })
                 )
                 .await
                 .context("Failed to create collection")?;
 
-            tracing::info!("Created Qdrant collection: {}", col_name);
+            tracing::info!("Created Qdrant collection: {} (dim={})", col_name, target);
+        } else {
+            // 존재하면 차원을 대조한다. 불일치면 명시적 "reindex 필요" 에러(FR4).
+            // 이 캐시 미스 경로에서만 대조하고, 통과하면 아래에서 캐시에 넣어 이후
+            // 호출은 빠르게 리턴한다(캐시는 set_target_dim이 차원 변경 시 비운다).
+            let existing_dim = self.collection_dim(&col_name).await?;
+            dimension_check(existing_dim, target)?;
         }
 
         // payload index 생성 (이미 존재하면 무시됨)
@@ -120,7 +184,11 @@ impl QdrantStorage {
         Ok(())
     }
 
-    /// 컬렉션을 삭제 후 재생성 (reindex 시 구 스키마 데이터 정리용)
+    /// 컬렉션을 삭제 후 재생성한다 (reindex 시 구 스키마/구 차원 데이터 정리용).
+    ///
+    /// 재생성은 `ensure_collection`을 거치므로 **현재 `target_dim`**으로 만들어진다
+    /// — 차원 마이그레이션(예: 3072→384)의 실행 지점(FR4). 호출 전에 embedder를
+    /// 확보해 `set_target_dim`이 선행돼야 새 차원이 반영된다.
     pub async fn recreate_collection(&self, workspace_id: &str) -> Result<()> {
         let col_name = collection_name(workspace_id);
         tracing::info!("Dropping and recreating Qdrant collection: {}", col_name);
@@ -247,6 +315,9 @@ impl QdrantStorage {
         query_embedding: Vec<f32>,
         limit: usize,
     ) -> Result<Vec<SearchHit>> {
+        // 컬렉션 존재·차원 대조를 먼저 수행한다. 차원 불일치면 여기서 "reindex 필요"
+        // 에러가 나 침묵 실패를 막는다(FR4). 없으면 현재 차원으로 생성(빈 검색).
+        self.ensure_collection(workspace_id).await?;
         let col_name = collection_name(workspace_id);
 
         let search_builder = SearchPointsBuilder::new(&col_name, query_embedding, limit as u64)
@@ -354,6 +425,8 @@ impl QdrantStorage {
         workspace_id: &str,
         chunk_type_filter: Option<&str>,
     ) -> Result<Vec<SearchHit>> {
+        // 키워드 검색 경로도 컬렉션 존재·차원 대조를 거친다(없으면 생성 → 빈 결과).
+        self.ensure_collection(workspace_id).await?;
         let col_name = collection_name(workspace_id);
         let mut all_hits = Vec::new();
         let mut offset: Option<PointId> = None;
@@ -523,6 +596,34 @@ fn merge_cross_workspace_results(workspace_results: Vec<Vec<SearchHit>>, k: f32)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ──── 차원 대조 (FR4 마이그레이션 불변식) ────
+
+    #[test]
+    fn test_dimension_check_missing_collection_passes() {
+        // 컬렉션이 없으면(None) 통과 — 신규 생성 예정.
+        assert!(dimension_check(None, 384).is_ok());
+    }
+
+    #[test]
+    fn test_dimension_check_matching_passes() {
+        assert!(dimension_check(Some(3072), 3072).is_ok());
+        assert!(dimension_check(Some(384), 384).is_ok());
+    }
+
+    #[test]
+    fn test_dimension_check_mismatch_errors_with_reindex_hint() {
+        // gemini(3072) 인덱스 상태에서 local(384)로 전환 후 reindex 전 → 명시적 에러.
+        let err = dimension_check(Some(3072), 384).unwrap_err().to_string();
+        assert!(
+            err.contains("dimension mismatch"),
+            "차원 불일치를 명시해야 한다: {err}"
+        );
+        assert!(
+            err.contains("reindex"),
+            "reindex 필요를 안내해야 한다(침묵 실패 금지): {err}"
+        );
+    }
 
     // ──── collection_name 생성 규칙 ────
 

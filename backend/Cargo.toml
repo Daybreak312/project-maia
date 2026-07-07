@@ -30,6 +30,13 @@ unicode-segmentation = "1.10"
 # Crypto (API Key hashing)
 sha2 = "0.10"
 
+# Base64 (Codex JWT exp 파싱 — base64url payload 디코딩)
+base64 = "0.22"
+
+# 로컬 임베딩 (multilingual-e5-small, onnxruntime 기반. ort download-binaries로
+# 프리빌트 onnxruntime 바이너리를 빌드시 내려받는다 — 외부 모델은 런타임 lazy 다운로드).
+fastembed = "5"
+
 # Async utilities
 futures = "0.3"
 
@@ -45,3 +52,5 @@ dotenvy = "0.15"
 
 [dev-dependencies]
 tempfile = "3"
+# 외부 HTTP mock (Claude OAuth·Codex refresh/responses 상태머신 테스트 — 라이브 토큰 금지)
+wiremock = "0.6"
