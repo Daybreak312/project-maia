@@ -1398,12 +1398,34 @@ impl Indexer {
         }
 
         let mut indexed = 0;
+        let mut skipped = 0; // 스냅샷 이후 삭제되어 부활을 막은 문서 수(관측용)
 
         for doc in docs {
             // summary + facts 임베딩 (facts가 비어있으면 summary chunk만)
             match self.build_chunks(embedder.as_ref(), &doc.summary, &doc.facts).await {
                 Ok(chunks) => {
                     let chunk_count = chunks.len();
+
+                    // **부활 방지(SSoT 재확인) — reindex도 "삭제=삭제" 불변식을 지킨다.**
+                    // `docs`는 T0 스냅샷이라, reindex 루프(로컬 임베딩은 문서별 직렬 → 수 분)가
+                    // 도는 동안 소유자/Review Queue가 이 문서를 삭제(delete_from_workspace →
+                    // raw JSON SSoT 제거)했을 수 있다. stale 스냅샷을 그대로 upsert하면 소유자가
+                    // 의도적으로 파기한 지식이 새 컬렉션에 **부활**한다 — search는 반환하나
+                    // get_document는 404(SSoT/파생 인덱스 영구 불일치). delete가 raw 제거를
+                    // write_lock으로 직렬화하므로 exists=false는 삭제 확정을 뜻한다. upsert 직전에
+                    // 재확인해 **지금 살아있는 문서만** 인덱싱하고, 동시 유입이 남긴 chunk가 있으면
+                    // delete_by_document_id로 현재 SSoT 기준 reconcile한다. 침묵 금지: skip을
+                    // warn으로 관측 신호화한다. (재확인~upsert 사이 극소 창에 삭제가 끼면 stale이
+                    // 남을 수 있으나, raw는 SSoT로 온전하고 재-reindex로 복원된다 — 정보 유실 0 유지.)
+                    if !self.documents.exists(doc.id, workspace_id).await {
+                        skipped += 1;
+                        if let Err(e) = self.qdrant.delete_by_document_id(workspace_id, doc.id).await {
+                            tracing::error!("Failed to reconcile deleted {}: {}", doc.id, e);
+                        }
+                        tracing::warn!("Skipped reindex of {} — 스냅샷 이후 삭제됨(부활 방지)", doc.id);
+                        continue;
+                    }
+
                     // reindex 엣지 생존의 핵심: raw JSON의 edges를 payload로 복원한다.
                     if let Err(e) = self.qdrant.upsert_chunks(
                         workspace_id,
@@ -1425,7 +1447,14 @@ impl Indexer {
             }
         }
 
-        tracing::info!("Reindex complete: {}/{} documents", indexed, total);
+        if skipped > 0 {
+            tracing::warn!(
+                "Reindex complete: {}/{} indexed, {} skipped (스냅샷 이후 삭제 — 부활 방지)",
+                indexed, total, skipped
+            );
+        } else {
+            tracing::info!("Reindex complete: {}/{} documents", indexed, total);
+        }
         Ok(indexed)
     }
 

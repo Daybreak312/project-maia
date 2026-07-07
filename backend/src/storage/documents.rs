@@ -721,6 +721,47 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_snapshot_goes_stale_but_exists_is_live_ssot_for_reindex() {
+        // reindex 부활 방지의 기반 계약: reindex는 T0에 `list_recent` 스냅샷을 떠 루프를 도는데,
+        // 로컬 임베딩은 문서별 직렬이라 그 루프가 수 분 걸린다. 그동안 소유자/Review Queue가 한
+        // 문서를 삭제하면 스냅샷은 그 삭제를 **모른다**(stale). 그래서 reindex는 스냅샷을 신뢰해
+        // blind-upsert하면 안 되고, upsert 직전 `exists()`로 SSoT를 재확인해 삭제된 문서의 검색
+        // 부활("삭제=삭제" 신뢰 붕괴 — search는 반환/get_document는 404)을 막아야 한다.
+        // 이 테스트는 "스냅샷엔 남아있지만 exists=false"라는 그 신호를 고정해, reindex가 부활을
+        // 막는 근거(indexer.rs reindex_workspace의 upsert 직전 exists 재확인)를 회귀로 잠근다.
+        let (_tmp, store) = setup().await;
+        let doomed = make_doc("소유자가 삭제할 문서");
+        let survivor = make_doc("살아남을 문서");
+        let doomed_id = doomed.id;
+        let survivor_id = survivor.id;
+        store.save(&doomed, "default").await.unwrap();
+        store.save(&survivor, "default").await.unwrap();
+
+        // reindex가 루프 시작 시 뜨는 T0 스냅샷.
+        let snapshot = store.list_recent(usize::MAX, "default").await.unwrap();
+        assert_eq!(snapshot.len(), 2, "T0 스냅샷에는 두 문서 모두 있다");
+
+        // reindex 루프가 도는 도중(수 분) 삭제 판단이 한 문서를 파기.
+        store.delete_serialized(doomed_id, "default").await.unwrap();
+
+        // 스냅샷은 여전히 삭제된 문서를 담고 있다 — 이것을 신뢰하면 부활한다.
+        assert!(
+            snapshot.iter().any(|d| d.id == doomed_id),
+            "스냅샷은 T0 상태라 이후 삭제를 반영하지 못한다(stale)"
+        );
+
+        // 그러나 exists(라이브 SSoT)는 삭제를 안다 — reindex는 upsert 직전 이 신호로 부활을 막는다.
+        assert!(
+            !store.exists(doomed_id, "default").await,
+            "삭제된 문서는 exists=false → reindex가 upsert를 건너뛰어 부활을 막는다"
+        );
+        assert!(
+            store.exists(survivor_id, "default").await,
+            "살아있는 문서는 exists=true → reindex가 정상 재임베딩한다"
+        );
+    }
+
     // ──── 소스 기반 조회 (커넥터 중복 방지) ────
 
     fn make_doc_with_source(content: &str, source_id: &str) -> Document {
