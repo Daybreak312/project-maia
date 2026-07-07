@@ -33,10 +33,16 @@ mod upstream {
     pub const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
     /// refresh 요청 scope.
     pub const SCOPE: &str = "openid profile email";
-    /// 파싱 모델(상향은 이 한 줄 교체).
-    pub const MODEL: &str = "gpt-5.1";
+    /// 파싱 모델(상향은 이 한 줄 교체). 백엔드가 계정·클라이언트 버전별로 모델을
+    /// 게이팅한다 — gpt-5.1/5.3-codex/5.4는 거부, gpt-5.5만 허용(실측 2026-07-07).
+    pub const MODEL: &str = "gpt-5.5";
     /// 요청 출처 식별자(Codex CLI 위장).
     pub const ORIGINATOR: &str = "codex_cli_rs";
+    /// 위장할 Codex CLI 버전. version 헤더 없이는 현행 모델 전부가
+    /// "model is not supported"로 거부된다(실측 2026-07-07).
+    pub const CLIENT_VERSION: &str = "0.142.5";
+    /// User-Agent — version 헤더와 세트로 클라이언트 버전 게이트를 통과시킨다.
+    pub const USER_AGENT: &str = "codex_cli_rs/0.142.5 (Mac OS 26.1.0; arm64) Terminal.app";
     /// Responses API 베타 헤더 값.
     pub const OPENAI_BETA: &str = "responses=experimental";
 }
@@ -388,6 +394,8 @@ impl CodexProvider {
             .header("chatgpt-account-id", &auth.account_id)
             .header("OpenAI-Beta", upstream::OPENAI_BETA)
             .header("originator", upstream::ORIGINATOR)
+            .header("version", upstream::CLIENT_VERSION)
+            .header("user-agent", upstream::USER_AGENT)
             .header("session_id", Uuid::new_v4().to_string())
             .header("content-type", "application/json")
             .header("accept", "text/event-stream")
@@ -401,8 +409,12 @@ impl CodexProvider {
             return Err(CodexCallError::Unauthorized);
         }
         if !status.is_success() {
+            // 업스트림 에러 본문({"detail": ...})은 진단에 필수 — 상태코드만으로는
+            // 모델 게이팅/버전 게이트를 구분할 수 없다. 토큰은 포함되지 않는다.
+            let body = resp.text().await.unwrap_or_default();
+            let snippet: String = body.chars().take(200).collect();
             return Err(CodexCallError::Other(anyhow!(
-                "codex responses 에러 ({status})"
+                "codex responses 에러 ({status}): {snippet}"
             )));
         }
 
