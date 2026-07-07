@@ -436,6 +436,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_list_recent_usize_max_returns_all() {
+        // reindex_workspace / all_documents / decay_workspace_edges가 의존하는 계약:
+        // usize::MAX 상한은 절단 없이 전 문서를 반환한다. 유한 상한이 재도입되면
+        // reindex가 가장 오래된 문서를 검색에서 소리 없이 잘라내므로(문서 수 손실 0 위반),
+        // 이 테스트가 그 회귀를 붙잡는 canary다.
+        let (_tmp, store) = setup().await;
+
+        for i in 0..25 {
+            store
+                .save(&make_doc(&format!("doc {}", i)), "default")
+                .await
+                .unwrap();
+        }
+
+        let docs = store.list_recent(usize::MAX, "default").await.unwrap();
+        assert_eq!(docs.len(), 25);
+    }
+
+    #[tokio::test]
     async fn test_same_id_coexists_across_workspaces() {
         // 동일 문서 ID가 서로 다른 워크스페이스에서 충돌 없이 존재해야 한다.
         let (_tmp, store) = setup().await;

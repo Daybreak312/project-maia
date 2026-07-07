@@ -1379,7 +1379,12 @@ impl Indexer {
     /// raw JSON(SSoT) 전량이 재임베딩된다. 문서 0건이어도 컬렉션은 새 차원으로
     /// 재생성해, 이후 유입이 차원 불일치로 실패하지 않게 한다.
     pub async fn reindex_workspace(&self, workspace_id: &str) -> Result<usize> {
-        let docs = self.documents.list_recent(10000, workspace_id).await?;
+        // 상한 없이 raw JSON(SSoT) **전량**을 적재한다. list_recent는 created_at 내림차순
+        // 정렬 후 truncate하므로, 유한 상한을 두면 컬렉션을 drop한 뒤 가장 **오래된** 문서
+        // (인공두뇌의 초기 기반 기억)를 검색 인덱스에서 소리 없이 절단한다 — "문서 수 손실 0"
+        // AC와 "침묵 금지" 원칙 정면 위반. 자매 함수 all_documents / decay_workspace_edges도
+        // 동일하게 usize::MAX를 쓴다(개인 규모에서 전 문서를 담기 충분).
+        let docs = self.documents.list_recent(usize::MAX, workspace_id).await?;
         let total = docs.len();
 
         // embedder를 먼저 확보 — 이 호출이 Qdrant 기대 차원을 현재 provider로 맞춘다.
