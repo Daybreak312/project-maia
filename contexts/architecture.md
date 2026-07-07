@@ -236,6 +236,12 @@ project-maia/
 - **로컬 임베딩**(신규, 임베딩 전용): fastembed `multilingual-e5-small`(384d, 다국어).
   모델은 `DATA_DIR/models`에 캐시(도커 볼륨 영속), 첫 embed 호출 시 lazy 로드/다운로드.
   e5 규약대로 문서는 `passage:`, 쿼리는 `query:` 접두(`embed`/`embed_query` 분리). 키 불요.
+  - **컨테이너 빌드 제약**(실측 2026-07-07, 리스크 1순위 해소): 프리빌트 onnxruntime(aarch64)이
+    glibc 2.38+ 심볼(`__isoc23_*`)을 요구해 빌더·런타임 베이스는 **debian trixie**여야 한다
+    (bookworm(glibc 2.36)은 최종 링크 실패). GCC12+에서 제거된 `__cxa_call_terminate`는
+    `backend/docker/onnx_compat.c` 호환 심으로 채운다. 런타임 의존: `libstdc++6`·`libgomp1`·`libssl3`.
+    컨테이너 E2E(이미지 빌드 + in-container 임베딩 384d + 볼륨 캐시 재사용) 검증 완료.
+    상세 근거는 `Dockerfile` Stage 2 및 `onnx_compat.c` 주석.
 
 ### 임베딩 차원 메타 & 마이그레이션
 
