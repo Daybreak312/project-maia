@@ -10,14 +10,19 @@ services:
       context: .
       dockerfile: Dockerfile
     ports:
-      - "9080:8080"
+      # 개인 지식 저장소 — LAN 노출 차단, 로컬(및 cloudflared 터널 경유)만 허용
+      - "127.0.0.1:9080:8080"
     volumes:
       - maia-data:/data
+      # 커넥터 소스: OpenClaw 워크스페이스 지식 (읽기 전용)
+      - ~/.openclaw/workspace/memory:/knowledge/memory:ro
+      - ~/.openclaw/workspace/reports:/knowledge/reports:ro
     environment:
       - SERVER_PORT=8080
       - QDRANT_URL=http://qdrant:6333
       - DATA_DIR=/data
       - STATIC_DIR=/app/static
+      - MAIA_API_KEY=${MAIA_API_KEY}
     depends_on:
       - qdrant
     restart: unless-stopped
