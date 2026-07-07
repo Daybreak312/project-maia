@@ -20,7 +20,11 @@ use crate::models::ParsedContent;
 /// `parse`/`complete`/`embed` future가 영원히 pending → ingest 요청이 무한 hang된다.
 /// 이 상한이 있어야 지연이 `Err`로 귀결되고, 상위의 raw 폴백 경로(정보 유실 0)가
 /// 비로소 발동한다(PRD 인수 조건 "타임아웃 시 폴백").
-const HTTP_TIMEOUT_SECS: u64 = 60;
+///
+/// 값은 thinking 계열 모델(gemini-2.5-flash)이 10KB+ 문서를 파싱할 때 60초를
+/// 초과하는 실측(2026-07-07, memory/2026-07-07.md 13KB가 60초 타임아웃으로
+/// 결정적 실패)에 맞춰 300초로 둔다. 무한 hang 방지 불변식은 그대로 유지된다.
+const HTTP_TIMEOUT_SECS: u64 = 300;
 
 /// 연결 수립 타임아웃(초). 도달 불가 호스트에서 빠르게 실패하도록 한다.
 const HTTP_CONNECT_TIMEOUT_SECS: u64 = 10;
