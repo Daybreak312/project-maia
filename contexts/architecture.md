@@ -123,7 +123,9 @@ project-maia/
 | Backend Language | **Rust** | 단일 바이너리, 성능, 타입 안전성 |
 | HTTP Server | **axum 0.7** | tokio 기반, 미들웨어 체계 |
 | Vector DB | **Qdrant** | Rust 네이티브 클라이언트, 필터링, Docker 지원 |
-| LLM | **Gemini/Claude/OpenAI** | 추상화된 Provider 패턴으로 교체 가능 |
+| LLM (파싱) | **Gemini/Claude(API키·구독 OAuth)/OpenAI/Codex(구독)** | Provider 패턴으로 교체 가능, 구독 기반으로 종량제 키 탈피 |
+| Embedding | **Gemini/OpenAI/Local(fastembed)** | 로컬 임베딩(multilingual-e5-small)으로 외부 키 없이 자립 |
+| Local Embedding | **fastembed 5 + ort(onnxruntime)** | 정적 링크 onnxruntime, 모델은 DATA_DIR/models 캐시 |
 | MCP Server | **TypeScript** | MCP SDK 생태계 가장 성숙, STDIO transport |
 | Frontend | **React + Vite** | SPA, 컴포넌트 기반 |
 | Container | **Docker** | 이식성, 볼륨으로 데이터 분리 |
@@ -198,18 +200,53 @@ project-maia/
 │  - parse(content) -> ParsedContent   (고정 스키마 파싱)     │
 │  - complete(prompt) -> String        (자유 형식, 에이전트 판단)│
 │  - validate_api_key() -> bool                               │
-├─────────────────────────────────────────────────────────────┤
-│  GeminiProvider  │  ClaudeProvider  │  OpenAiChatProvider   │
-└─────────────────────────────────────────────────────────────┘
+├──────────────┬──────────────┬───────────────┬───────────────┤
+│ GeminiProvider│ ClaudeProvider│ OpenAiChat    │ CodexProvider │
+│              │ (API키/OAuth) │               │ (구독 OAuth)  │
+└──────────────┴──────────────┴───────────────┴───────────────┘
 
 ┌─────────────────────────────────────────────────────────────┐
 │                   EmbeddingProvider (trait)                  │
-│  - embed(text) -> Vec<f32>                                  │
+│  - embed(text) / embed_query(text) -> Vec<f32>              │
 │  - dimension() -> usize                                     │
-├─────────────────────────────────────────────────────────────┤
-│  GeminiEmbedding (3072 dim) │  OpenAiEmbedding (1536 dim)  │
-└─────────────────────────────────────────────────────────────┘
+├──────────────────┬──────────────────┬───────────────────────┤
+│ GeminiEmbedding  │ OpenAiEmbedding  │ LocalEmbedding        │
+│ (3072 dim)       │ (1536 dim)       │ (384 dim, multilingual│
+│                  │                  │  -e5-small, 로컬)     │
+└──────────────────┴──────────────────┴───────────────────────┘
 ```
+
+`ProviderType` = {gemini, claude, openai, **codex**, **local**}. 교차 선택 제약은
+`valid_for_parsing`/`valid_for_embedding` 단일 지점으로 판정한다: **local은 임베딩
+전용**(파싱 불가), **codex는 파싱 전용**(임베딩 불가), claude는 임베딩 미지원. 위반 시
+설정 API가 400을 반환한다.
+
+### 구독 프로바이더 (Phase 6 — 종량제 키 탈피)
+
+- **Claude OAuth 모드**: 키 접두 자동 감지 — `sk-ant-oat…`(`claude setup-token` 산출물)
+  이면 OAuth 모드로 `Authorization: Bearer` + `anthropic-beta: oauth-2025-04-20` 헤더를
+  쓰고 `x-api-key`를 제거하며, Claude Code system 프리픽스를 부여한다. `sk-ant-api…`는
+  기존 `x-api-key` 경로 그대로(회귀 없음). 파싱 모델 상수 `claude-haiku-4-5`.
+- **Codex 프로바이더**(신규, 파싱 전용): `~/.codex/auth.json` 임포트로 활성화. access
+  token JWT `exp` 임박(여유 60초) 또는 401 시 `auth.openai.com/oauth/token`으로 **단일
+  플라이트** refresh(동시 파싱 호출이 중복 refresh하지 않음), 회전된 refresh_token 영속화,
+  실패 시 "재임포트 필요" 명시. 파싱은 `chatgpt.com/backend-api/codex/responses`(Responses
+  API, SSE 관대 집계, 모델 `gpt-5.1`). 비공식 업스트림 상수(엔드포인트·client_id·헤더)는
+  `llm/codex.rs`의 단일 모듈에 격리(출처·검증일 주석). 토큰은 Debug/에러/응답에서 앞4+뒤4 마스킹.
+- **로컬 임베딩**(신규, 임베딩 전용): fastembed `multilingual-e5-small`(384d, 다국어).
+  모델은 `DATA_DIR/models`에 캐시(도커 볼륨 영속), 첫 embed 호출 시 lazy 로드/다운로드.
+  e5 규약대로 문서는 `passage:`, 쿼리는 `query:` 접두(`embed`/`embed_query` 분리). 키 불요.
+
+### 임베딩 차원 메타 & 마이그레이션
+
+각 임베딩 provider가 차원을 선언(gemini 3072 / openai 1536 / local 384)한다.
+`QdrantStorage`는 현재 provider 차원(`target_dim`)을 기억하고, 컬렉션 존재 시 실제 차원과
+대조한다. **불일치면 침묵 실패·자동 재생성 없이** `embedding dimension mismatch — run
+POST /api/reindex` 에러를 반환(검색·유입 경로). `POST /api/reindex`가 현재 차원으로 컬렉션을
+재생성하고 raw JSON(SSoT) 전량을 재임베딩해 전환(예: 3072→384)을 완결한다(문서 손실 0).
+
+**정보 유실 0 불변식 유지**: 파싱·임베딩·refresh가 전부 실패해도 raw 저장은 성공한다
+(기존 raw 폴백 경로 불변).
 
 ## MCP Tools
 
