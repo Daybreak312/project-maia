@@ -1901,6 +1901,55 @@ mod tests {
         }
     }
 
+    /// 파싱·임베딩 provider가 **하나도 설정되지 않은** Indexer를 tempdir로 조립한다.
+    ///
+    /// 기본 설정은 gemini(파싱/임베딩)인데 API 키가 없으므로 `get_llm_provider`/
+    /// `get_embedding_provider`가 네트워크 없이 즉시 Err를 낸다 — "provider 미확보"라는
+    /// 실 장애 모드(키 삭제/전환 중)를 그대로 재현한다. Qdrant 클라이언트는 lazy라 RPC가
+    /// 없으면 연결하지 않으므로, 이 경로가 절대 닿지 않는 표준 URL로 구성만 성립시킨다.
+    async fn indexer_without_providers() -> (tempfile::TempDir, Indexer) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let data_dir = tmp.path().to_str().unwrap();
+        let settings = Arc::new(SettingsManager::new(data_dir).await.unwrap());
+        let qdrant = Arc::new(QdrantStorage::new("http://127.0.0.1:6333").await.unwrap());
+        let documents = Arc::new(DocumentStore::new(tmp.path()).await.unwrap());
+        let versions = Arc::new(VersionStore::new(tmp.path()));
+        let indexer = Indexer::new(settings, qdrant, documents, versions);
+        (tmp, indexer)
+    }
+
+    #[tokio::test]
+    async fn test_smart_ingest_preserves_raw_when_providers_unavailable() {
+        // **정보 유실 0 (최상위 불변식) 회귀 테스트.**
+        // 파싱·임베딩이 어떤 방식으로 실패해도 원문은 절대 사라지면 안 된다(PRD AC). Phase 6의
+        // 신규 실패 모드(claude OAuth 거절 / codex refresh 실패 / local 모델 init 실패)는 모두
+        // 동일한 get_llm/embedding_provider **미확보** 경로로 수렴하므로, 그 경로를 provider
+        // 미설정으로 재현해 불변식을 자동 회귀로 잠근다. smart_ingest는 LLM provider 확보 실패 시
+        // raw_fallback → persist_raw_document로 원문을 SSoT(DocumentStore)에 **선기록**하고,
+        // best_effort_index는 임베딩 provider가 없으면 Qdrant에 닿기 전에 조용히 빠져나온다 —
+        // 따라서 외부 서비스가 전면 장애여도 디스크에는 원문이 남는다.
+        let (_tmp, indexer) = indexer_without_providers().await;
+        let raw = "소유자의 잃어서는 안 될 원문 지식".to_string();
+
+        let outcome = indexer
+            .smart_ingest_to_workspace(raw.clone(), "default")
+            .await
+            .expect("provider 미확보는 에러가 아니라 raw 폴백으로 흡수되어야 한다(정보 유실 0)");
+
+        // 폴백이 명시적으로 신고되어야 한다(침묵 금지 — 응답 메타에 드러난다).
+        assert!(outcome.fallback, "provider 미확보 시 fallback=true여야 한다");
+        assert_eq!(outcome.strategy, "raw", "폴백 전략은 raw여야 한다");
+        assert_eq!(outcome.document_ids, vec![outcome.id], "raw 문서 1건이 기록되어야 한다");
+
+        // **핵심 단언: 원문이 SSoT(디스크)에 실제로 보존되었다.**
+        let saved = indexer
+            .documents
+            .load(outcome.id, "default")
+            .await
+            .expect("원문이 DocumentStore(SSoT)에 저장되어 로드 가능해야 한다");
+        assert_eq!(saved.raw_content, raw, "저장된 원문이 입력과 정확히 일치해야 한다");
+    }
+
     #[test]
     fn test_targets_primary_only_when_no_cross() {
         let ctx = scoped(&["personal"]);
