@@ -814,6 +814,15 @@ impl Indexer {
         limit: usize,
         workspace_id: &str,
     ) -> Result<(Vec<SearchResult>, usize)> {
+        // 차원 불일치 사전 감지(FR4): 하이브리드는 아래에서 vector/keyword의 개별
+        // 실패를 graceful하게 삼키므로(unwrap_or), 그대로 두면 차원 불일치가 "빈 결과"로
+        // 침묵된다(기본 검색 모드가 hybrid이라 치명적). 임베딩 provider가 가용할 때만
+        // 컬렉션 차원을 대조해 불일치면 "reindex 필요" 에러를 명시적으로 올린다. provider
+        // 구성 실패(키 미설정 등 별개 문제)는 여기서 삼켜 기존 keyword 폴백을 보존한다.
+        if self.get_embedding_provider().await.is_ok() {
+            self.qdrant.ensure_collection(workspace_id).await?;
+        }
+
         // 병렬로 두 검색 수행
         let (vector_results, keyword_results) = tokio::join!(
             self.vector_search(query, limit * 2, workspace_id),
