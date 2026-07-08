@@ -1,0 +1,37 @@
+services:
+  qdrant:
+    image: qdrant/qdrant:latest
+    volumes:
+      - qdrant-data:/qdrant/storage
+    restart: unless-stopped
+    # 마인크래프트 서버와 동거 — CPU는 캡, 경합 시 마크가 우선(shares 절반)
+    cpus: 1.0
+    mem_limit: 1500m
+    cpu_shares: 512
+
+  app:
+    image: project-maia-app:latest
+    ports:
+      # 개인 지식 저장소 — 공개 노출 금지, 맥에서 SSH 터널로만 접근
+      - "127.0.0.1:9080:8080"
+    volumes:
+      - maia-data:/data
+      # 커넥터 소스: 맥에서 rsync로 미러링되는 OpenClaw 지식 (읽기 전용)
+      - /home/ubuntu/maia-knowledge/memory:/knowledge/memory:ro
+      - /home/ubuntu/maia-knowledge/reports:/knowledge/reports:ro
+    environment:
+      - SERVER_PORT=8080
+      - QDRANT_URL=http://qdrant:6333
+      - DATA_DIR=/data
+      - STATIC_DIR=/app/static
+      - MAIA_API_KEY=${MAIA_API_KEY}
+    depends_on:
+      - qdrant
+    restart: unless-stopped
+    cpus: 2.0
+    mem_limit: 3g
+    cpu_shares: 512
+
+volumes:
+  qdrant-data:
+  maia-data:
