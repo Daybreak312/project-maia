@@ -1,10 +1,12 @@
 pub mod keys;
+pub mod sessions;
 pub mod users;
 
 pub use keys::{
     ApiKey, ApiKeyManager, AuthContext, Permission,
     generate_key_id, generate_raw_key, hash_key,
 };
+pub use sessions::{Session, SessionManager, SESSION_COOKIE_NAME};
 pub use users::{User, UserManager};
 
 use std::sync::Arc;
