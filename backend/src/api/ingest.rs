@@ -29,8 +29,8 @@ pub async fn ingest_handler(
     Query(q): Query<IngestQuery>,
     Json(req): Json<IngestRequest>,
 ) -> Result<Json<IngestOutcome>, (StatusCode, String)> {
-    require_write(&ctx)?;
     let workspace = resolve_and_authorize_workspace(&state, &ctx, q.workspace).await?;
+    require_write(&ctx, &workspace)?;
 
     let is_raw = q.mode.as_deref() == Some("raw");
 

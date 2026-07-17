@@ -22,7 +22,7 @@ use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use auth::ApiKeyManager;
+use auth::{ApiKeyManager, AuthEngine, SessionManager, UserManager};
 use config::Config;
 use connectors::runner::ConnectorRunner;
 use connectors::scheduler::ConnectorScheduler;
@@ -37,19 +37,27 @@ use patrol::scheduler::PatrolScheduler;
 use patrol::{Patrol, PatrolExecutor};
 use settings::SettingsManager;
 use storage::{DocumentStore, QdrantStorage, SearchLogStore, VersionStore};
-use workspace::WorkspaceManager;
+use workspace::{MembershipManager, WorkspaceManager};
 
 /// 애플리케이션 상태
 pub struct AppState {
     /// 인덱싱·검색 오케스트레이터. 커넥터 유입 실행기(ConnectorIngest)로도 공유되므로 Arc.
     pub indexer: Arc<Indexer>,
     pub settings: Arc<SettingsManager>,
-    /// 마스터 API 키 (MAIA_API_KEY). None이면 인증 비활성(개발 모드).
-    pub api_key: Option<String>,
+    /// 인증 자격증명 해석기 (마스터키·API 키·세션 쿠키 → AuthContext)
+    pub auth: AuthEngine,
     /// 워크스페이스 CRUD 관리자
     pub workspaces: Arc<WorkspaceManager>,
     /// API 키 발급/조회/인증 관리자
     pub api_keys: Arc<ApiKeyManager>,
+    /// 계정 관리자 (users.json)
+    pub users: Arc<UserManager>,
+    /// 로그인 세션 관리자 (sessions.json)
+    pub sessions: Arc<SessionManager>,
+    /// 워크스페이스 멤버십·공개 설정 관리자 (workspaces/{id}/members.json)
+    pub memberships: Arc<MembershipManager>,
+    /// 세션 쿠키 Secure 플래그 (로그인/로그아웃 핸들러의 Set-Cookie에 반영)
+    pub cookie_secure: bool,
     /// 검색 로그 저장소 (워크스페이스별 일 단위 JSONL 축적)
     pub search_logs: Arc<SearchLogStore>,
     /// 커넥터 동기화 실행기 (수동 트리거·상태 조회가 공유)
@@ -84,6 +92,11 @@ async fn main() -> anyhow::Result<()> {
 
     // API 키 관리자 초기화 (파일 기반, Qdrant 독립)
     let api_keys = Arc::new(ApiKeyManager::new(&config.data_dir).await?);
+
+    // 계정·세션·멤버십 관리자 초기화 (파일 기반, Qdrant 독립)
+    let users = Arc::new(UserManager::new(&config.data_dir).await?);
+    let sessions = Arc::new(SessionManager::new(&config.data_dir).await?);
+    let memberships = Arc::new(MembershipManager::new(&config.data_dir));
 
     // 스토리지 초기화
     // DocumentStore는 data_dir에 루팅되어 `{data_dir}/workspaces/{id}/documents`에 저장한다
@@ -142,18 +155,39 @@ async fn main() -> anyhow::Result<()> {
     ));
     patrol_scheduler.start();
 
-    // AppState 생성
-    if config.api_key.is_some() {
-        tracing::info!("API key authentication enabled");
+    // 인증 엔진 조립 — 해석 순서: dev 옵트인 → 마스터키 → API 키 → 세션 쿠키.
+    // 마스터키 미설정은 더 이상 fail-open이 아니다 (users/api_keys/세션으로 동작).
+    if config.dev_no_auth {
+        tracing::warn!(
+            "MAIA_DEV_NO_AUTH=1 — 인증이 비활성화되었습니다 (명시적 개발 모드, 프로덕션 금지)"
+        );
+    } else if config.api_key.is_some() {
+        tracing::info!("Authentication enabled (master key + users/api keys/sessions)");
     } else {
-        tracing::warn!("API key not set (MAIA_API_KEY). All endpoints are open.");
+        tracing::info!("Authentication enabled (users/api keys/sessions — master key not set)");
     }
+    let auth_engine = AuthEngine::new(
+        config.api_key.clone(),
+        config.dev_no_auth,
+        users.clone(),
+        sessions.clone(),
+        api_keys.clone(),
+        memberships.clone(),
+        workspaces.clone(),
+    );
+    // 인증 수단 전무 상태 안내 (잠금은 유지 — fail-closed)
+    auth_engine.warn_if_locked_out().await;
+
     let state = Arc::new(AppState {
         indexer,
         settings,
-        api_key: config.api_key,
+        auth: auth_engine,
         workspaces,
         api_keys,
+        users,
+        sessions,
+        memberships,
+        cookie_secure: config.cookie_secure,
         search_logs,
         connector_runner,
         sync_state,
@@ -220,7 +254,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/metrics", get(api::metrics_handler))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
-            auth::require_api_key,
+            auth::require_auth,
         ));
 
     // 인증 불필요한 라우트

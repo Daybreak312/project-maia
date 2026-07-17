@@ -122,8 +122,8 @@ pub async fn add_edge_handler(
     Query(wq): Query<WorkspaceQuery>,
     Json(req): Json<AddEdgeRequest>,
 ) -> Result<Json<EdgeMutationResponse>, (StatusCode, String)> {
-    require_write(&ctx)?;
     let workspace = resolve_and_authorize_workspace(&state, &ctx, wq.workspace).await?;
+    require_write(&ctx, &workspace)?;
 
     let relation = RelationType::from_str(&req.relation).map_err(|_| {
         (
@@ -169,8 +169,8 @@ pub async fn remove_edge_handler(
     Path((id, target)): Path<(Uuid, Uuid)>,
     Query(wq): Query<WorkspaceQuery>,
 ) -> Result<Json<RemoveEdgeResponse>, (StatusCode, String)> {
-    require_write(&ctx)?;
     let workspace = resolve_and_authorize_workspace(&state, &ctx, wq.workspace).await?;
+    require_write(&ctx, &workspace)?;
 
     state
         .indexer

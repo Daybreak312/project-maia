@@ -110,8 +110,8 @@ pub async fn update_document_handler(
     Query(wq): Query<WorkspaceQuery>,
     Json(payload): Json<UpdateRequest>,
 ) -> Result<Json<IngestResponse>, (StatusCode, String)> {
-    require_write(&ctx)?;
     let workspace = resolve_and_authorize_workspace(&state, &ctx, wq.workspace).await?;
+    require_write(&ctx, &workspace)?;
 
     state
         .indexer
@@ -130,8 +130,8 @@ pub async fn delete_document_handler(
     Path(id): Path<Uuid>,
     Query(wq): Query<WorkspaceQuery>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    require_write(&ctx)?;
     let workspace = resolve_and_authorize_workspace(&state, &ctx, wq.workspace).await?;
+    require_write(&ctx, &workspace)?;
 
     state
         .indexer
@@ -154,8 +154,8 @@ pub async fn reindex_handler(
     Extension(ctx): Extension<AuthContext>,
     Query(wq): Query<WorkspaceQuery>,
 ) -> Result<Json<ReindexResponse>, (StatusCode, String)> {
-    require_write(&ctx)?;
     let workspace = resolve_and_authorize_workspace(&state, &ctx, wq.workspace).await?;
+    require_write(&ctx, &workspace)?;
 
     state
         .indexer

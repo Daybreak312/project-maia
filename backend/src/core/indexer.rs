@@ -1975,8 +1975,12 @@ mod tests {
         AuthContext {
             key_id: "test".to_string(),
             permissions: Permission::ReadWrite,
-            workspaces: workspaces.iter().map(|s| s.to_string()).collect(),
+            scope: crate::auth::keys::WorkspaceScope::Fixed(
+                workspaces.iter().map(|s| s.to_string()).collect(),
+            ),
             is_master: false,
+            source: crate::auth::keys::AuthSource::ApiKey,
+            user: None,
         }
     }
 

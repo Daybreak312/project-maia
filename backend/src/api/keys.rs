@@ -98,7 +98,7 @@ pub async fn create_key_handler(
 
     let (key, raw) = state
         .api_keys
-        .create_key(req.label, req.workspaces, req.permissions, req.expires_at)
+        .create_key(req.label, req.workspaces, req.permissions, req.expires_at, None)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 

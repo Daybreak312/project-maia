@@ -2,6 +2,7 @@ use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use tokio::fs;
 use tokio::sync::RwLock;
@@ -28,6 +29,26 @@ impl Permission {
     pub fn is_admin(&self) -> bool {
         matches!(self, Permission::Admin)
     }
+
+    /// 권한 서열 (ReadOnly < ReadWrite < Admin).
+    /// derive(Ord)의 선언 순서 의존 대신 명시적 서열로 고정한다.
+    fn rank(&self) -> u8 {
+        match self {
+            Permission::ReadOnly => 0,
+            Permission::ReadWrite => 1,
+            Permission::Admin => 2,
+        }
+    }
+
+    /// 두 권한의 교집합 — 더 낮은 쪽을 반환한다.
+    /// 소유 계정이 있는 API 키의 유효 권한(키 스코프 ∩ 계정 접근권) 산출에 쓴다.
+    pub fn intersect(&self, other: &Permission) -> Permission {
+        if self.rank() <= other.rank() {
+            self.clone()
+        } else {
+            other.clone()
+        }
+    }
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -52,6 +73,12 @@ pub struct ApiKey {
     pub last_used_at: Option<DateTime<Utc>>,
     /// 만료일 (None이면 무기한)
     pub expires_at: Option<DateTime<Utc>>,
+    /// 소유 계정(User.user_id). None이면 시스템 키 — 기존 의미 그대로
+    /// 키 자체 스코프로 동작한다 (`#[serde(default)]`로 기존 키 파일 하위호환).
+    /// Some이면 유효 접근권 = 키 스코프 ∩ 소유 계정의 현재 접근권(미들웨어에서
+    /// 매 요청 산출 — 계정이 워크스페이스에서 빠지면 키도 그 즉시 접근 불가).
+    #[serde(default)]
+    pub owner: Option<String>,
 }
 
 impl ApiKey {
@@ -71,20 +98,64 @@ impl ApiKey {
 // AuthContext — 미들웨어가 요청에 주입하는 인증 컨텍스트
 // ──────────────────────────────────────────────────────────────
 
+/// 인증 자격증명의 출처. 데이터 엔드포인트는 이 값을 몰라야 하며(소스 무관 인가),
+/// 자격증명 관리 엔드포인트(`/api/me/keys` 세션 전용 게이트, `/api/auth/me` 표시)와
+/// 미들웨어(last_used 갱신)만 참조한다.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AuthSource {
+    /// MAIA_API_KEY 마스터키
+    Master,
+    /// MAIA_DEV_NO_AUTH=1 명시적 개발 모드
+    DevMode,
+    /// 등록된 API 키 (Bearer)
+    ApiKey,
+    /// 로그인 세션 쿠키
+    Session,
+}
+
+/// 인증된 계정의 최소 신원. 세션 인증 또는 소유 계정 있는 API 키 인증 시 채워진다.
+#[derive(Debug, Clone)]
+pub struct UserIdentity {
+    pub user_id: String,
+    pub username: String,
+}
+
+/// 워크스페이스 접근 스코프 — 인증 주체 유형별 판정 규칙.
+///
+/// 기존 "단일 권한 + 워크스페이스 목록" 모델은 유저 세션의 "워크스페이스마다
+/// 다른 role"을 표현할 수 없어, 판정 규칙 자체를 스코프 타입으로 분리했다.
+#[derive(Debug, Clone)]
+pub enum WorkspaceScope {
+    /// 전 워크스페이스 Admin (마스터키/개발모드/글로벌 admin 계정)
+    All,
+    /// 고정 목록 + 컨텍스트의 단일 권한 (시스템 API 키 — 기존 의미 그대로.
+    /// 빈 목록 = 접근 없음, fail-closed)
+    Fixed(Vec<String>),
+    /// 워크스페이스별 유효 권한 맵 (유저 세션: 멤버십 ∪ public /
+    /// 소유 계정 있는 키: 키 스코프 ∩ 계정 접근권).
+    /// BTreeMap이라 순회가 결정적이다 (default_workspace 판정의 예측 가능성).
+    PerWorkspace(BTreeMap<String, Permission>),
+}
+
 /// 인증된 요청의 컨텍스트. 미들웨어가 검증 후 Request Extensions에 삽입한다.
+/// 어떤 인증 경로든 최종적으로 이 타입 하나로 수렴하므로, 하위 핸들러는
+/// 인증 소스와 무관하게 동일한 인가 판정 API를 사용한다.
 #[derive(Debug, Clone)]
 pub struct AuthContext {
-    /// 키 식별자 ("master" 또는 "dev" 또는 실제 key_id)
+    /// 인증 주체 식별자 ("master" | "dev" | 키 key_id | 세션의 user_id)
     pub key_id: String,
-    /// 권한 수준
+    /// 전역(시스템) 권한 — 워크스페이스와 무관한 시스템 작업(require_admin:
+    /// 워크스페이스 CRUD, 설정, 키 관리 등) 판정에 쓴다.
+    /// 워크스페이스별 유효 권한은 `permission_for()`가 판정한다.
     pub permissions: Permission,
-    /// 접근 가능한 워크스페이스 ID 목록.
-    /// 영속 키(비마스터)는 이 목록에 명시된 워크스페이스에만 접근한다
-    /// (빈 목록 = 접근 없음, fail-closed). 마스터키/개발모드(`is_master`)만
-    /// 목록과 무관하게 전체 접근을 가진다.
-    pub workspaces: Vec<String>,
+    /// 워크스페이스 접근 스코프
+    pub scope: WorkspaceScope,
     /// 마스터키 또는 개발모드 여부
     pub is_master: bool,
+    /// 인증 자격증명 출처
+    pub source: AuthSource,
+    /// 인증된 계정 신원 (세션/소유 키 인증 시)
+    pub user: Option<UserIdentity>,
 }
 
 impl AuthContext {
@@ -93,55 +164,188 @@ impl AuthContext {
         Self {
             key_id: "master".to_string(),
             permissions: Permission::Admin,
-            workspaces: vec![],
+            scope: WorkspaceScope::All,
             is_master: true,
+            source: AuthSource::Master,
+            user: None,
         }
     }
 
-    /// 개발 모드 (인증 미설정) 시 생성
+    /// 개발 모드 (MAIA_DEV_NO_AUTH=1 명시적 옵트인) 시 생성
     pub fn dev_mode() -> Self {
         Self {
             key_id: "dev".to_string(),
             permissions: Permission::Admin,
-            workspaces: vec![],
+            scope: WorkspaceScope::All,
             is_master: true,
+            source: AuthSource::DevMode,
+            user: None,
         }
     }
 
-    /// API Key로부터 AuthContext 생성
+    /// 시스템 API Key(소유 계정 없음)로부터 AuthContext 생성 — 기존 의미 그대로
+    /// 키의 워크스페이스 목록 + 단일 권한으로 동작한다.
     pub fn from_api_key(key: &ApiKey) -> Self {
         Self {
             key_id: key.key_id.clone(),
             permissions: key.permissions.clone(),
-            workspaces: key.workspaces.clone(),
+            scope: WorkspaceScope::Fixed(key.workspaces.clone()),
             is_master: false,
+            source: AuthSource::ApiKey,
+            user: None,
         }
     }
 
-    /// 특정 워크스페이스에 접근 가능한지 확인.
+    /// 소유 계정이 있는 API Key로부터 AuthContext 생성.
     ///
-    /// 마스터키/개발모드(`is_master`)는 항상 true. 영속 API 키는 오직 `workspaces`
-    /// 목록에 명시된 워크스페이스에만 접근한다 — 빈 목록은 "전체 접근"이 아니라
-    /// "접근 없음"(fail-closed)이다. 이로써 `has_workspace_access`와 동일한 판정을
-    /// 보장한다. ("unscoped = all"은 마스터/dev 전용 의미이며, 영속 키에 허용하면
-    /// 스코프하려던 키가 개인 워크스페이스까지 조용히 읽는 격리 우회가 된다.)
+    /// 유효 접근권 = 키 스코프 ∩ 소유 계정의 현재 접근권(`user_access`):
+    /// - 워크스페이스 집합: 키 목록 ∩ 계정 접근 가능 목록
+    /// - 워크스페이스별 권한: min(키 권한, 계정의 해당 ws 권한)
+    /// - 전역 권한: min(키 권한, 계정 전역 권한 — admin 계정만 Admin, 그 외 ReadOnly)
+    ///
+    /// 계정이 워크스페이스에서 빠지면 이 교집합에서 즉시 사라지므로,
+    /// 키가 계정보다 넓은 접근을 가질 수 없다.
+    pub fn from_owned_api_key(
+        key: &ApiKey,
+        user: &crate::auth::User,
+        user_access: &BTreeMap<String, Permission>,
+    ) -> Self {
+        let mut effective = BTreeMap::new();
+        for ws in &key.workspaces {
+            if let Some(user_perm) = user_access.get(ws) {
+                effective.insert(ws.clone(), key.permissions.intersect(user_perm));
+            }
+        }
+
+        let user_global = if user.is_admin {
+            Permission::Admin
+        } else {
+            Permission::ReadOnly
+        };
+
+        Self {
+            key_id: key.key_id.clone(),
+            permissions: key.permissions.intersect(&user_global),
+            scope: WorkspaceScope::PerWorkspace(effective),
+            is_master: false,
+            source: AuthSource::ApiKey,
+            user: Some(UserIdentity {
+                user_id: user.user_id.clone(),
+                username: user.username.clone(),
+            }),
+        }
+    }
+
+    /// 로그인 세션의 계정으로부터 AuthContext 생성.
+    ///
+    /// - 글로벌 admin 계정: 전 워크스페이스 Admin (마스터키와 동급 인가 — 단
+    ///   `is_master`는 아니므로 "마스터키" 표시/식별과는 구분된다)
+    /// - 일반 계정: 접근 가능 ws = 멤버인 ws ∪ public ws (`access` 맵),
+    ///   전역 권한은 ReadOnly 바닥 — 시스템 작업(require_admin)은 불가
+    pub fn from_user(user: &crate::auth::User, access: BTreeMap<String, Permission>) -> Self {
+        let (permissions, scope) = if user.is_admin {
+            (Permission::Admin, WorkspaceScope::All)
+        } else {
+            (Permission::ReadOnly, WorkspaceScope::PerWorkspace(access))
+        };
+
+        Self {
+            key_id: user.user_id.clone(),
+            permissions,
+            scope,
+            is_master: false,
+            source: AuthSource::Session,
+            user: Some(UserIdentity {
+                user_id: user.user_id.clone(),
+                username: user.username.clone(),
+            }),
+        }
+    }
+
+    /// 특정 워크스페이스에 대한 유효 권한을 판정한다.
+    ///
+    /// - `All`: 항상 Admin
+    /// - `Fixed`: 목록에 있으면 컨텍스트의 단일 권한, 없으면 None
+    ///   (빈 목록 = 접근 없음, fail-closed — "unscoped = all"은 마스터/dev 전용)
+    /// - `PerWorkspace`: 맵에 있으면 해당 권한, 없으면 None (fail-closed)
+    pub fn permission_for(&self, workspace_id: &str) -> Option<Permission> {
+        match &self.scope {
+            WorkspaceScope::All => Some(Permission::Admin),
+            WorkspaceScope::Fixed(list) => list
+                .iter()
+                .any(|w| w == workspace_id)
+                .then(|| self.permissions.clone()),
+            WorkspaceScope::PerWorkspace(map) => map.get(workspace_id).cloned(),
+        }
+    }
+
+    /// 특정 워크스페이스에 접근 가능한지 확인 (`permission_for` 기반 단일 판정).
     pub fn can_access_workspace(&self, workspace_id: &str) -> bool {
-        self.is_master || self.workspaces.iter().any(|w| w == workspace_id)
+        self.permission_for(workspace_id).is_some()
+    }
+
+    /// 특정 워크스페이스에 쓰기 가능한지 확인.
+    pub fn can_write_workspace(&self, workspace_id: &str) -> bool {
+        self.permission_for(workspace_id)
+            .map_or(false, |p| p.can_write())
+    }
+
+    /// 특정 워크스페이스의 admin(owner급)인지 확인 — 멤버십·공개 설정 관리 판정.
+    pub fn is_workspace_admin(&self, workspace_id: &str) -> bool {
+        self.permission_for(workspace_id)
+            .map_or(false, |p| p.is_admin())
+    }
+
+    /// 접근 가능한 워크스페이스 ID → 유효 권한 목록 (`/api/auth/me` 표시용).
+    /// `All` 스코프는 전체 목록을 갖지 않으므로 호출측이 실제 워크스페이스
+    /// 목록과 조합해야 한다 — 여기서는 명시적 스코프만 반환한다.
+    pub fn scoped_workspaces(&self) -> Vec<(String, Permission)> {
+        match &self.scope {
+            WorkspaceScope::All => vec![],
+            WorkspaceScope::Fixed(list) => list
+                .iter()
+                .map(|w| (w.clone(), self.permissions.clone()))
+                .collect(),
+            WorkspaceScope::PerWorkspace(map) => {
+                map.iter().map(|(w, p)| (w.clone(), p.clone())).collect()
+            }
+        }
     }
 
     /// 워크스페이스 미지정 시 사용할 기본 워크스페이스 ID.
-    /// 키에 바인딩된 첫 워크스페이스, 비어있으면(마스터/개발모드) `default`.
+    ///
+    /// - 마스터/개발모드/글로벌 admin(`All`): `default`
+    /// - 시스템 키(`Fixed`): 목록의 첫 워크스페이스 (기존 의미 유지)
+    /// - 유저/소유 키(`PerWorkspace`): 개인 워크스페이스 `u-{username}`가
+    ///   접근 가능하면 그것, 아니면 정렬 순 첫 워크스페이스 (결정적)
     pub fn default_workspace(&self) -> String {
-        self.workspaces
-            .first()
-            .cloned()
-            .unwrap_or_else(|| "default".to_string())
+        match &self.scope {
+            WorkspaceScope::All => "default".to_string(),
+            WorkspaceScope::Fixed(list) => list
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "default".to_string()),
+            WorkspaceScope::PerWorkspace(map) => {
+                if let Some(user) = &self.user {
+                    let personal = format!("u-{}", user.username);
+                    if map.contains_key(&personal) {
+                        return personal;
+                    }
+                }
+                map.keys()
+                    .next()
+                    .cloned()
+                    .unwrap_or_else(|| "default".to_string())
+            }
+        }
     }
 
+    /// 전역(시스템) 쓰기 권한. 워크스페이스별 판정은 `can_write_workspace`를 쓸 것.
     pub fn can_write(&self) -> bool {
         self.permissions.can_write()
     }
 
+    /// 전역(시스템) admin 여부 — 마스터키·admin 권한 키·글로벌 admin 계정.
     pub fn is_admin(&self) -> bool {
         self.permissions.is_admin()
     }
@@ -240,12 +444,14 @@ impl ApiKeyManager {
 
     /// 새 API Key를 생성한다. (ApiKey, 평문 키)를 반환한다.
     /// 평문 키는 이 시점에서만 확인 가능하며, 이후에는 해시만 저장된다.
+    /// `owner`가 Some이면 계정 하위 키 — 유효 접근권이 계정 접근권과 교집합된다.
     pub async fn create_key(
         &self,
         label: String,
         workspaces: Vec<String>,
         permissions: Permission,
         expires_at: Option<DateTime<Utc>>,
+        owner: Option<String>,
     ) -> Result<(ApiKey, String)> {
         let key_id = generate_key_id();
         let raw_key = generate_raw_key();
@@ -260,6 +466,7 @@ impl ApiKeyManager {
             created_at: Utc::now(),
             last_used_at: None,
             expires_at,
+            owner,
         };
 
         {
@@ -316,6 +523,32 @@ impl ApiKeyManager {
     /// 등록된 키가 있는지 확인한다.
     pub async fn has_keys(&self) -> bool {
         !self.keys.read().await.is_empty()
+    }
+
+    /// 특정 계정이 소유한 키 목록을 반환한다 (`/api/me/keys` 셀프서비스).
+    pub async fn list_keys_for_owner(&self, user_id: &str) -> Vec<ApiKey> {
+        let keys = self.keys.read().await;
+        keys.iter()
+            .filter(|k| k.owner.as_deref() == Some(user_id))
+            .cloned()
+            .collect()
+    }
+
+    /// 특정 계정이 소유한 키를 전부 폐기한다 (계정 삭제 연쇄 조치).
+    /// 폐기된 키 수를 반환한다.
+    pub async fn revoke_keys_for_owner(&self, user_id: &str) -> Result<usize> {
+        let removed = {
+            let mut keys = self.keys.write().await;
+            let before = keys.len();
+            keys.retain(|k| k.owner.as_deref() != Some(user_id));
+            before - keys.len()
+        };
+
+        if removed > 0 {
+            self.save().await?;
+            tracing::info!("Revoked {} API key(s) owned by user: {}", removed, user_id);
+        }
+        Ok(removed)
     }
 
     /// `last_used_at`을 현재 시각으로 갱신한다.
@@ -542,6 +775,7 @@ mod tests {
             created_at: Utc::now(),
             last_used_at: None,
             expires_at: None,
+            owner: None,
         }
     }
 
@@ -701,7 +935,110 @@ mod tests {
         assert!(ctx.can_write());
     }
 
-    // ──── ApiKeyManager ────
+    // ──── Permission::intersect ────
+
+    #[test]
+    fn test_permission_intersect_takes_lower() {
+        use Permission::*;
+        assert_eq!(ReadOnly.intersect(&Admin), ReadOnly);
+        assert_eq!(Admin.intersect(&ReadOnly), ReadOnly);
+        assert_eq!(ReadWrite.intersect(&Admin), ReadWrite);
+        assert_eq!(Admin.intersect(&Admin), Admin);
+        assert_eq!(ReadWrite.intersect(&ReadWrite), ReadWrite);
+        assert_eq!(ReadOnly.intersect(&ReadWrite), ReadOnly);
+    }
+
+    // ──── WorkspaceScope — 유저/소유 키 컨텍스트 단위 판정 ────
+
+    fn make_test_user(is_admin: bool) -> crate::auth::User {
+        crate::auth::User {
+            user_id: "user_test00000000".to_string(),
+            username: "alice".to_string(),
+            password_hash: "$argon2id$test".to_string(),
+            display_name: "Alice".to_string(),
+            is_admin,
+            created_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn test_from_user_per_workspace_scope() {
+        let mut access = BTreeMap::new();
+        access.insert("ws-rw".to_string(), Permission::ReadWrite);
+        access.insert("ws-ro".to_string(), Permission::ReadOnly);
+
+        let ctx = AuthContext::from_user(&make_test_user(false), access);
+        assert_eq!(ctx.source, AuthSource::Session);
+        assert_eq!(ctx.permission_for("ws-rw"), Some(Permission::ReadWrite));
+        assert_eq!(ctx.permission_for("ws-ro"), Some(Permission::ReadOnly));
+        assert_eq!(ctx.permission_for("elsewhere"), None, "맵 밖은 fail-closed");
+        assert!(ctx.can_write_workspace("ws-rw"));
+        assert!(!ctx.can_write_workspace("ws-ro"));
+        assert!(!ctx.is_admin(), "일반 계정은 전역 admin 아님");
+        assert!(!ctx.is_master);
+    }
+
+    #[test]
+    fn test_from_user_admin_gets_all_scope() {
+        let ctx = AuthContext::from_user(&make_test_user(true), BTreeMap::new());
+        assert!(ctx.is_admin());
+        assert!(ctx.can_access_workspace("anything"));
+        assert!(ctx.is_workspace_admin("anything"));
+        assert!(!ctx.is_master, "글로벌 admin 계정은 마스터키와 구분된다");
+    }
+
+    #[test]
+    fn test_default_workspace_prefers_personal() {
+        // 유저 컨텍스트는 개인 워크스페이스 u-{username}를 기본으로 선호한다
+        let mut access = BTreeMap::new();
+        access.insert("a-first-sorted".to_string(), Permission::ReadWrite);
+        access.insert("u-alice".to_string(), Permission::Admin);
+        let ctx = AuthContext::from_user(&make_test_user(false), access);
+        assert_eq!(ctx.default_workspace(), "u-alice");
+
+        // 개인 ws가 접근 목록에 없으면 정렬 순 첫 워크스페이스 (결정적)
+        let mut access = BTreeMap::new();
+        access.insert("b-ws".to_string(), Permission::ReadWrite);
+        access.insert("a-ws".to_string(), Permission::ReadOnly);
+        let ctx = AuthContext::from_user(&make_test_user(false), access);
+        assert_eq!(ctx.default_workspace(), "a-ws");
+
+        // 접근이 하나도 없으면 default (resolve 단계에서 403으로 걸러진다)
+        let ctx = AuthContext::from_user(&make_test_user(false), BTreeMap::new());
+        assert_eq!(ctx.default_workspace(), "default");
+    }
+
+    #[test]
+    fn test_from_owned_api_key_intersection_unit() {
+        // 키 스코프 {a, c} ∩ 계정 접근 {a: RO, b: Admin} = {a: min(RW,RO)=RO}
+        let mut key = make_test_key();
+        key.workspaces = vec!["a".to_string(), "c".to_string()];
+        key.permissions = Permission::ReadWrite;
+        key.owner = Some("user_test00000000".to_string());
+
+        let mut user_access = BTreeMap::new();
+        user_access.insert("a".to_string(), Permission::ReadOnly);
+        user_access.insert("b".to_string(), Permission::Admin);
+
+        let ctx = AuthContext::from_owned_api_key(&key, &make_test_user(false), &user_access);
+        assert_eq!(ctx.permission_for("a"), Some(Permission::ReadOnly));
+        assert_eq!(ctx.permission_for("b"), None, "키 스코프 밖");
+        assert_eq!(ctx.permission_for("c"), None, "계정 접근권 밖");
+        assert!(!ctx.is_admin(), "일반 계정 소유 키는 전역 admin 불가");
+        assert_eq!(ctx.user.as_ref().unwrap().username, "alice");
+    }
+
+    #[test]
+    fn test_scoped_workspaces_listing() {
+        // /api/auth/me 표시용 목록: Fixed는 (ws, 키 권한), PerWorkspace는 맵 그대로
+        let key = make_test_key();
+        let ctx = AuthContext::from_api_key(&key);
+        let listed = ctx.scoped_workspaces();
+        assert_eq!(listed.len(), 2);
+        assert!(listed.contains(&("default".to_string(), Permission::ReadWrite)));
+
+        assert!(AuthContext::master().scoped_workspaces().is_empty(), "All 스코프는 명시 목록 없음");
+    }
 
     async fn setup_manager() -> (TempDir, ApiKeyManager) {
         let tmp = TempDir::new().unwrap();
@@ -717,6 +1054,7 @@ mod tests {
             "Test".to_string(),
             vec!["default".to_string()],
             Permission::ReadWrite,
+            None,
             None,
         ).await.unwrap();
 
@@ -738,6 +1076,7 @@ mod tests {
             vec!["default".to_string()],
             Permission::ReadOnly,
             None,
+            None,
         ).await.unwrap();
 
         // 평문 키의 해시가 저장된 해시와 일치해야 한다
@@ -755,9 +1094,9 @@ mod tests {
     async fn test_manager_list_keys_multiple() {
         let (_tmp, manager) = setup_manager().await;
 
-        manager.create_key("Key 1".to_string(), vec!["default".to_string()], Permission::ReadOnly, None).await.unwrap();
-        manager.create_key("Key 2".to_string(), vec!["work".to_string()], Permission::ReadWrite, None).await.unwrap();
-        manager.create_key("Key 3".to_string(), vec!["default".to_string(), "work".to_string()], Permission::Admin, None).await.unwrap();
+        manager.create_key("Key 1".to_string(), vec!["default".to_string()], Permission::ReadOnly, None, None).await.unwrap();
+        manager.create_key("Key 2".to_string(), vec!["work".to_string()], Permission::ReadWrite, None, None).await.unwrap();
+        manager.create_key("Key 3".to_string(), vec!["default".to_string(), "work".to_string()], Permission::Admin, None, None).await.unwrap();
 
         let keys = manager.list_keys().await;
         assert_eq!(keys.len(), 3);
@@ -774,6 +1113,7 @@ mod tests {
             "Find Me".to_string(),
             vec!["default".to_string()],
             Permission::ReadWrite,
+            None,
             None,
         ).await.unwrap();
 
@@ -799,6 +1139,7 @@ mod tests {
             vec!["default".to_string()],
             Permission::ReadWrite,
             None,
+            None,
         ).await.unwrap();
 
         manager.revoke_key(&key.key_id).await.unwrap();
@@ -823,6 +1164,7 @@ mod tests {
             vec!["default".to_string()],
             Permission::ReadWrite,
             None,
+            None,
         ).await.unwrap();
 
         let hashed = hash_key(&raw);
@@ -837,7 +1179,7 @@ mod tests {
         let (_tmp, manager) = setup_manager().await;
         assert!(!manager.has_keys().await);
 
-        manager.create_key("K".to_string(), vec![], Permission::ReadOnly, None).await.unwrap();
+        manager.create_key("K".to_string(), vec![], Permission::ReadOnly, None, None).await.unwrap();
         assert!(manager.has_keys().await);
     }
 
@@ -849,6 +1191,7 @@ mod tests {
             "Usage Track".to_string(),
             vec!["default".to_string()],
             Permission::ReadWrite,
+            None,
             None,
         ).await.unwrap();
 
@@ -870,6 +1213,7 @@ mod tests {
             vec!["default".to_string()],
             Permission::Admin,
             None,
+            None,
         ).await.unwrap();
 
         // 새 매니저로 디스크에서 재로드
@@ -889,6 +1233,7 @@ mod tests {
             vec!["default".to_string()],
             Permission::ReadWrite,
             Some(expires),
+            None,
         ).await.unwrap();
 
         // 키 자체는 검색 가능하지만, is_expired()가 true를 반환해야 한다
@@ -906,6 +1251,7 @@ mod tests {
             "WS Check".to_string(),
             vec!["allowed-ws".to_string()],
             Permission::ReadWrite,
+            None,
             None,
         ).await.unwrap();
 
@@ -926,6 +1272,7 @@ mod tests {
             vec!["default".to_string()],
             Permission::ReadWrite,
             None,
+            None,
         ).await.unwrap();
 
         let authed = manager.authenticate(&raw).await;
@@ -941,6 +1288,7 @@ mod tests {
             vec!["default".to_string()],
             Permission::ReadWrite,
             None,
+            None,
         ).await.unwrap();
 
         assert!(manager.authenticate("maia_wrongtoken").await.is_none());
@@ -955,6 +1303,7 @@ mod tests {
             vec!["default".to_string()],
             Permission::ReadWrite,
             Some(expires),
+            None,
         ).await.unwrap();
 
         // 만료된 키는 검색은 되지만 authenticate는 거부해야 한다
@@ -995,6 +1344,7 @@ mod tests {
             vec!["ws-a".to_string(), "ws-b".to_string()],
             Permission::ReadWrite,
             Some(expires),
+            None,
         ).await.unwrap();
 
         // 디스크에서 재로드
@@ -1030,8 +1380,8 @@ mod tests {
     #[tokio::test]
     async fn test_manager_save_is_atomic_no_temp_left() {
         let (tmp, manager) = setup_manager().await;
-        manager.create_key("A".to_string(), vec!["default".to_string()], Permission::ReadOnly, None).await.unwrap();
-        manager.create_key("B".to_string(), vec!["work".to_string()], Permission::ReadOnly, None).await.unwrap();
+        manager.create_key("A".to_string(), vec!["default".to_string()], Permission::ReadOnly, None, None).await.unwrap();
+        manager.create_key("B".to_string(), vec!["work".to_string()], Permission::ReadOnly, None, None).await.unwrap();
 
         // 원자적 저장(temp+rename) 후 .tmp 파일이 남지 않아야 한다
         let tmp_path = tmp.path().join("api_keys.json.tmp");
@@ -1050,6 +1400,7 @@ mod tests {
             vec!["default".to_string()],
             Permission::ReadOnly,
             None,
+            None,
         ).await.unwrap();
 
         // 첫 갱신은 None → Some (임계값 무관하게 반영)
@@ -1061,5 +1412,57 @@ mod tests {
         manager.update_last_used(&key.key_id).await.unwrap();
         let second = manager.list_keys().await[0].last_used_at;
         assert_eq!(first, second, "임계값 내 재갱신은 last_used_at을 변경하지 않아야 한다");
+    }
+
+    // ──── owner (계정 하위 키) ────
+
+    #[test]
+    fn test_api_key_deserialize_legacy_without_owner() {
+        // owner 필드가 없는 기존 api_keys.json도 로드되어야 한다(하위호환).
+        // 이 불변식이 깨지면 기동 시 기존 키 전체가 파싱 실패로 유실된다.
+        let json = r#"{
+            "key_id": "maia_sk_legacy000000",
+            "hashed_key": "sha256:abc",
+            "label": "Legacy",
+            "workspaces": ["default"],
+            "permissions": "read_write",
+            "created_at": "2026-04-01T00:00:00Z",
+            "last_used_at": null,
+            "expires_at": null
+        }"#;
+        let key: ApiKey = serde_json::from_str(json).unwrap();
+        assert_eq!(key.owner, None, "누락된 owner는 None(시스템 키)으로 기본값 처리");
+    }
+
+    #[tokio::test]
+    async fn test_manager_list_keys_for_owner() {
+        let (_tmp, manager) = setup_manager().await;
+        manager.create_key("sys".to_string(), vec!["default".to_string()], Permission::ReadOnly, None, None).await.unwrap();
+        manager.create_key("mine-1".to_string(), vec!["default".to_string()], Permission::ReadOnly, None, Some("user_a".to_string())).await.unwrap();
+        manager.create_key("mine-2".to_string(), vec!["default".to_string()], Permission::ReadOnly, None, Some("user_a".to_string())).await.unwrap();
+        manager.create_key("theirs".to_string(), vec!["default".to_string()], Permission::ReadOnly, None, Some("user_b".to_string())).await.unwrap();
+
+        let mine = manager.list_keys_for_owner("user_a").await;
+        assert_eq!(mine.len(), 2);
+        assert!(mine.iter().all(|k| k.owner.as_deref() == Some("user_a")));
+    }
+
+    #[tokio::test]
+    async fn test_manager_revoke_keys_for_owner() {
+        let (tmp, manager) = setup_manager().await;
+        manager.create_key("sys".to_string(), vec!["default".to_string()], Permission::ReadOnly, None, None).await.unwrap();
+        let (_, raw_owned) = manager.create_key("mine".to_string(), vec!["default".to_string()], Permission::ReadOnly, None, Some("user_a".to_string())).await.unwrap();
+
+        let removed = manager.revoke_keys_for_owner("user_a").await.unwrap();
+        assert_eq!(removed, 1);
+        assert!(manager.authenticate(&raw_owned).await.is_none(), "폐기된 소유 키는 인증 불가");
+        assert_eq!(manager.list_keys().await.len(), 1, "시스템 키는 남는다");
+
+        // 디스크에도 반영 (재로드 검증)
+        let m2 = ApiKeyManager::new(tmp.path().to_str().unwrap()).await.unwrap();
+        assert_eq!(m2.list_keys().await.len(), 1);
+
+        // 소유 키가 없는 계정은 no-op
+        assert_eq!(manager.revoke_keys_for_owner("user_none").await.unwrap(), 0);
     }
 }

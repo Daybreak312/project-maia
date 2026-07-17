@@ -38,8 +38,8 @@ pub async fn run_patrol_handler(
     Extension(ctx): Extension<AuthContext>,
     Query(wq): Query<WorkspaceQuery>,
 ) -> Result<Json<PatrolRun>, (StatusCode, String)> {
-    require_write(&ctx)?;
     let workspace = resolve_and_authorize_workspace(&state, &ctx, wq.workspace).await?;
+    require_write(&ctx, &workspace)?;
 
     state
         .patrol
@@ -122,8 +122,8 @@ pub async fn judge_reviews_handler(
     Query(wq): Query<WorkspaceQuery>,
     Json(req): Json<JudgeRequest>,
 ) -> Result<Json<JudgeResponse>, (StatusCode, String)> {
-    require_write(&ctx)?;
     let workspace = resolve_and_authorize_workspace(&state, &ctx, wq.workspace).await?;
+    require_write(&ctx, &workspace)?;
 
     state
         .patrol
@@ -153,8 +153,8 @@ pub async fn submit_feedback_handler(
     Query(wq): Query<WorkspaceQuery>,
     Json(req): Json<FeedbackRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    require_write(&ctx)?;
     let workspace = resolve_and_authorize_workspace(&state, &ctx, wq.workspace).await?;
+    require_write(&ctx, &workspace)?;
 
     state
         .patrol

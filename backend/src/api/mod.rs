@@ -108,14 +108,35 @@ pub fn require_admin(ctx: &AuthContext) -> Result<(), (StatusCode, String)> {
     }
 }
 
-/// 쓰기 권한(read_write 이상)을 요구한다. 실패 시 403.
-pub fn require_write(ctx: &AuthContext) -> Result<(), (StatusCode, String)> {
-    if ctx.can_write() {
+/// 대상 워크스페이스에 대한 쓰기 권한(read_write 이상)을 요구한다. 실패 시 403.
+///
+/// 전역 권한이 아니라 "그 워크스페이스에 대한" 유효 권한으로 판정한다 —
+/// 유저 세션은 워크스페이스마다 role이 다를 수 있기 때문. 호출부는 반드시
+/// `resolve_and_authorize_workspace`로 대상을 확정한 뒤 호출한다.
+pub fn require_write(ctx: &AuthContext, workspace_id: &str) -> Result<(), (StatusCode, String)> {
+    if ctx.can_write_workspace(workspace_id) {
         Ok(())
     } else {
         Err((
             StatusCode::FORBIDDEN,
-            "Write permission required".to_string(),
+            format!("Write permission required for workspace '{}'", workspace_id),
+        ))
+    }
+}
+
+/// 워크스페이스 관리 권한을 요구한다: 글로벌 admin(마스터키·admin 계정·admin 키)
+/// 또는 해당 워크스페이스 role=admin 멤버. 실패 시 403.
+/// (멤버십·공개 설정 변경 등 워크스페이스 거버넌스 작업의 관문)
+pub fn require_workspace_admin(
+    ctx: &AuthContext,
+    workspace_id: &str,
+) -> Result<(), (StatusCode, String)> {
+    if ctx.is_admin() || ctx.is_workspace_admin(workspace_id) {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::FORBIDDEN,
+            format!("Admin permission required for workspace '{}'", workspace_id),
         ))
     }
 }
@@ -123,14 +144,34 @@ pub fn require_write(ctx: &AuthContext) -> Result<(), (StatusCode, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::keys::{AuthSource, WorkspaceScope};
     use crate::auth::Permission;
+    use std::collections::BTreeMap;
 
     fn ctx(perm: Permission) -> AuthContext {
         AuthContext {
             key_id: "t".to_string(),
             permissions: perm,
-            workspaces: vec!["default".to_string()],
+            scope: WorkspaceScope::Fixed(vec!["default".to_string()]),
             is_master: false,
+            source: AuthSource::ApiKey,
+            user: None,
+        }
+    }
+
+    /// 워크스페이스별 role이 다른 유저 세션 컨텍스트
+    fn user_ctx(map: &[(&str, Permission)]) -> AuthContext {
+        let scope: BTreeMap<String, Permission> = map
+            .iter()
+            .map(|(w, p)| (w.to_string(), p.clone()))
+            .collect();
+        AuthContext {
+            key_id: "user_test".to_string(),
+            permissions: Permission::ReadOnly,
+            scope: WorkspaceScope::PerWorkspace(scope),
+            is_master: false,
+            source: AuthSource::Session,
+            user: None,
         }
     }
 
@@ -151,14 +192,51 @@ mod tests {
 
     #[test]
     fn test_require_write_readwrite_and_admin_pass() {
-        assert!(require_write(&ctx(Permission::ReadWrite)).is_ok());
-        assert!(require_write(&ctx(Permission::Admin)).is_ok());
-        assert!(require_write(&ctx(Permission::ReadOnly)).is_err());
+        // 기존 API 키(Fixed 스코프) 회귀: 스코프 내 워크스페이스에 대해
+        // 키의 단일 권한으로 판정된다.
+        assert!(require_write(&ctx(Permission::ReadWrite), "default").is_ok());
+        assert!(require_write(&ctx(Permission::Admin), "default").is_ok());
+        assert!(require_write(&ctx(Permission::ReadOnly), "default").is_err());
     }
 
     #[test]
     fn test_require_write_returns_403() {
-        let (status, _) = require_write(&ctx(Permission::ReadOnly)).unwrap_err();
+        let (status, _) = require_write(&ctx(Permission::ReadOnly), "default").unwrap_err();
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn test_require_write_out_of_scope_denied() {
+        // 쓰기 권한이 있어도 스코프 밖 워크스페이스는 거부 (fail-closed).
+        // 정상 흐름에선 resolve가 먼저 403을 내지만, 이 함수 단독으로도 안전해야 한다.
+        assert!(require_write(&ctx(Permission::ReadWrite), "other-ws").is_err());
+    }
+
+    #[test]
+    fn test_require_write_per_workspace_roles() {
+        // 유저 세션: 워크스페이스마다 다른 role — ws별로 판정이 달라야 한다.
+        let ctx = user_ctx(&[("ws-rw", Permission::ReadWrite), ("ws-ro", Permission::ReadOnly)]);
+        assert!(require_write(&ctx, "ws-rw").is_ok());
+        assert!(require_write(&ctx, "ws-ro").is_err());
+        assert!(require_write(&ctx, "ws-none").is_err());
+    }
+
+    #[test]
+    fn test_require_workspace_admin_paths() {
+        // 글로벌 admin(마스터키)은 모든 워크스페이스 관리 가능
+        assert!(require_workspace_admin(&AuthContext::master(), "any").is_ok());
+        // admin 권한 API 키(전역 admin 의미 유지 — 기존 require_admin과 동일 모델)
+        assert!(require_workspace_admin(&ctx(Permission::Admin), "elsewhere").is_ok());
+
+        // 해당 ws role=admin 멤버는 그 ws만 관리 가능
+        let ws_admin = user_ctx(&[("mine", Permission::Admin), ("other", Permission::ReadWrite)]);
+        assert!(require_workspace_admin(&ws_admin, "mine").is_ok());
+        assert!(require_workspace_admin(&ws_admin, "other").is_err());
+        assert!(require_workspace_admin(&ws_admin, "stranger").is_err());
+
+        // 일반 멤버는 불가
+        let member = user_ctx(&[("mine", Permission::ReadWrite)]);
+        let (status, _) = require_workspace_admin(&member, "mine").unwrap_err();
         assert_eq!(status, StatusCode::FORBIDDEN);
     }
 
