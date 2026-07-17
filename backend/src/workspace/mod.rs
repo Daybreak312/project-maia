@@ -9,4 +9,4 @@ pub use config::{
 };
 pub use connector_config::{ConnectorInstance, ConnectorSpec, LocalDirectoryConfig};
 pub use manager::WorkspaceManager;
-pub use members::{MembershipManager, WorkspaceMember, WorkspaceMembers, WorkspaceVisibility};
+pub use members::{MembershipManager, WorkspaceMembers, WorkspaceVisibility};

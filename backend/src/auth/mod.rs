@@ -6,7 +6,7 @@ pub use keys::{
     ApiKey, ApiKeyManager, AuthContext, AuthSource, Permission, UserIdentity, WorkspaceScope,
     generate_key_id, generate_raw_key, hash_key,
 };
-pub use sessions::{Session, SessionManager, SESSION_COOKIE_NAME};
+pub use sessions::{SessionManager, SESSION_COOKIE_NAME};
 pub use users::{User, UserManager};
 
 use std::collections::BTreeMap;

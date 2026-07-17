@@ -33,7 +33,6 @@ pub use keys::{
 };
 pub use users::{
     change_password_handler, create_user_handler, delete_user_handler, list_users_handler,
-    UserInfo,
 };
 pub use patrol::{
     judge_reviews_handler, list_reviews_handler, metrics_handler, patrol_history_handler,
