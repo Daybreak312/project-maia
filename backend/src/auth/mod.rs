@@ -1,9 +1,11 @@
 pub mod keys;
+pub mod users;
 
 pub use keys::{
     ApiKey, ApiKeyManager, AuthContext, Permission,
     generate_key_id, generate_raw_key, hash_key,
 };
+pub use users::{User, UserManager};
 
 use std::sync::Arc;
 

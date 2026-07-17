@@ -30,6 +30,12 @@ unicode-segmentation = "1.10"
 # Crypto (API Key hashing)
 sha2 = "0.10"
 
+# 비밀번호 해싱 (argon2id — 저엔트로피 입력이라 SHA-256 부적합)
+argon2 = "0.5"
+
+# CSPRNG (세션 토큰 — uuid 조합 금지, OS 엔트로피 직접 사용)
+rand = "0.8"
+
 # Base64 (Codex JWT exp 파싱 — base64url payload 디코딩)
 base64 = "0.22"
 
