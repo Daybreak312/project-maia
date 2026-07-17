@@ -27,7 +27,10 @@ pub use auth::{login_handler, logout_handler, me_handler};
 pub use members::{
     list_members_handler, remove_member_handler, set_visibility_handler, upsert_member_handler,
 };
-pub use keys::{list_keys_handler, create_key_handler, revoke_key_handler};
+pub use keys::{
+    create_key_handler, create_my_key_handler, list_keys_handler, list_my_keys_handler,
+    revoke_key_handler, revoke_my_key_handler,
+};
 pub use users::{
     change_password_handler, create_user_handler, delete_user_handler, list_users_handler,
     UserInfo,

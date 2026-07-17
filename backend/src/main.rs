@@ -257,6 +257,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/users/:id/password", put(api::change_password_handler))
         // 현재 인증 주체 정보 (모든 인증 소스 허용)
         .route("/api/auth/me", get(api::me_handler))
+        // 계정 셀프서비스 API 키 (로그인 세션 전용 — 핸들러에서 강제)
+        .route("/api/me/keys", get(api::list_my_keys_handler))
+        .route("/api/me/keys", post(api::create_my_key_handler))
+        .route("/api/me/keys/:key_id", delete(api::revoke_my_key_handler))
         // Patrol·거버넌스 (Phase 5): 실행/판단/피드백은 write, 조회는 워크스페이스 접근
         .route("/api/patrol/run", post(api::run_patrol_handler))
         .route("/api/patrol/history", get(api::patrol_history_handler))
