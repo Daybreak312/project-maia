@@ -250,6 +250,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/users", post(api::create_user_handler))
         .route("/api/users/:id", delete(api::delete_user_handler))
         .route("/api/users/:id/password", put(api::change_password_handler))
+        // 현재 인증 주체 정보 (모든 인증 소스 허용)
+        .route("/api/auth/me", get(api::me_handler))
         // Patrol·거버넌스 (Phase 5): 실행/판단/피드백은 write, 조회는 워크스페이스 접근
         .route("/api/patrol/run", post(api::run_patrol_handler))
         .route("/api/patrol/history", get(api::patrol_history_handler))
@@ -262,9 +264,13 @@ async fn main() -> anyhow::Result<()> {
             auth::require_auth,
         ));
 
-    // 인증 불필요한 라우트
+    // 인증 불필요한 라우트.
+    // login: 자격증명 획득 자체가 목적. logout: 무효 세션이어도 쿠키를 지워야
+    // 하므로 인증 뒤에 두지 않는다 (핸들러가 쿠키의 세션만 폐기 — 멱등).
     let public_routes = Router::new()
-        .route("/health", get(health_handler));
+        .route("/health", get(health_handler))
+        .route("/api/auth/login", post(api::login_handler))
+        .route("/api/auth/logout", post(api::logout_handler));
 
     // 정적 파일 서빙 (환경변수 우선, 없으면 기본 경로)
     let static_dir = std::env::var("STATIC_DIR")

@@ -1,3 +1,4 @@
+mod auth;
 mod ingest;
 mod search;
 mod documents;
@@ -21,6 +22,7 @@ pub use connectors::{
     connector_status_handler, delete_connector_handler, list_connectors_handler,
     register_connector_handler, trigger_connector_handler,
 };
+pub use auth::{login_handler, logout_handler, me_handler};
 pub use keys::{list_keys_handler, create_key_handler, revoke_key_handler};
 pub use users::{
     change_password_handler, create_user_handler, delete_user_handler, list_users_handler,
