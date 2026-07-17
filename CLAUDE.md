@@ -64,35 +64,38 @@
 ### 8. 역할의 경계 (Scope of Autonomy)
 - **How vs What:** "어떻게(How)"는 자율적으로 결정하되, "무엇을(What)" 만들지는 사용자의 승인을 받아라.
 
-## 📁 컨텍스트 관리 시스템 (The 5-Layer Context System)
-에이전트는 프로젝트의 연속성(Continuity)과 정합성(Consistency)을 위해 루트의 `./contexts/` 디렉토리를 **Single Source of Truth**로 관리한다. 새로운 세션이 시작되면 **반드시** 이 파일들을 먼저 읽어 프로젝트의 맥락을 파악해야 한다.
+## 📁 컨텍스트 관리 시스템 (contexts/ + docs/)
+에이전트는 프로젝트의 연속성(Continuity)과 정합성(Consistency)을 위해 두 개의 문서 레이어를 관리한다. 새로운 세션이 시작되면 **반드시** 아래 파일들을 먼저 읽어 프로젝트의 맥락을 파악해야 한다.
+
+- **`./contexts/`** — **작업 컨텍스트의 SSoT.** 정체성·정책·현재 작업·현황·결정 이력. 작업 단위로 갱신된다.
+- **`./docs/`** — **시스템 사실(Fact)의 SSoT.** 아키텍처·API·데이터 모델 등 "지금 어떻게 동작하는가". 인덱스와 코드→문서 매핑표는 [docs/README.md](docs/README.md). **코드를 바꾸면 같은 커밋에서 해당 문서를 갱신한다.**
 
 ### 1. 파일 구조 및 독해 가이드
 각 파일은 서로 다른 '계층(Layer)'의 정보를 담고 있다. 에이전트는 아래 순서대로 파일을 참조하여 컨텍스트를 로드해야 한다.
 
-1. **`primary.md` (Identity & Goal) - [WHO & WHY]**
+1. **`contexts/primary.md` (Identity & Goal) - [WHO & WHY]**
     *   **설명:** 프로젝트의 정체성, 핵심 가치(Deep Dive, No Compromise), 현재 페이즈를 정의한 헌법.
     *   **활용:** "내가 지금 대충 짜도 되는 프로토타입을 만드는가, 아니면 견고한 시스템을 만드는가?"에 대한 판단 기준.
 
-2.  **`policy.md` (Rules & Regulations) - [HOW]**
+2.  **`contexts/policy.md` (Rules & Regulations) - [HOW]**
     *   **설명:** 보안 정책, 기술 스택 제약, 코딩 컨벤션 등 **반드시 지켜야 할 법률**.
-    *   **활용:** 코드를 작성하기 전, "Redis에 평문을 넣어도 되나?", "라이브러리를 써도 되나?"를 확인하는 규정집.
+    *   **활용:** 코드를 작성하기 전, "인증 없이 노출해도 되나?", "새 DB를 써도 되나?"를 확인하는 규정집.
 
-3.  **`spec.md` (Current Task Specs) - [WHAT]**
+3.  **`contexts/spec.md` (Current Task Specs) - [WHAT]**
     *   **설명:** **현재 진행 중인 작업**의 상세 기능 명세서. (User Story, Requirements, Edge Cases)
-    *   **활용:** "지금 당장 어떤 함수와 API를 구현해야 하는가?"에 대한 구체적인 작업 지시서. 가장 빈번하게 참조된다.
+    *   **활용:** "지금 당장 어떤 함수와 API를 구현해야 하는가?"에 대한 구체적인 작업 지시서. 활성 작업이 없으면 비어 있는 것이 정상.
 
-4.  **`architecture.md` (System Blueprint) - [WHERE]**
-    *   **설명:** 현재 구축된 인프라, DB 스키마, API 포트, 네트워크 구조 등의 **사실(Fact)** 정보.
-    *   **활용:** "Auth Server 포트가 몇 번이지?", "User 테이블 스키마가 어떻게 생겼지?"를 확인할 때 보는 지도.
+4.  **`docs/` (System Facts) - [WHERE]**
+    *   **설명:** 현재 구축된 시스템의 **사실(Fact)** — 아키텍처, API, 데이터 모델, 프로바이더, 배포, 운영 런북. (구 `contexts/architecture.md`는 이곳으로 이관됨 — DEC-012)
+    *   **활용:** "포트가 몇 번이지?", "이 엔드포인트 스키마가 뭐지?"를 확인할 때 보는 지도. 진입점은 [docs/README.md](docs/README.md).
 
-5.  **`plan.md` (Roadmap & Status) - [WHEN]**
+5.  **`contexts/plan.md` (Roadmap & Status) - [WHEN]**
     *   **설명:** 전체 프로젝트의 일정과 각 Task의 완료/진행/대기 상태.
     *   **활용:** 현재 작업의 전후 맥락을 파악하고, 진척도를 업데이트하는 현황판.
 
-6.  **`decision_log.md` (History & Context) - [WHY HISTORY]**
+6.  **`contexts/decision_log.md` (History & Context) - [WHY HISTORY]**
     *   **설명:** 과거의 주요 기술적 의사결정과 그 이유(Reasoning)에 대한 기록.
-    *   **활용:** "왜 아키텍처가 이렇게 되었지?"에 대한 역사적 맥락이 필요할 때 참조.
+    *   **활용:** "왜 아키텍처가 이렇게 되었지?"에 대한 역사적 맥락이 필요할 때 참조. (Phase별 상세는 `prd-maia-brain/`)
 
 ### 2. 정책 작성 규칙 (Structured Policy)
 `policy.md` 작성 시 반드시 아래의 구조화된 포맷을 준수하여 가독성을 높인다.

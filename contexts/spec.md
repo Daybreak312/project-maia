@@ -1,149 +1,31 @@
-# Feature Specification
+# Current Task Specs — 현재 진행 중인 작업
 
-## Phase 1: MVP
+> 이 파일은 "지금 무엇을 만들고 있는가"만 담는다. 작업이 없으면 비어 있는 것이
+> 정상이다. 완료된 스펙은 여기서 지우고, 결과 사실은 `docs/`에 반영한다.
+> (역사적 스펙: Phase별 PRD → `prd-maia-brain/`, MVP 시절 스펙 → git 히스토리)
 
-### 1.1 정보 입력 (Ingest)
+## 활성 스펙
 
-**Input**: 자연어 텍스트
-```
-"오늘 A회사 면접 봤는데, 연봉 8천 제안받음.
- 분위기는 좋았는데 기술스택이 레거시야"
-```
+**없음 — 운영 단계.** (2026-07-17 기준)
 
-**Process**:
-1. 원본 저장 (raw JSON 파일)
-2. LLM으로 파싱 (선택된 Provider 사용)
-   - 개요(summary) 생성
-   - 태그 추출
-   - 엔티티 추출 (회사명, 금액, 날짜, 스킬 등)
-3. 임베딩 생성 (summary 기반)
-4. Qdrant에 벡터 인덱싱
+직전 완료: Phase 6(구독 프로바이더·로컬 임베딩) + sonnet-5 전환 핫픽스(커밋 712484e)
++ 문서 체계 개편(docs/ 신설).
 
-**Output**: 저장 완료 + 추출된 메타데이터 반환
+## 다음 작업 후보 (착수 시 이 섹션을 스펙으로 승격)
 
-### 1.2 검색 (Search)
+우선순위는 [docs/known-issues.md](../docs/known-issues.md) 권고 순서를 따른다:
 
-**Input**: 자연어 쿼리 + 검색 모드 선택
+1. **H1** — `MAIA_API_KEY` fail-open 방어 (compose 필수 치환 → 앱 레벨 fail-closed)
+2. **H2** — settings.json 손상 시 백업+명시 에러 (auth/keys.rs 패턴 이식)
+3. **M5** — qdrant 이미지 태그 고정
+4. **M1·M2·M4** — 프로바이더 견고화 묶음 (재시도/3상 검증/JSON 추출/강등 관측)
+5. **M3·M6** — poison item dead-letter 정책 + thinking 제어 (설계 판단 필요)
 
-**Search Modes**:
-- `hybrid` (기본): 벡터 + 키워드 검색 결과를 RRF로 결합
-- `vector`: 쿼리 임베딩 → Qdrant 코사인 유사도 검색
-- `keyword`: 전체 문서 BM25 스코어링
+착수는 소유자 승인 후 (`policy.md`의 How vs What 경계).
 
-**Output**:
-```json
-{
-  "results": [{ "id": "...", "summary": "...", "tags": [...], "relevance_score": 0.85 }],
-  "sources_used": ["doc_001", "doc_003"],
-  "total": 15,
-  "mode": "hybrid"
-}
-```
+## 스펙 작성 규칙
 
-### 1.3 AI 모델 추상화
-
-**지원 모델**:
-| Provider | 파싱 모델 | 임베딩 모델 | 임베딩 차원 |
-|----------|-----------|-------------|-------------|
-| Gemini | gemini-2.5-flash | gemini-embedding-001 | 768 |
-| Claude | claude-sonnet-4-20250514 | (OpenAI 폴백) | - |
-| OpenAI | gpt-4o-mini | text-embedding-3-small | 1536 |
-
-- API Key는 `data/settings.json`에 파일 기반 저장
-- 런타임에 Provider 변경 가능
-- Provider 변경 시 임베딩 차원이 다르면 `POST /api/reindex` 필요
-
-### 1.4 프론트엔드 UI (React + Vite)
-
-**페이지 구성**:
-1. **Add** (`/`) — 자연어 입력으로 정보 추가
-2. **Search** (`/search`) — 하이브리드 검색, 모드 선택
-3. **Browse** (`/browse`) — 전체 문서 브라우징
-4. **Admin** (`/admin`) — API Key 관리, Provider 선택
-
-### 1.5 MCP 서버
-
-로컬 MCP 서버(TypeScript, STDIO transport)가 원격 Maia 백엔드의 REST API를 호출하는 브릿지 구조.
-
-**등록 Tool**:
-| Tool | 트리거 예시 | Maia API |
-|------|-------------|----------|
-| `search_context` | "내 면접 경험 알려줘" | `POST /search` |
-| `ingest_information` | "이거 기억해둬" | `POST /ingest` |
-| `get_document` | 검색 결과 원문 조회 | `GET /documents/{id}` |
-| `list_recent_documents` | "최근에 뭘 저장했지?" | `GET /recent` |
-| `get_tags` | 태그 목록 확인 | `GET /tags` |
-
-**호환 AI 도구**: Claude Desktop, Claude Code, Cursor, VS Code Copilot, Gemini CLI
-
-### 1.6 API 인증
-
-- `MAIA_API_KEY` 환경변수로 Bearer 토큰 인증
-- 미설정 시 인증 비활성화 (로컬 개발)
-- `/health`만 인증 불필요
-
----
-
-## API Endpoints
-
-```
-# 인증 필요 (MAIA_API_KEY 설정 시)
-POST   /ingest                          — 정보 저장
-POST   /search                          — 검색
-GET    /documents/{id}                  — 문서 조회
-PUT    /documents/{id}                  — 문서 수정 (재파싱 + 재임베딩)
-DELETE /documents/{id}                  — 문서 삭제
-GET    /recent?limit=20&offset=0        — 최근 문서 목록
-GET    /tags                            — 전체 태그 목록
-POST   /api/reindex                     — 전체 문서 재인덱싱
-GET    /api/settings                    — 설정 조회
-PUT    /api/settings                    — Provider 변경
-POST   /api/settings/models/{provider}/key   — API Key 설정
-DELETE /api/settings/models/{provider}/key   — API Key 삭제
-POST   /api/settings/models/{provider}/test  — API Key 유효성 검증
-
-# 인증 불필요
-GET    /health                          — 헬스체크
-```
-
----
-
-## 배포 아키텍처
-
-### Docker Compose 구성
-```
-services:
-  qdrant       — 벡터 DB
-  app (maia)   — Rust 백엔드 (:8080)
-  nginx        — 리버스 프록시 (HTTPS, :443)
-```
-
-### MCP 클라이언트 설정 (claude_desktop_config.json)
-```json
-{
-  "mcpServers": {
-    "maia": {
-      "command": "node",
-      "args": ["/path/to/project-maia/mcp/dist/index.js"],
-      "env": {
-        "MAIA_URL": "https://your-server:8080",
-        "MAIA_API_KEY": "your-secret-key"
-      }
-    }
-  }
-}
-```
-
----
-
-## Phase 2: 확장 (Future)
-
-### 2.1 웹 AI 연동
-- ChatGPT GPT Actions (OpenAPI spec)
-- Gemini Google Extensions
-
-### 2.2 자동 수집
-- Threads, GeekNews 등 크롤링
-
-### 2.3 프로젝트 분리
-- 멀티 collection 지원
+새 작업 착수 시 이 파일에 다음 구조로 적는다:
+목표 / 사용자 스토리 / 기능 요구사항(FR) / 비기능 요구사항·불변식 / 엣지 케이스 /
+종료 조건(테스트 게이트). Phase 6 스펙(`prd-maia-brain/06-phase6-providers.md`)이
+좋은 선례다.
