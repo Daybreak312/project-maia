@@ -7,8 +7,9 @@
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::OnceCell;
 
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
@@ -31,29 +32,47 @@ fn e5_query(text: &str) -> String {
     format!("query: {text}")
 }
 
-/// 로컬 임베딩 provider. 모델은 첫 embed 호출 시 lazy 로드/다운로드된다.
+/// 프로세스 전역 모델 캐시(캐시 경로 키). provider 인스턴스는 호출 단위로 새로
+/// 조립되므로(indexer `embedding_provider_for` → `Box::new`) 인스턴스 필드에만
+/// 캐시하면 동시 워커 수만큼 모델이 중복 로드된다 — 79건 일괄 동기화에서 동시
+/// 로드 3~4개(개당 수백 MB ort 세션)가 컨테이너 메모리 캡(3g)을 넘겨 OOM 크래시
+/// 루프 실측(2026-07-17). 같은 경로의 모델을 프로세스당 1개로 보장한다.
+static MODEL_CACHE: OnceLock<Mutex<HashMap<PathBuf, Arc<OnceCell<Arc<Mutex<TextEmbedding>>>>>>> =
+    OnceLock::new();
+
+/// `cache_dir`에 대응하는 전역 lazy-init 셀을 얻는다. 맵 락은 조회/삽입 동안만
+/// 잡고(await 없음), 실제 모델 로드는 셀의 `get_or_try_init`이 직렬화한다.
+fn model_cell(cache_dir: &Path) -> Arc<OnceCell<Arc<Mutex<TextEmbedding>>>> {
+    let map = MODEL_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    // 락 오염 복구: 락 구간엔 패닉 가능 연산이 없어 맵은 항상 유효 상태다.
+    let mut guard = map.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard
+        .entry(cache_dir.to_path_buf())
+        .or_insert_with(|| Arc::new(OnceCell::new()))
+        .clone()
+}
+
+/// 로컬 임베딩 provider. 모델은 첫 embed 호출 시 lazy 로드/다운로드되며,
+/// 같은 캐시 경로면 인스턴스가 몇 개든 전역 캐시의 단일 모델을 공유한다.
 ///
 /// fastembed `TextEmbedding::embed`가 `&mut self`를 요구하므로 `Mutex`로 내부
 /// 가변성을 감싼다. 초기화·추론은 블로킹 CPU 작업이라 `spawn_blocking`으로 런타임
 /// 워커 스레드를 막지 않는다.
 pub struct LocalEmbeddingProvider {
     cache_dir: PathBuf,
-    model: OnceCell<Arc<Mutex<TextEmbedding>>>,
 }
 
 impl LocalEmbeddingProvider {
     /// `cache_dir`은 모델 파일 캐시 위치(보통 `DATA_DIR/models`).
     pub fn new(cache_dir: PathBuf) -> Self {
-        Self {
-            cache_dir,
-            model: OnceCell::new(),
-        }
+        Self { cache_dir }
     }
 
-    /// lazy 초기화 — 최초 호출에서만 모델을 로드/다운로드한다. 초기화 실패는
-    /// 명확한 에러로 반환되어 상위 raw 폴백 불변식이 그대로 발동한다.
+    /// lazy 초기화 — 프로세스에서 경로당 최초 호출만 모델을 로드/다운로드한다.
+    /// 초기화 실패는 명확한 에러로 반환되어 상위 raw 폴백 불변식이 그대로
+    /// 발동한다(OnceCell 규약상 실패한 초기화는 캐시되지 않아 다음 호출이 재시도).
     async fn model(&self) -> Result<Arc<Mutex<TextEmbedding>>> {
-        self.model
+        model_cell(&self.cache_dir)
             .get_or_try_init(|| async {
                 let cache = self.cache_dir.clone();
                 let model = tokio::task::spawn_blocking(move || {
@@ -141,6 +160,17 @@ mod tests {
         let provider = LocalEmbeddingProvider::new(PathBuf::from("/tmp/does-not-matter"));
         assert_eq!(provider.dimension(), 384);
         assert_eq!(LOCAL_EMBED_DIM, 384);
+    }
+
+    /// 전역 모델 캐시: 같은 경로는 같은 셀을 공유(인스턴스 무관), 다른 경로는
+    /// 분리된다 — 워커별 provider 재조립이 모델 중복 로드로 이어지지 않는 근거.
+    #[test]
+    fn test_model_cell_shared_per_path() {
+        let a1 = model_cell(Path::new("/tmp/maia-cell-a"));
+        let a2 = model_cell(Path::new("/tmp/maia-cell-a"));
+        let b = model_cell(Path::new("/tmp/maia-cell-b"));
+        assert!(Arc::ptr_eq(&a1, &a2));
+        assert!(!Arc::ptr_eq(&a1, &b));
     }
 
     /// 실제 모델 로드 + 임베딩 통합 테스트. 모델 다운로드(수백 MB)가 필요하므로
