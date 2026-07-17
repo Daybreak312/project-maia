@@ -244,6 +244,8 @@ export interface SyncTriggerRequest {
 export type ReviewStatus = 'pending' | 'valid' | 'needs_fix' | 'deleted' | 'dismissed';
 export type DetectorKind = 'staleness' | 'duplicate' | 'orphan' | 'external_mismatch';
 export type ReviewDecision = 'valid' | 'needs_fix' | 'deleted' | 'dismissed';
+/** 판단 주체 — 사람(수동) vs AI 자동 판정(review_mode=auto). */
+export type DecidedBy = 'human' | 'auto';
 
 /** Review Queue 한 항목 (탐지 후보 + 판단 상태). */
 export interface ReviewItem {
@@ -257,6 +259,10 @@ export interface ReviewItem {
   status: ReviewStatus;
   created_at: string;
   decided_at?: string | null;
+  /** 판단 주체(대기 중이면 없음). auto 판정의 감사 추적용. */
+  decided_by?: DecidedBy | null;
+  /** 판단 근거(주로 auto 판정의 LLM/재유입 사유). */
+  decision_reason?: string | null;
 }
 
 export interface JudgeResponse {

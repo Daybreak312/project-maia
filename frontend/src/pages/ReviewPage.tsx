@@ -32,6 +32,7 @@ const KIND_COLOR: Record<DetectorKind, string> = {
 const STATUS_FILTERS: { value: ReviewStatus | 'all'; label: string }[] = [
   { value: 'pending', label: 'Pending' },
   { value: 'valid', label: 'Valid' },
+  { value: 'needs_fix', label: 'Needs fix' },
   { value: 'deleted', label: 'Deleted' },
   { value: 'dismissed', label: 'Dismissed' },
   { value: 'all', label: 'All' },
@@ -99,8 +100,23 @@ function ReviewCard({
                 {item.status.replace('_', ' ')}
               </span>
             )}
+            {!isPending && item.decided_by && (
+              <span
+                className={`text-xs px-2 py-0.5 rounded ${
+                  item.decided_by === 'auto'
+                    ? 'bg-primary/20 text-primary'
+                    : 'bg-border text-muted'
+                }`}
+                title={item.decided_by === 'auto' ? 'AI가 자동 판정' : '사람이 판단'}
+              >
+                {item.decided_by === 'auto' ? 'Auto' : 'Human'}
+              </span>
+            )}
           </div>
           <p className="text-sm text-gray-200">{item.reason}</p>
+          {!isPending && item.decision_reason && (
+            <p className="text-xs text-muted mt-1 italic">“{item.decision_reason}”</p>
+          )}
           <Evidence evidence={item.evidence} />
           <div className="text-xs text-muted mt-2 font-mono">doc {item.document_id.slice(0, 8)}</div>
         </div>
