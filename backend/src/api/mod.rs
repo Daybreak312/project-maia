@@ -6,6 +6,7 @@ mod workspaces;
 mod connectors;
 mod keys;
 mod patrol;
+mod users;
 pub mod settings;
 
 pub use ingest::ingest_handler;
@@ -21,6 +22,10 @@ pub use connectors::{
     register_connector_handler, trigger_connector_handler,
 };
 pub use keys::{list_keys_handler, create_key_handler, revoke_key_handler};
+pub use users::{
+    change_password_handler, create_user_handler, delete_user_handler, list_users_handler,
+    UserInfo,
+};
 pub use patrol::{
     judge_reviews_handler, list_reviews_handler, metrics_handler, patrol_history_handler,
     run_patrol_handler, submit_feedback_handler,

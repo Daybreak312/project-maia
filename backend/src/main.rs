@@ -245,6 +245,11 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/keys", get(api::list_keys_handler))
         .route("/api/keys", post(api::create_key_handler))
         .route("/api/keys/:key_id", delete(api::revoke_key_handler))
+        // 계정 관리 (admin 전용, 비밀번호 변경만 본인 세션 허용 — 핸들러에서 강제)
+        .route("/api/users", get(api::list_users_handler))
+        .route("/api/users", post(api::create_user_handler))
+        .route("/api/users/:id", delete(api::delete_user_handler))
+        .route("/api/users/:id/password", put(api::change_password_handler))
         // Patrol·거버넌스 (Phase 5): 실행/판단/피드백은 write, 조회는 워크스페이스 접근
         .route("/api/patrol/run", post(api::run_patrol_handler))
         .route("/api/patrol/history", get(api::patrol_history_handler))
