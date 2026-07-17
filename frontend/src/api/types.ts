@@ -153,6 +153,8 @@ export interface ApiKeyInfo {
   created_at: string;
   last_used_at: string | null;
   expires_at: string | null;
+  /** 소유 계정 user_id (null = 시스템 키) */
+  owner: string | null;
 }
 
 export interface CreateKeyRequest {
@@ -166,6 +168,78 @@ export interface CreateKeyResponse {
   /** 평문 키 — 이 응답에서만 확인 가능 */
   api_key: string;
   key: ApiKeyInfo;
+}
+
+// ─── 인증 · 계정 (Phase 2) ───────────────────────────────────────
+/** 계정 공개 뷰 (password_hash 미포함 — 백엔드 UserInfo). */
+export interface UserInfo {
+  user_id: string;
+  username: string;
+  display_name: string;
+  is_admin: boolean;
+  created_at: string;
+}
+
+/** 인증 소스 — `GET /api/auth/me`의 auth_source. */
+export type AuthSource = 'master' | 'dev' | 'api_key' | 'session';
+
+/** 접근 가능한 워크스페이스 한 항목 (id + 유효 권한). */
+export interface WorkspaceAccess {
+  id: string;
+  permission: Permission;
+}
+
+/** `GET /api/auth/me` 응답 — 앱 전역 인증 상태의 원천. */
+export interface MeResponse {
+  auth_source: AuthSource;
+  /** 인증된 계정 (세션·소유 키). 마스터키·시스템 키·dev는 null. */
+  user: UserInfo | null;
+  is_admin: boolean;
+  workspaces: WorkspaceAccess[];
+}
+
+/** `POST /api/auth/login` 응답 (세션 토큰은 HttpOnly 쿠키로만 전달). */
+export interface LoginResponse {
+  user: UserInfo;
+}
+
+export interface CreateUserRequest {
+  username: string;
+  /** 초기 비밀번호 (admin이 지정) */
+  password: string;
+  display_name?: string;
+  is_admin?: boolean;
+}
+
+/** 계정 생성 응답 — 자동 생성된 개인 워크스페이스 id 포함. */
+export interface CreateUserResponse {
+  user: UserInfo;
+  personal_workspace: string;
+}
+
+// ─── 워크스페이스 멤버십 · 공개 설정 ─────────────────────────────
+export type WorkspaceVisibility = 'private' | 'public';
+
+/** 멤버 목록 항목 — 계정이 삭제된 잔존 멤버십은 username/display_name이 null. */
+export interface MemberView {
+  user_id: string;
+  username: string | null;
+  display_name: string | null;
+  role: Permission;
+}
+
+/** `GET /api/workspaces/:id/members` 응답. */
+export interface MembersResponse {
+  visibility: WorkspaceVisibility;
+  /** public일 때 비멤버 로그인 계정에게 부여되는 권한 (admin 불가). */
+  public_permission: Permission;
+  members: MemberView[];
+}
+
+export interface SetVisibilityRequest {
+  visibility: WorkspaceVisibility;
+  /** 미지정 시 기존 값 유지. */
+  public_permission?: Permission;
 }
 
 // ─── 커넥터 (Phase 4) ────────────────────────────────────────────
