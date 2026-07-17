@@ -53,3 +53,13 @@
 - `[Docs] - [Sync]`: 코드 동작·구조 변경은 같은 커밋/PR에서 `docs/`를 갱신한다.
   매핑표는 [docs/README.md](../docs/README.md). (이유: 문서 부패 방지 — 이 체계의 전제)
 - `[Docs] - [Fact]`: 문서에는 코드로 확인한 사실만. 수치·상수는 원문 대조 후 기입.
+- `[Docs] - [Decision]`: 아키텍처 갈림길에서의 선택은
+  [docs/decisions/](../docs/decisions/index.md)에 ADR로 기록한다. 결정 변경은 새 ADR +
+  구 ADR Status 갱신으로. (이유: 결정의 생명주기 추적 — ADR-013)
+- `[Docs] - [Guardrail]`: 작업 착수 전 해당 유형의
+  [docs/guardrails/](../docs/guardrails/README.md) 체크리스트를 확인한다. 이 정책
+  파일이 규칙의 SSoT이고 guardrail은 실행 뷰다 — 충돌 시 여기가 이긴다.
+  (이유: 법전과 체크리스트의 역할 분리)
+- `[Docs] - [Green]`: 검증 게이트 명령은
+  [docs/definition-of-green.md](../docs/definition-of-green.md)에만 산다 — 다른 문서에
+  재작성 금지. (이유: 게이트 중복 서술은 곧 불일치)

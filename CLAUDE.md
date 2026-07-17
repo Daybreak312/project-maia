@@ -81,21 +81,21 @@
     *   **설명:** 보안 정책, 기술 스택 제약, 코딩 컨벤션 등 **반드시 지켜야 할 법률**.
     *   **활용:** 코드를 작성하기 전, "인증 없이 노출해도 되나?", "새 DB를 써도 되나?"를 확인하는 규정집.
 
-3.  **`contexts/spec.md` (Current Task Specs) - [WHAT]**
-    *   **설명:** **현재 진행 중인 작업**의 상세 기능 명세서. (User Story, Requirements, Edge Cases)
-    *   **활용:** "지금 당장 어떤 함수와 API를 구현해야 하는가?"에 대한 구체적인 작업 지시서. 활성 작업이 없으면 비어 있는 것이 정상.
+3.  **`contexts/spec.md` (Current Task Pointer) - [WHAT]**
+    *   **설명:** **현재 진행 중인 작업의 포인터.** 작업의 실체는 `docs/prd/`(무엇을)와 `docs/exec-plans/active/`(어떻게)에 산다 (ADR-013).
+    *   **활용:** "지금 활성 작업이 있는가, 있다면 어느 플랜인가?"의 진입점. 활성 작업이 없으면 비어 있는 것이 정상.
 
-4.  **`docs/` (System Facts) - [WHERE]**
-    *   **설명:** 현재 구축된 시스템의 **사실(Fact)** — 아키텍처, API, 데이터 모델, 프로바이더, 배포, 운영 런북. (구 `contexts/architecture.md`는 이곳으로 이관됨 — DEC-012)
-    *   **활용:** "포트가 몇 번이지?", "이 엔드포인트 스키마가 뭐지?"를 확인할 때 보는 지도. 진입점은 [docs/README.md](docs/README.md).
+4.  **`docs/` (System Facts & Work Docs) - [WHERE & HOW-TO]**
+    *   **설명:** 현재 구축된 시스템의 **사실(Fact)** — 아키텍처, API, 데이터 모델, 프로바이더, 배포, 운영 런북 (구 `contexts/architecture.md`는 이곳으로 이관됨 — ADR-012). 그리고 **작업 문서 체계** — 작업 유형별 체크리스트(`docs/guardrails/`), 검증 게이트 단일 정의(`docs/definition-of-green.md`), PRD·실행 계획(`docs/prd/`, `docs/exec-plans/`), 템플릿(`docs/_templates/`).
+    *   **활용:** "포트가 몇 번이지?"는 본문 문서, "이 작업에서 뭘 조심하지?"는 guardrails, "끝났다고 선언해도 되나?"는 definition-of-green. 진입점은 [docs/README.md](docs/README.md).
 
 5.  **`contexts/plan.md` (Roadmap & Status) - [WHEN]**
     *   **설명:** 전체 프로젝트의 일정과 각 Task의 완료/진행/대기 상태.
-    *   **활용:** 현재 작업의 전후 맥락을 파악하고, 진척도를 업데이트하는 현황판.
+    *   **활용:** 현재 작업의 전후 맥락을 파악하고, 진척도를 업데이트하는 현황판. 진행 중 플랜의 실물은 `docs/exec-plans/active/`.
 
-6.  **`contexts/decision_log.md` (History & Context) - [WHY HISTORY]**
-    *   **설명:** 과거의 주요 기술적 의사결정과 그 이유(Reasoning)에 대한 기록.
-    *   **활용:** "왜 아키텍처가 이렇게 되었지?"에 대한 역사적 맥락이 필요할 때 참조. (Phase별 상세는 `prd-maia-brain/`)
+6.  **`docs/decisions/` (Architecture Decision Records) - [WHY HISTORY]**
+    *   **설명:** 과거의 주요 기술적 의사결정과 그 이유(Reasoning)의 불변 기록 — ADR 개별 파일 + [index](docs/decisions/index.md). (구 `contexts/decision_log.md`는 스텁 — DEC-001~012는 ADR-001~012로 이관됨. Phase별 상세는 `prd-maia-brain/`)
+    *   **활용:** "왜 아키텍처가 이렇게 되었지?"가 필요할 때 index에서 찾아 읽는다. **아키텍처 갈림길에서 선택했다면 새 ADR을 남긴다** (`docs/_templates/adr.md`).
 
 ### 2. 정책 작성 규칙 (Structured Policy)
 `policy.md` 작성 시 반드시 아래의 구조화된 포맷을 준수하여 가독성을 높인다.

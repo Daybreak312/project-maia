@@ -27,17 +27,9 @@ cd mcp && npm ci && npm run dev               # tsc --watch
 
 ## 종료 조건 (필수 게이트)
 
-작업 완료 선언 전에 전부 통과해야 한다.
-
-```bash
-cd backend && cargo test        # 단위·회귀 테스트 (Phase 6 기준 544개)
-cd frontend && npm run build    # tsc -b + vite build
-cd mcp && npm run build         # tsc
-```
-
-테스트 문화: 외부 의존(Qdrant·실 LLM) 없는 단위 테스트가 원칙이다 — LLM 판단은
-mock provider, 검색·Patrol은 trait(`SearchBackend`/`PatrolExecutor`) mock 주입으로
-전 분기를 고정한다. 버그 수정에는 재발 방지 회귀 테스트를 동반한다.
+게이트의 단일 정의는 **[definition-of-green.md](definition-of-green.md)** 다 —
+명령·기대값·테스트 격리 원칙·보고 규칙까지 그 문서가 답한다. 여기에는 재작성하지
+않는다 (명령이 바뀌면 그 문서를 갱신).
 
 ## 코드 컨벤션
 
@@ -53,20 +45,28 @@ mock provider, 검색·Patrol은 trait(`SearchBackend`/`PatrolExecutor`) mock �
 
 | 경로 | 성격 | 편집 시점 |
 |------|------|-----------|
-| `docs/` | **사실 레퍼런스 (SSoT)** | 코드 동작·구조가 바뀔 때 같은 PR에서 갱신 |
-| `contexts/` | 에이전트 작업 컨텍스트 (정체성·정책·스펙·플랜·결정 로그) | 새 작업 착수·정책 합의·주요 결정 시 |
-| `prd-maia-brain/` | Phase 1~6 PRD — 역사 기록 | 갱신하지 않는다 (새 대형 작업은 새 PRD) |
+| `docs/` 본문 | **사실 레퍼런스 (SSoT)** | 코드 동작·구조가 바뀔 때 같은 PR에서 갱신 |
+| `docs/decisions/` | ADR — 결정의 "왜" | 아키텍처 갈림길에서 선택했을 때 |
+| `docs/prd/` · `docs/exec-plans/` | 작업의 "무엇을"·"어떻게" | 새 작업 착수 시 작성, 완료 시 이동/동결 |
+| `docs/guardrails/` | 작업 유형별 체크리스트 | 규칙·함정이 새로 확인됐을 때 |
+| `contexts/` | 에이전트 작업 컨텍스트 (정체성·정책·현황) | 정책 합의·현황 변동 시 |
+| `prd-maia-brain/` | Phase 1~6 PRD — 역사 기록 | 갱신하지 않는다 (새 PRD는 `docs/prd/`) |
 | `backend/static/` | 레거시 정적 UI | 미사용 (컨테이너는 frontend 빌드를 서빙) — 정리 후보 |
 
 문서 갱신 규칙의 상세(코드→문서 매핑, 검증 배지)는 [docs/README.md](README.md) 참조.
 
 ## 새 기능을 붙이는 표준 지점
 
+작업 유형별 체크리스트는 [guardrails/](guardrails/README.md)에 있다 — 아래는 배선
+위치 요약.
+
 - **새 LLM provider**: `backend/src/llm/`에 구현 + `ProviderType` 분기
-  (`valid_for_*`, 팩토리) + 설정 API 연결 (→ [llm-providers.md](llm-providers.md))
+  (`valid_for_*`, 팩토리) + 설정 API 연결
+  (→ [guardrails/llm-provider-change.md](guardrails/llm-provider-change.md))
 - **새 커넥터 타입**: `Connector` trait 구현 + `build_connector` 팩토리 한 줄 +
-  `ConnectorSpec` variant (→ [ingest.md](ingest.md))
+  `ConnectorSpec` variant (→ [guardrails/connector-change.md](guardrails/connector-change.md))
 - **새 Patrol 탐지기**: `patrol/detectors.rs`에 순수 함수 추가 + `combine` 등록
   (→ [patrol.md](patrol.md))
 - **새 MCP tool**: 대응 REST API를 먼저 만들고 `mcp/src/index.ts`에 얇은 번역만 추가
-  (`contexts/decision_log.md` DEC-004 — REST가 유니버설 인터페이스)
+  ([ADR-004](decisions/004-rest-universal-interface.md) — REST가 유니버설 인터페이스,
+  → [guardrails/api-change.md](guardrails/api-change.md))

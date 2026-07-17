@@ -23,12 +23,15 @@
   워크스페이스 지식이 커넥터로 지속 유입, 일일 백업 체계 가동.
 - 2026-07-17: 파싱 모델 sonnet-5 전환 핫픽스(712484e), 레포 공개 전환,
   백엔드 전수 감사(→ [docs/known-issues.md](../docs/known-issues.md)),
-  문서 체계 개편(docs/ 신설).
+  문서 체계 개편 1차(docs/ 신설, ADR-012) + 2차(작업 문서 체계 —
+  ADR·guardrails·prd/exec-plans, [ADR-013](../docs/decisions/013-work-docs-system.md)).
 
 ## 다음 작업 (대기)
 
 견고화 백로그 — 우선순위와 후보는 [spec.md](spec.md)의 "다음 작업 후보" 참조.
-**착수는 소유자 승인 대기 중.**
+**착수는 소유자 승인 대기 중.** 진행 중 작업은
+[docs/exec-plans/active/](../docs/exec-plans/README.md)가 실물이다 (현재 비어 있음 =
+운영 단계). 완료 이력은 `completed/`에 쌓인다.
 
 ## 백로그 (기능)
 

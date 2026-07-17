@@ -13,6 +13,10 @@ RAG 앱"이 아니라 **에이전트가 사람처럼 일하도록 문맥을 제�
 **[`docs/`](docs/README.md)가 사실 레퍼런스의 SSoT다.** 아키텍처·데이터 모델·검색·유입·
 Patrol·LLM 프로바이더·API·MCP·배포·운영 런북·알려진 이슈가 문서별로 정리돼 있고,
 상황별 읽기 경로와 유지보수 규약은 [docs/README.md](docs/README.md)에 있다.
+작업 문서 체계도 같은 곳에 산다 — 결정 기록([decisions/](docs/decisions/index.md) ADR),
+작업 유형별 체크리스트([guardrails/](docs/guardrails/README.md)),
+PRD·실행 계획([prd/](docs/prd/README.md) · [exec-plans/](docs/exec-plans/README.md)),
+검증 게이트([definition-of-green.md](docs/definition-of-green.md)).
 
 | 급한 용무 | 바로가기 |
 |-----------|----------|
@@ -20,6 +24,7 @@ Patrol·LLM 프로바이더·API·MCP·배포·운영 런북·알려진 이슈�
 | API 호출 | [docs/api.md](docs/api.md) · [docs/mcp.md](docs/mcp.md) |
 | 배포/이전 | [docs/deployment.md](docs/deployment.md) |
 | 장애 대응 | [docs/operations.md](docs/operations.md) |
+| 수정 작업 착수 | [docs/guardrails/](docs/guardrails/README.md) → [definition-of-green](docs/definition-of-green.md) |
 
 ## 빠른 시작
 
