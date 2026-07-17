@@ -14,9 +14,15 @@ const ANTHROPIC_VERSION: &str = "2023-06-01";
 /// `/v1/messages`에서 Bearer 인증이 허용된다. (출처: Anthropic OAuth 베타, 2026-07 검증)
 const OAUTH_BETA_HEADER: &str = "oauth-2025-04-20";
 
-/// 파싱 모델 상수 — 파싱은 구조화 추출이라 속도/쿼터 효율을 우선한다.
-/// 상향(예: sonnet)은 이 상수 한 줄 교체로 끝나야 한다(FR1).
-const CLAUDE_PARSE_MODEL: &str = "claude-haiku-4-5";
+/// 파싱 모델 상수 — 소유자 지정 기본값(2026-07-17). 교체는 이 상수 한 줄(FR1).
+const CLAUDE_PARSE_MODEL: &str = "claude-sonnet-5";
+
+/// 파싱 응답 출력 상한. 구조화 JSON이 입력 문서 크기에 비례해 커지므로 넉넉히
+/// 잡는다 — 1024 운영 시 대형 데일리 노트에서 응답 절단 실측(2026-07-17).
+const PARSE_MAX_TOKENS: u32 = 16384;
+
+/// 판단(complete) 응답 출력 상한 — 전략+근거+분할 세그먼트를 담는다.
+const COMPLETE_MAX_TOKENS: u32 = 8192;
 
 /// OAuth 토큰(setup-token)은 **Claude Code 사용 맥락**에 스코프되어 있어, 일반
 /// API 호출로 보이면 서버 정책상 거절될 수 있다. 이를 대비해 OAuth 모드 요청의
@@ -120,13 +126,29 @@ impl ClaudeProvider {
             .await
             .context("Failed to parse Anthropic response")?;
 
+        ensure_not_truncated(response.stop_reason.as_deref(), max_tokens)?;
+
+        // thinking 등 비-text 블록을 건너뛰고 text 블록만 이어붙인다.
         Ok(response
             .content
             .into_iter()
-            .next()
-            .map(|c| c.text)
-            .unwrap_or_default())
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(text),
+                ContentBlock::Other => None,
+            })
+            .collect::<Vec<_>>()
+            .join(""))
     }
+}
+
+/// 응답 절단 감지(순수 함수). `stop_reason == "max_tokens"`는 출력이 상한에서
+/// 잘렸다는 뜻 — 잘린 JSON을 하류 파서에 넘기면 "파싱 실패"로 원인이 가려지므로
+/// 여기서 명시적으로 실패시킨다.
+fn ensure_not_truncated(stop_reason: Option<&str>, max_tokens: u32) -> Result<()> {
+    if stop_reason == Some("max_tokens") {
+        anyhow::bail!("Claude 응답이 출력 상한({max_tokens} 토큰)에서 절단됨");
+    }
+    Ok(())
 }
 
 #[async_trait]
@@ -137,13 +159,12 @@ impl LlmProvider for ClaudeProvider {
 
     async fn parse(&self, content: &str) -> Result<ParsedContent> {
         let prompt = build_parse_prompt(content);
-        let text = self.send_messages(1024, prompt).await?;
+        let text = self.send_messages(PARSE_MAX_TOKENS, prompt).await?;
         parse_llm_json(&text)
     }
 
     async fn complete(&self, prompt: &str) -> Result<String> {
-        // 판단 응답(전략+근거, 분할 세그먼트 포함)을 담기에 넉넉한 상한.
-        self.send_messages(2048, prompt.to_string()).await
+        self.send_messages(COMPLETE_MAX_TOKENS, prompt.to_string()).await
     }
 
     async fn validate_api_key(&self) -> Result<bool> {
@@ -188,11 +209,22 @@ struct Message {
 #[derive(Debug, Deserialize)]
 struct AnthropicResponse {
     content: Vec<ContentBlock>,
+    /// 절단 감지용 — `"max_tokens"`면 출력이 상한에서 잘린 것.
+    #[serde(default)]
+    stop_reason: Option<String>,
 }
 
+/// 응답 content 블록. sonnet-5는 복잡한 입력에서 adaptive thinking을 스스로
+/// 발동해 `{"type":"thinking",...}` 블록을 text 앞에 붙인다(2026-07-17 실측 —
+/// thinking 블록엔 `text` 필드가 없어 구조체 역직렬화가 통째로 깨졌음).
+/// text 외 타입은 값 없이 수용해 역직렬화를 깨뜨리지 않는다.
 #[derive(Debug, Deserialize)]
-struct ContentBlock {
-    text: String,
+#[serde(tag = "type")]
+enum ContentBlock {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(other)]
+    Other,
 }
 
 #[cfg(test)]
@@ -299,10 +331,58 @@ mod tests {
         );
     }
 
-    /// 파싱 모델 상수가 haiku로 고정되어 있는지(FR1). 상향은 이 상수 교체 한 줄.
+    /// 파싱 모델 상수가 소유자 지정 기본값(sonnet 5)인지(FR1). 교체는 이 상수 한 줄.
     #[test]
     fn test_parse_model_constant() {
         let provider = ClaudeProvider::new("sk-ant-api03-k".to_string());
-        assert_eq!(provider.model, "claude-haiku-4-5");
+        assert_eq!(provider.model, "claude-sonnet-5");
+    }
+
+    /// 절단 감지: stop_reason이 max_tokens면 에러, 그 외(end_turn/None)는 통과.
+    #[test]
+    fn test_ensure_not_truncated() {
+        assert!(ensure_not_truncated(Some("max_tokens"), 1024).is_err());
+        assert!(ensure_not_truncated(Some("end_turn"), 1024).is_ok());
+        assert!(ensure_not_truncated(None, 1024).is_ok());
+    }
+
+    /// stop_reason 필드가 없거나(구버전 응답 가정) 있어도 역직렬화가 깨지지 않는다.
+    #[test]
+    fn test_response_stop_reason_deserialization() {
+        let with: AnthropicResponse = serde_json::from_str(
+            r#"{"content":[{"type":"text","text":"hi"}],"stop_reason":"max_tokens"}"#,
+        )
+        .unwrap();
+        assert_eq!(with.stop_reason.as_deref(), Some("max_tokens"));
+
+        let without: AnthropicResponse =
+            serde_json::from_str(r#"{"content":[{"type":"text","text":"hi"}]}"#).unwrap();
+        assert_eq!(without.stop_reason, None);
+    }
+
+    /// sonnet-5 adaptive thinking 응답: thinking 블록이 text 앞에 와도 역직렬화가
+    /// 깨지지 않고, text 블록만 추출된다(2026-07-17 운영 실측 케이스).
+    #[test]
+    fn test_content_block_tolerates_thinking_and_unknown_types() {
+        let resp: AnthropicResponse = serde_json::from_str(
+            r#"{"content":[
+                {"type":"thinking","thinking":"...","signature":"sig"},
+                {"type":"text","text":"{\"ok\":"},
+                {"type":"tool_use","id":"t1","name":"x","input":{}},
+                {"type":"text","text":"true}"}
+            ],"stop_reason":"end_turn"}"#,
+        )
+        .unwrap();
+
+        let text: String = resp
+            .content
+            .into_iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(text),
+                ContentBlock::Other => None,
+            })
+            .collect::<Vec<_>>()
+            .join("");
+        assert_eq!(text, r#"{"ok":true}"#);
     }
 }
