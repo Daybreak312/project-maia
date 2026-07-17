@@ -20,14 +20,40 @@ pub const DEFAULT_TICK_SECS: u64 = 3600;
 
 /// patrol frequency 문자열 → 주기(초).
 ///
-/// "hourly"/"daily"/"weekly"만 인식하고 그 외(빈 문자열·cron 표현식 등)는 보수적으로
-/// daily로 본다(cron 파싱은 이 phase 범위 밖 — 과잉 설계 방지).
+/// 인식 형식:
+/// - 키워드: "hourly"/"daily"/"weekly".
+/// - `<숫자><단위>` 스펙: 단위는 `h`(시간)·`d`(일). 예: "6h"→21600, "12h", "2d".
+///
+/// 그 외(빈 문자열·cron 표현식·알 수 없는 단위·0/음수)는 보수적으로 daily로 폴백한다
+/// (cron 파싱은 이 phase 범위 밖 — 과잉 설계 방지). 순수 함수라 mock 없이 검증된다.
 pub fn patrol_interval_secs(frequency: &str) -> u64 {
-    match frequency.trim().to_lowercase().as_str() {
-        "hourly" => 3_600,
-        "weekly" => 604_800,
-        _ => 86_400, // daily 기본
+    let norm = frequency.trim().to_lowercase();
+    match norm.as_str() {
+        "hourly" => return 3_600,
+        "daily" => return 86_400,
+        "weekly" => return 604_800,
+        _ => {}
     }
+    // "<n>h" / "<n>d" 커스텀 주기(예: "6h" → 6시간).
+    parse_duration_spec(&norm).unwrap_or(86_400)
+}
+
+/// `<양의 정수><h|d>` 스펙을 초로 파싱한다(순수). 형식이 아니면 None(호출 측이 daily 폴백).
+///
+/// 방어: 단위 없음/숫자 없음/0/파싱 불가/오버플로는 모두 None. h는 3600, d는 86400 배수.
+fn parse_duration_spec(s: &str) -> Option<u64> {
+    let (digits, mult) = if let Some(d) = s.strip_suffix('h') {
+        (d, 3_600u64)
+    } else if let Some(d) = s.strip_suffix('d') {
+        (d, 86_400u64)
+    } else {
+        return None;
+    };
+    let n: u64 = digits.parse().ok()?;
+    if n == 0 {
+        return None; // 0h/0d는 무의미 → daily 폴백
+    }
+    n.checked_mul(mult)
 }
 
 pub struct PatrolScheduler {
@@ -137,6 +163,30 @@ mod tests {
         assert_eq!(patrol_interval_secs(" Weekly "), 604_800);
     }
 
+    #[test]
+    fn test_interval_custom_hour_day_spec() {
+        // "<n>h" / "<n>d" 커스텀 주기 — 6시간 주기가 이 phase의 핵심 요구.
+        assert_eq!(patrol_interval_secs("6h"), 21_600);
+        assert_eq!(patrol_interval_secs("12h"), 43_200);
+        assert_eq!(patrol_interval_secs("1h"), 3_600, "1h는 hourly와 등가");
+        assert_eq!(patrol_interval_secs("24h"), 86_400, "24h는 daily와 등가");
+        assert_eq!(patrol_interval_secs("2d"), 172_800);
+        // 대소문자·공백 관대(설정 값이 " 6H "로 들어와도 동작).
+        assert_eq!(patrol_interval_secs(" 6H "), 21_600);
+    }
+
+    #[test]
+    fn test_interval_custom_spec_invalid_falls_back_daily() {
+        // 방어: 0/단위없음/숫자없음/알 수 없는 단위/음수는 daily 폴백(브릭 방지).
+        assert_eq!(patrol_interval_secs("0h"), 86_400, "0h는 무의미 → daily");
+        assert_eq!(patrol_interval_secs("0d"), 86_400);
+        assert_eq!(patrol_interval_secs("h"), 86_400, "숫자 없음 → daily");
+        assert_eq!(patrol_interval_secs("6"), 86_400, "단위 없음 → daily");
+        assert_eq!(patrol_interval_secs("6x"), 86_400, "알 수 없는 단위 → daily");
+        assert_eq!(patrol_interval_secs("-6h"), 86_400, "음수 → daily");
+        assert_eq!(patrol_interval_secs("6.5h"), 86_400, "소수 → daily");
+    }
+
     // ──── tick_once (스케줄) ────
 
     /// 아무 문서도 없는 실행기(스케줄 판정만 검증).
@@ -156,6 +206,12 @@ mod tests {
             _now: DateTime<Utc>,
         ) -> Result<usize> {
             Ok(0)
+        }
+        async fn patrol_llm_complete(&self, _ws: &str, _prompt: &str) -> Result<String> {
+            Ok(String::new())
+        }
+        async fn reingest_source_document(&self, _ws: &str, _id: Uuid) -> Result<bool> {
+            Ok(false)
         }
     }
 
