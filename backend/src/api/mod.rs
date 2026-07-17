@@ -6,6 +6,7 @@ mod graph;
 mod workspaces;
 mod connectors;
 mod keys;
+mod members;
 mod patrol;
 mod users;
 pub mod settings;
@@ -23,6 +24,9 @@ pub use connectors::{
     register_connector_handler, trigger_connector_handler,
 };
 pub use auth::{login_handler, logout_handler, me_handler};
+pub use members::{
+    list_members_handler, remove_member_handler, set_visibility_handler, upsert_member_handler,
+};
 pub use keys::{list_keys_handler, create_key_handler, revoke_key_handler};
 pub use users::{
     change_password_handler, create_user_handler, delete_user_handler, list_users_handler,

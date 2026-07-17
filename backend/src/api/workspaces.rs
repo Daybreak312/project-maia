@@ -164,6 +164,10 @@ pub async fn delete_workspace_handler(
         }
     })?;
 
+    // 멤버십 캐시 무효화 — members.json은 디렉토리와 함께 이미 제거되었지만,
+    // 캐시가 남으면 같은 id로 재생성된 워크스페이스가 옛 멤버십을 물려받는다.
+    state.memberships.forget_workspace(&id).await;
+
     if let Err(e) = state.indexer.purge_workspace_collection(&id).await {
         tracing::warn!(
             "Workspace '{}' deleted but Qdrant collection purge failed: {}",

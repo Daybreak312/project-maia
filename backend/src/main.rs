@@ -235,6 +235,11 @@ async fn main() -> anyhow::Result<()> {
             "/api/workspaces/:id/patrol",
             patch(api::update_workspace_patrol_handler),
         )
+        // 워크스페이스 멤버십·공개 설정 (글로벌 admin 또는 해당 ws admin — 핸들러에서 강제)
+        .route("/api/workspaces/:id/members", get(api::list_members_handler))
+        .route("/api/workspaces/:id/members/:user_id", put(api::upsert_member_handler))
+        .route("/api/workspaces/:id/members/:user_id", delete(api::remove_member_handler))
+        .route("/api/workspaces/:id/visibility", put(api::set_visibility_handler))
         // 커넥터 관리 (목록·상태는 워크스페이스 접근, 등록·삭제·실행은 admin — 핸들러에서 강제)
         .route("/api/connectors", get(api::list_connectors_handler))
         .route("/api/connectors", post(api::register_connector_handler))
