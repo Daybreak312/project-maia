@@ -27,13 +27,53 @@ pub enum WorkspaceTemplate {
     Enterprise,
 }
 
-/// Patrol 에이전트 설정 (향후 구현용 — 구조만 선점)
+/// Review Queue 판단 모드 — 누가 후보를 판단하고 반영하는가.
+///
+/// `Manual`이 기본이자 PRD의 반자율 원칙(삭제는 사람만)을 지키는 상태다. `Auto`는 소유자가
+/// 명시적으로 켰을 때만 동작하며, Patrol이 열린 항목을 LLM으로 판정해 즉시 반영한다 —
+/// 단 삭제는 여전히 복구 가능한 soft delete만, 실패·불확실은 전부 Pending에 잔류한다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReviewMode {
+    /// 소유자가 Review Queue를 직접 판단한다(기본).
+    Manual,
+    /// Patrol이 열린 항목을 자동 판정·반영한다(soft delete만, 실패는 Pending 잔류).
+    Auto,
+}
+
+impl ReviewMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ReviewMode::Manual => "manual",
+            ReviewMode::Auto => "auto",
+        }
+    }
+}
+
+/// review_mode 기본값 — 기존 config.json(필드 부재) 하위호환 및 안전 기본(반자율 유지).
+fn default_review_mode() -> ReviewMode {
+    ReviewMode::Manual
+}
+
+/// auto 모드에서 한 번의 Patrol 실행이 자동 판정할 열린 항목 상한 — LLM 호출 수를
+/// 실행당 상수로 바운드해 비용·rate limit 폭주를 막는다(policy `[Backend] - [LLM]`).
+fn default_auto_judge_cap() -> usize {
+    50
+}
+
+/// Patrol 에이전트 설정
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PatrolConfig {
-    /// 순회 주기: "daily", "weekly", 또는 cron 표현식
+    /// 순회 주기: "hourly"/"daily"/"weekly" 또는 `<n>h`/`<n>d`(예: "6h").
     pub frequency: String,
     /// 엄격도 (0.0 = 느슨, 1.0 = 엄격)
     pub strictness: f32,
+    /// Review Queue 판단 모드(manual/auto). 기존 config.json 하위호환 위해 serde default(manual).
+    #[serde(default = "default_review_mode")]
+    pub review_mode: ReviewMode,
+    /// auto 모드에서 한 실행당 자동 판정할 열린 항목 상한. 하위호환 위해 serde default(50).
+    #[serde(default = "default_auto_judge_cap")]
+    pub auto_judge_cap: usize,
 }
 
 /// 파싱 설정 — LLM 파싱 동작 커스터마이징
@@ -112,6 +152,9 @@ impl WorkspaceConfig {
             PatrolConfig {
                 frequency: "weekly".to_string(),
                 strictness: 0.3,
+                // auto는 소유자가 명시적으로 켜는 opt-in — 프리셋은 반자율(manual) 유지.
+                review_mode: default_review_mode(),
+                auto_judge_cap: default_auto_judge_cap(),
             },
             ParsingConfig {
                 entity_priorities: vec![
@@ -137,6 +180,8 @@ impl WorkspaceConfig {
             PatrolConfig {
                 frequency: "daily".to_string(),
                 strictness: 0.7,
+                review_mode: default_review_mode(),
+                auto_judge_cap: default_auto_judge_cap(),
             },
             ParsingConfig {
                 entity_priorities: vec![
@@ -244,6 +289,44 @@ mod tests {
     }
 
     #[test]
+    fn test_config_deserialize_legacy_patrol_without_review_mode() {
+        // review_mode/auto_judge_cap 없는 기존 patrol config도 serde default로 로드되어야
+        // 한다(하위호환). 이 불변식이 깨지면 기동 시 기존 워크스페이스 파싱이 실패해 브릭된다.
+        let json = r#"{
+            "id": "legacy",
+            "name": "Legacy",
+            "created_at": "2026-04-01T00:00:00Z",
+            "template": "personal",
+            "patrol": {"frequency": "weekly", "strictness": 0.3},
+            "parsing": {"entity_priorities": [], "fact_depth": "deep", "llm_provider": null},
+            "search": {"time_decay_lambda": 0.01, "default_mode": "hybrid", "cross_workspace": []}
+        }"#;
+        let config: WorkspaceConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.patrol.review_mode, ReviewMode::Manual, "누락 review_mode는 manual 기본");
+        assert_eq!(config.patrol.auto_judge_cap, 50, "누락 auto_judge_cap은 50 기본");
+    }
+
+    #[test]
+    fn test_config_patrol_review_mode_roundtrip() {
+        // auto 모드가 소문자로 직렬화/역직렬화되어야 프론트/설정 왕복이 안전하다.
+        let json = r#"{
+            "id": "auto-ws",
+            "name": "Auto",
+            "created_at": "2026-04-01T00:00:00Z",
+            "template": "personal",
+            "patrol": {"frequency": "6h", "strictness": 0.3, "review_mode": "auto", "auto_judge_cap": 10},
+            "parsing": {"entity_priorities": [], "fact_depth": "deep", "llm_provider": null},
+            "search": {"time_decay_lambda": 0.01, "default_mode": "hybrid", "cross_workspace": []}
+        }"#;
+        let config: WorkspaceConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.patrol.review_mode, ReviewMode::Auto);
+        assert_eq!(config.patrol.auto_judge_cap, 10);
+        assert_eq!(config.patrol.frequency, "6h");
+        let reser = serde_json::to_string(&config.patrol).unwrap();
+        assert!(reser.contains("\"auto\""), "review_mode는 소문자 auto로 직렬화");
+    }
+
+    #[test]
     fn test_config_deserialize_legacy_without_connectors() {
         // connectors 필드가 없는 Phase 3 이전 config.json도 로드되어야 한다(하위호환).
         // 이 불변식이 깨지면 기동 시 기존 워크스페이스 파싱이 실패해 브릭된다.
@@ -287,6 +370,9 @@ mod tests {
 
         assert_eq!(config.patrol.frequency, "weekly");
         assert!((config.patrol.strictness - 0.3).abs() < f32::EPSILON);
+        // 프리셋은 반자율(manual) 유지 — auto는 소유자 opt-in.
+        assert_eq!(config.patrol.review_mode, ReviewMode::Manual);
+        assert_eq!(config.patrol.auto_judge_cap, 50);
         assert_eq!(config.parsing.fact_depth, "deep");
         assert!(config
             .parsing

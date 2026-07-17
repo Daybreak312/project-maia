@@ -1172,6 +1172,79 @@ impl Indexer {
         Ok(total_changed)
     }
 
+    /// **auto-judge용 자유형식 LLM 응답** — ingest 판단과 동일한 파싱 provider를 재사용한다.
+    ///
+    /// 현재 파싱 경로가 전역 설정 provider를 쓰므로 `workspace_id`는 계약 명시용으로만 받는다
+    /// (향후 워크스페이스별 오버라이드 확장점). 구독 기반(claude)이라 종량제 과금이 없다.
+    /// 실패는 `Err`로 올려, 호출 측(auto-judge)이 해당 항목을 Pending에 잔류시키게 한다.
+    pub async fn patrol_llm_complete(&self, _workspace_id: &str, prompt: &str) -> Result<String> {
+        let llm = self.get_llm_provider().await?;
+        llm.complete(prompt).await
+    }
+
+    /// **external_mismatch 자동 해소** — 문서의 커넥터 소스 현재 내용으로 재유입(update)한다.
+    ///
+    /// 현재 내용을 얻을 수 있는 로컬 디렉토리 소스만 지원한다(`resolve_current_source_mtime`와
+    /// 대칭 — 다른 타입은 보류). 기존 커넥터 유입 경로(`ingest_connector_item_inner`, Parsed)를
+    /// **그대로 재사용**해 (source_type, source_id) 중복 방지·버전 보관·파싱·임베딩을 태운다 —
+    /// 별도 삭제/교체 경로를 만들지 않아 안전 불변식(버전 보관·정보 유실 0)이 그대로 적용된다.
+    ///
+    /// 반환: `Ok(true)`면 문서가 소스와 정합해짐(Updated 또는 이미 최신 Skipped). `Ok(false)`면
+    /// 소스 없음·비로컬·파일 접근 불가로 해소 불가(호출 측이 Pending 유지). 오류는 `Err`.
+    pub async fn reingest_source_document(&self, workspace_id: &str, id: Uuid) -> Result<bool> {
+        let doc = self.documents.load(id, workspace_id).await?;
+        let Some(source) = doc.source else {
+            return Ok(false); // 수동 입력 문서 — 소스 없음, 재유입 불가
+        };
+        // 현재 내용을 확보할 수 있는 소스만 재유입한다(로컬 디렉토리). 그 외는 보류.
+        if source.source_type != "local_directory" {
+            return Ok(false);
+        }
+        let content = match tokio::fs::read_to_string(&source.source_id).await {
+            Ok(c) => c,
+            Err(e) => {
+                // 파일 이동/삭제/권한 — 오탐 방지로 보류(삭제로 강등하지 않는다).
+                tracing::warn!(
+                    "재유입: 소스 파일 읽기 실패 {}({}): {}",
+                    id,
+                    source.source_id,
+                    e
+                );
+                return Ok(false);
+            }
+        };
+        // 파일의 현재 수정 시각을 각인한다(다음 스캔의 "변경 없음" 판단 기준). 확인 불가 시
+        // now()로 폴백해도 재유입은 성립한다(recorded보다 새로우므로 Update 경로).
+        let modified_at = tokio::fs::metadata(&source.source_id)
+            .await
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .map(DateTime::<Utc>::from)
+            .unwrap_or_else(Utc::now);
+
+        let item = ConnectorItem {
+            source_id: source.source_id.clone(),
+            content,
+            modified_at,
+        };
+        // 기존 커넥터 유입 파이프라인 재사용 — dedup이 update 경로로 보내고, 이미 최신이면 Skipped.
+        let outcome = self
+            .ingest_connector_item_inner(
+                workspace_id,
+                &source.source_type,
+                &source.connector_id,
+                item,
+                ConnectorIngestMode::Parsed,
+            )
+            .await?;
+        // Updated=재유입 성공, Skipped=이미 소스와 정합(둘 다 mismatch 해소됨). Created는 발생
+        // 불가(동일 소스 문서가 이미 존재)하지만, 방어적으로 해소로 보지 않는다.
+        Ok(matches!(
+            outcome,
+            ItemOutcome::Updated(_) | ItemOutcome::Skipped
+        ))
+    }
+
     // ──── 커넥터 유입 (Phase 4) ────
 
     /// 커넥터 신규 항목을 Parsed 모드로 유입한다 — LLM 파싱 + 임베딩 + 출처 각인 +
@@ -1607,6 +1680,12 @@ impl crate::patrol::PatrolExecutor for Indexer {
         now: DateTime<Utc>,
     ) -> Result<usize> {
         Indexer::decay_workspace_edges(self, workspace_id, lambda, now).await
+    }
+    async fn patrol_llm_complete(&self, workspace_id: &str, prompt: &str) -> Result<String> {
+        Indexer::patrol_llm_complete(self, workspace_id, prompt).await
+    }
+    async fn reingest_source_document(&self, workspace_id: &str, id: Uuid) -> Result<bool> {
+        Indexer::reingest_source_document(self, workspace_id, id).await
     }
 }
 

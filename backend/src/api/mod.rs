@@ -14,7 +14,7 @@ pub use documents::{get_document_handler, recent_handler, update_document_handle
 pub use graph::{neighbors_handler, add_edge_handler, remove_edge_handler};
 pub use workspaces::{
     list_workspaces_handler, create_workspace_handler, get_workspace_handler,
-    delete_workspace_handler,
+    delete_workspace_handler, update_workspace_patrol_handler,
 };
 pub use connectors::{
     connector_status_handler, delete_connector_handler, list_connectors_handler,

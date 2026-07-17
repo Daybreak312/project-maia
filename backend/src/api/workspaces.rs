@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use crate::api::require_admin;
 use crate::auth::AuthContext;
-use crate::workspace::{WorkspaceConfig, WorkspaceTemplate};
+use crate::workspace::{ReviewMode, WorkspaceConfig, WorkspaceTemplate};
 use crate::AppState;
 
 /// 워크스페이스 생성 요청. template 미지정 시 personal.
@@ -74,6 +74,72 @@ pub async fn create_workspace_handler(
     }
 
     Ok(Json(created))
+}
+
+/// Patrol 설정 부분 갱신 요청 — 명시된 필드만 적용한다(부분 PATCH).
+#[derive(Debug, Deserialize)]
+pub struct UpdatePatrolRequest {
+    /// 순회 주기: "hourly"/"daily"/"weekly" 또는 `<n>h`/`<n>d`(예: "6h").
+    #[serde(default)]
+    pub frequency: Option<String>,
+    /// 엄격도(0.0~1.0).
+    #[serde(default)]
+    pub strictness: Option<f32>,
+    /// 판단 모드(manual/auto).
+    #[serde(default)]
+    pub review_mode: Option<ReviewMode>,
+    /// auto 모드 실행당 자동 판정 상한.
+    #[serde(default)]
+    pub auto_judge_cap: Option<usize>,
+}
+
+/// PATCH /api/workspaces/:id/patrol — Patrol 설정(주기·엄격도·판단 모드·상한) 부분 갱신 (admin)
+///
+/// 명시된 필드만 반영하고 나머지는 보존한다. review_mode=auto로 켜면 다음 patrol 실행부터
+/// Review Queue를 AI가 자동 판정·반영한다(soft delete만, 실패는 Pending 잔류).
+pub async fn update_workspace_patrol_handler(
+    State(state): State<Arc<AppState>>,
+    Extension(ctx): Extension<AuthContext>,
+    Path(id): Path<String>,
+    Json(req): Json<UpdatePatrolRequest>,
+) -> Result<Json<WorkspaceConfig>, (StatusCode, String)> {
+    require_admin(&ctx)?;
+
+    let mut config = state
+        .workspaces
+        .get(&id)
+        .await
+        .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+
+    if let Some(frequency) = req.frequency {
+        let trimmed = frequency.trim();
+        if trimmed.is_empty() {
+            return Err((StatusCode::BAD_REQUEST, "frequency는 비어 있을 수 없습니다".to_string()));
+        }
+        config.patrol.frequency = trimmed.to_string();
+    }
+    if let Some(strictness) = req.strictness {
+        if !(0.0..=1.0).contains(&strictness) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "strictness는 0.0~1.0 범위여야 합니다".to_string(),
+            ));
+        }
+        config.patrol.strictness = strictness;
+    }
+    if let Some(review_mode) = req.review_mode {
+        config.patrol.review_mode = review_mode;
+    }
+    if let Some(cap) = req.auto_judge_cap {
+        config.patrol.auto_judge_cap = cap;
+    }
+
+    state
+        .workspaces
+        .update(&id, config)
+        .await
+        .map(Json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 
 /// DELETE /api/workspaces/:id — 워크스페이스 삭제 (admin)

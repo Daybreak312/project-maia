@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use axum::{
     middleware,
-    routing::{delete, get, post, put},
+    routing::{delete, get, patch, post, put},
     Router,
 };
 use tower_http::cors::{Any, CorsLayer};
@@ -197,6 +197,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/workspaces", post(api::create_workspace_handler))
         .route("/api/workspaces/:id", get(api::get_workspace_handler))
         .route("/api/workspaces/:id", delete(api::delete_workspace_handler))
+        .route(
+            "/api/workspaces/:id/patrol",
+            patch(api::update_workspace_patrol_handler),
+        )
         // 커넥터 관리 (목록·상태는 워크스페이스 접근, 등록·삭제·실행은 admin — 핸들러에서 강제)
         .route("/api/connectors", get(api::list_connectors_handler))
         .route("/api/connectors", post(api::register_connector_handler))

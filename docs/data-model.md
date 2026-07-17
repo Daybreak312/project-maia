@@ -1,6 +1,6 @@
 # 데이터 모델과 저장 구조
 
-> 최종 검증: 2026-07-17 · 기준 커밋: 712484e · [문서 인덱스](README.md)
+> 최종 검증: 2026-07-18 · 기준 커밋: main · [문서 인덱스](README.md)
 
 ## 핵심 구조체 (`backend/src/models/document.rs`)
 
@@ -122,8 +122,9 @@ raw JSON은 엣지의 SSoT인데 저장은 파일 전체 덮어쓰기다. 따라
 - 격리 단위: 문서 디렉토리 + Qdrant 컬렉션 + `config.json` + API 키 스코프.
 - `default`는 기동 시 자동 보장되고 삭제 불가. 레거시 flat 레이아웃(`data/raw/*.json`)은
   기동 시 `default`로 비파괴 마이그레이션된다.
-- `config.json`: patrol(활성/주기/strictness), parsing, search(cross_workspace 목록,
-  time_decay_lambda, deep_search 상한), connectors(인스턴스 등록) 설정을 담는다.
+- `config.json`: patrol(주기/strictness/review_mode/auto_judge_cap), parsing, search(cross_workspace
+  목록, time_decay_lambda, deep_search 상한), connectors(인스턴스 등록) 설정을 담는다.
+  patrol의 `review_mode`(manual/auto)·`auto_judge_cap`은 `#[serde(default)]`라 기존 파일과 하위호환.
 - 교차 검색: 설정의 `search.cross_workspace` ∩ 키 접근 권한 ∩ 실존 워크스페이스를
   대상으로 검색 후 점수로 병합·재정렬. 결과에 출처 `workspace`가 표시된다.
 

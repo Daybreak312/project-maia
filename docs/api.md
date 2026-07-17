@@ -1,6 +1,6 @@
 # REST API 레퍼런스
 
-> 최종 검증: 2026-07-17 · 기준 커밋: 712484e (`backend/src/main.rs` 라우터 대조) · [문서 인덱스](README.md)
+> 최종 검증: 2026-07-18 · 기준 커밋: main (`backend/src/main.rs` 라우터 대조) · [문서 인덱스](README.md)
 
 ## 인증
 
@@ -99,6 +99,7 @@
 | GET | `/api/workspaces` | admin | 전체 목록 |
 | GET | `/api/workspaces/{id}` | admin | 단일 조회 |
 | POST | `/api/workspaces` | admin | 생성 `{id, name, template?}` |
+| PATCH | `/api/workspaces/{id}/patrol` | admin | Patrol 설정 부분 갱신 `{frequency?, strictness?, review_mode?, auto_judge_cap?}` (명시 필드만 반영) |
 | DELETE | `/api/workspaces/{id}` | admin | 삭제 (`default` 불가, 문서·컬렉션·설정 best-effort 정리) |
 
 ## 커넥터 (`backend/src/api/connectors.rs`)

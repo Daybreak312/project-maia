@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use super::atomic_write_json;
+use super::auto_judge::AutoJudgeSummary;
 use super::detectors::{DetectorKind, ReviewCandidate};
 
 /// 이력에 보관할 최근 실행 수 상한(파일 무한 성장 방지).
@@ -60,6 +61,10 @@ pub struct PatrolRun {
     /// 실패해 격리된 탐지기 유형(관측용). 정상이면 빈 목록.
     #[serde(default)]
     pub failed_detectors: Vec<String>,
+    /// auto review 모드에서 이번 실행이 자동 판정한 결과 요약(manual이면 None).
+    /// `#[serde(default)]`로 auto 도입 이전 이력 JSON과 하위호환된다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_judge: Option<AutoJudgeSummary>,
 }
 
 /// Patrol 상태 — 마지막 실행 시각 + 최근 실행 이력.
@@ -139,6 +144,7 @@ mod tests {
             enqueued: 0,
             edges_decayed: 0,
             failed_detectors: vec![],
+            auto_judge: None,
         }
     }
 

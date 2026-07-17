@@ -1,6 +1,6 @@
 # Patrol — 자기 관리와 메모리 거버넌스
 
-> 최종 검증: 2026-07-17 · 기준 커밋: 712484e · [문서 인덱스](README.md)
+> 최종 검증: 2026-07-18 · 기준 커밋: main · [문서 인덱스](README.md)
 
 ## 철학
 
@@ -8,9 +8,35 @@
 자기참조 순환과 오탐 피로를 피하기 위해:
 
 - 시스템은 **후보를 식별해 플래그만 세운다** (Review Queue).
-- 판단(유효/수정 필요/삭제/기각)은 소유자가 한다.
+- 판단(유효/수정 필요/삭제/기각)은 기본적으로 소유자가 한다.
 - **Patrol 자체는 읽기 + 플래그 + 엣지 감쇠 재계산만** 하며 문서 내용을 변경·삭제하지
-  않는다. 삭제는 오직 사람의 judge에서만 일어난다.
+  않는다(기본 `review_mode=manual`).
+
+### auto review 모드 (opt-in)
+
+소유자가 `review_mode=auto`로 켜면, Patrol이 열린 항목을 **AI로 판정해 즉시 반영**한다
+(사람 대신 판단). 반자율 원칙을 완화하는 만큼 네 안전장치를 **코드로** 봉인한다:
+
+- **soft delete만** — 삭제 판정은 기존 judge(Deleted) 경로(버전 보관 후 삭제)만 재사용한다.
+  하드 삭제 경로에는 접근하지 않는다(복구 가능성 보장).
+- **실패는 전부 Pending 잔류** — 허용 목록 밖 판정·JSON 파싱 실패·LLM 오류·재유입 실패는
+  절대 삭제로 강등하지 않고 항목을 열린 채 남긴다(사람이 볼 수 있게).
+- **판단 주체·근거 영구 기록** — `decided_by`(human/auto)·`decision_reason`을 항목에 각인.
+- **manual 복귀 가능** — 설정 한 번으로 언제든 사람 판단으로 되돌린다.
+
+동작(`patrol/auto_judge.rs`, `Patrol::auto_judge_pass`): 매 실행 enqueue 직후, 열린(Pending)
+항목 **전체**를 대상으로 실행당 `auto_judge_cap`(기본 50)개까지 판정한다.
+
+| 유형 | 판정 방법 | 허용 판정 |
+|------|-----------|-----------|
+| `staleness` | 대상 문서를 LLM에 판정 요청 | valid / deleted / needs_fix |
+| `duplicate` | 대상 + 상대 문서(evidence.similar_to) 요약을 LLM에 | deleted / dismissed |
+| `orphan` | 대상 문서를 LLM에 판정 요청 | valid / deleted / dismissed |
+| `external_mismatch` | LLM 불필요 — 소스 현재 내용으로 **재유입**(기존 커넥터 유입 경로 재사용), 성공 시 Valid로 닫음 | (자동) |
+
+LLM 응답은 엄격한 JSON `{decision, reason}`으로 파싱하고, 허용 목록 밖 판정·파싱 실패는
+거부해 항목을 Pending에 잔류시킨다(ingest_agent의 환각 강등 패턴과 동형). LLM은 ingest와
+동일한 구독 provider(claude)를 재사용해 종량제 과금이 없다.
 
 ## 실행 흐름 (`backend/src/patrol/`)
 
@@ -21,6 +47,7 @@ API 트리거(수동)┘        ▼
                   탐지기 4종 (순수 함수, 실패 상호 격리)
                         ▼
                   Review Queue enqueue (열린 항목 dedup + 유형별 상한 50)
+                        ├─▶ (review_mode=auto) auto-judge 패스 — 열린 항목 AI 판정·즉시 반영
                         ├─▶ 엣지 시간 감쇠 자동 재계산
                         ├─▶ 메트릭 일 롤업
                         └─▶ 실행 이력 기록
@@ -54,6 +81,8 @@ API 트리거(수동)┘        ▼
 - 열린 동일 (문서, 유형) 항목은 중복 생성 금지. enqueue는 유형별 상한으로 폭주 방지.
 - **judge는 멱등** — 같은 판단 재제출이 상태를 깨지 않고 부수효과도 이중 실행되지 않는다.
   부수효과를 상태 전이 **전에** 수행해 크래시 후 재제출로 복구 가능하다.
+- 판단 시 `decided_by`(human/auto)·`decision_reason`을 각인한다(사람 판단은 human, auto-judge는
+  auto+근거). 두 필드는 `#[serde(default)]`라 기존 큐 파일과 하위호환된다.
 - 판단별 부수효과:
   - `valid` → freshness 기준점 갱신 (당분간 staleness 유예, `patrol/freshness.rs` —
     문서 raw JSON은 건드리지 않는다)
@@ -69,9 +98,11 @@ API 트리거(수동)┘        ▼
 
 ## 스케줄러·이력
 
-- 커넥터 스케줄러와 동일한 틱 루프 + 오류 격리 (`patrol/scheduler.rs`).
-- `patrol.frequency`(hourly/daily/weekly)를 주기로 환산, 마지막 실행 이력
-  (`patrol/history.rs`) 기준으로 due 판정. 수동 트리거는 동기 실행 후 리포트 반환.
+- 커넥터 스케줄러와 동일한 틱 루프(틱 1시간) + 오류 격리 (`patrol/scheduler.rs`).
+- `patrol.frequency`를 주기로 환산한다: 키워드(hourly/daily/weekly) 또는 `<n>h`/`<n>d`
+  스펙(예: `"6h"`→6시간, `"12h"`, `"2d"`). 0/음수/알 수 없는 값은 daily로 폴백(브릭 방지).
+  마지막 실행 이력(`patrol/history.rs`) 기준으로 due 판정. 수동 트리거는 동기 실행 후 리포트 반환.
+- auto 모드 실행은 `PatrolRun.auto_judge`(판정별 카운트·실패 수)로 이력에 남는다.
 
 ## API 요약
 
@@ -80,8 +111,9 @@ API 트리거(수동)┘        ▼
 | 수동 실행 | `POST /api/patrol/run` | write |
 | 실행 이력 | `GET /api/patrol/history` | read |
 | 큐 조회 | `GET /api/review?status=&kind=` | read |
-| 판단 | `POST /api/review/judge` (단건·일괄 통합) | write |
+| 판단(사람) | `POST /api/review/judge` (단건·일괄 통합, decided_by=human) | write |
 | 피드백 | `POST /api/feedback` | write |
 | 메트릭 | `GET /api/metrics?from=&until=` (기본 30일) | read |
+| 주기·모드 설정 | `PATCH /api/workspaces/{id}/patrol` (frequency·review_mode·auto_judge_cap·strictness) | admin |
 
-프론트엔드 `/review` 페이지가 이 API들의 UI다 (메트릭 카드 + 상태 필터 + 일괄 판정).
+프론트엔드 `/review` 페이지가 이 API들의 UI다 (메트릭 카드 + 상태 필터 + 일괄 판정 + auto/human 뱃지).

@@ -1,6 +1,6 @@
 # Maia 개요 — 정체성과 설계 원칙
 
-> 최종 검증: 2026-07-17 · 기준 커밋: 712484e · [문서 인덱스](README.md)
+> 최종 검증: 2026-07-18 · 기준 커밋: main · [문서 인덱스](README.md)
 
 ## Maia는 무엇인가
 
@@ -34,8 +34,11 @@ Maia는 소유자의 모든 정보(일상 기록·프로젝트·관심사·의�
    침묵하지 않고 명시적 에러를 낸다(원인 은폐 방지). → [search.md](search.md)
 4. **LLM 호출 상수 상한** — 유입 판단은 문서당 최대 2회, deep search는 라운드당
    상한(재작성 3회 / LLM 5회 / 시간 제한)이 있어 비용이 입력 크기에 비례 폭주하지 않는다.
-5. **반자율 거버넌스** — Patrol은 읽기 + 플래그 + 엣지 감쇠 재계산만 한다. 문서의 변경·삭제는
-   오직 사람의 판단(Review Queue judge)에서만 일어난다. → [patrol.md](patrol.md)
+5. **반자율 거버넌스(기본)** — Patrol은 읽기 + 플래그 + 엣지 감쇠 재계산만 하고, 문서의
+   변경·삭제는 사람의 판단(Review Queue judge)에서만 일어난다. 소유자가 명시적으로 켠
+   `review_mode=auto`에서만 AI가 판정·반영하되, ⓐ 삭제는 복구 가능한 soft delete만 ⓑ 실패·
+   불확실은 전부 Pending 잔류 ⓒ 판단 주체·근거 영구 기록 ⓓ 언제든 manual 복귀 가능이라는
+   네 안전장치가 코드로 보장된다. → [patrol.md](patrol.md)
 6. **종량제 키 탈피 (Phase 6)** — 파싱은 구독(Claude OAuth / ChatGPT Codex), 임베딩은
    로컬 연산(multilingual-e5-small)으로 돌 수 있어 종량제 API 키 없이 자립 가능하다.
    → [llm-providers.md](llm-providers.md)

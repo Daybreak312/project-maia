@@ -64,6 +64,29 @@ impl ReviewDecision {
             ReviewDecision::Dismissed => ReviewStatus::Dismissed,
         }
     }
+
+    /// 소문자 라벨(로그·프롬프트·API 표기용). serde rename과 일치한다.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReviewDecision::Valid => "valid",
+            ReviewDecision::NeedsFix => "needs_fix",
+            ReviewDecision::Deleted => "deleted",
+            ReviewDecision::Dismissed => "dismissed",
+        }
+    }
+}
+
+/// 판단 주체 — 사람이 판단했는가(수동), AI가 자동 판정했는가(auto 모드).
+///
+/// 판단 근거([`ReviewItem::decision_reason`])와 함께 **영구 기록**되어, auto 판정의 감사
+/// 추적과 사후 검증을 가능하게 한다(설계 안전장치 (c) 판단 근거·주체 영구 기록).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecidedBy {
+    /// 소유자가 직접 판단(판단 API 경로).
+    Human,
+    /// Patrol auto-judge가 판정(review_mode=auto).
+    Auto,
 }
 
 /// Review Queue 한 항목.
@@ -82,6 +105,12 @@ pub struct ReviewItem {
     /// 판단 시각(대기 중이면 None).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decided_at: Option<DateTime<Utc>>,
+    /// 판단 주체(사람/auto). 대기 중이거나 기존 큐 파일(필드 부재)이면 None(하위호환).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decided_by: Option<DecidedBy>,
+    /// 판단 근거(주로 auto 판정의 LLM/재유입 사유). 없으면 생략(하위호환).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_reason: Option<String>,
 }
 
 /// 판단 제출 결과 — 항목과 "이번 호출로 실제 전이했는지"를 함께 준다.
@@ -181,6 +210,8 @@ impl ReviewQueueStore {
                 status: ReviewStatus::Pending,
                 created_at: now,
                 decided_at: None,
+                decided_by: None,
+                decision_reason: None,
             });
             open.insert(key);
             *count += 1;
@@ -198,11 +229,16 @@ impl ReviewQueueStore {
     /// **멱등·전이 규칙:** 대기(열린) 항목만 판단 상태로 전이한다(transitioned=true).
     /// 이미 판단된 항목은 상태를 바꾸지 않고 transitioned=false로 돌려준다 — 같은 판단
     /// 재제출도, 다른 판단 재제출도 최초 판단을 깨지 않는다(부수효과 이중 실행 방지).
+    ///
+    /// `decided_by`/`reason`은 전이 시 함께 각인된다(판단 주체·근거 영구 기록). 이미 판단된
+    /// 항목의 재제출은 최초 판단의 주체·근거를 보존한다.
     pub async fn judge(
         &self,
         workspace_id: &str,
         item_id: Uuid,
         decision: ReviewDecision,
+        decided_by: DecidedBy,
+        reason: Option<String>,
         now: DateTime<Utc>,
     ) -> Result<Option<JudgeOutcome>> {
         let _guard = self.write_lock.lock().await;
@@ -212,7 +248,7 @@ impl ReviewQueueStore {
         };
 
         if !item.status.is_open() {
-            // 이미 판단됨 — 상태 유지(멱등).
+            // 이미 판단됨 — 상태·주체·근거 유지(멱등).
             return Ok(Some(JudgeOutcome {
                 item: item.clone(),
                 transitioned: false,
@@ -221,6 +257,8 @@ impl ReviewQueueStore {
 
         item.status = decision.to_status();
         item.decided_at = Some(now);
+        item.decided_by = Some(decided_by);
+        item.decision_reason = reason;
         let outcome = JudgeOutcome {
             item: item.clone(),
             transitioned: true,
@@ -236,6 +274,8 @@ impl ReviewQueueStore {
         workspace_id: &str,
         item_ids: &[Uuid],
         decision: ReviewDecision,
+        decided_by: DecidedBy,
+        reason: Option<String>,
         now: DateTime<Utc>,
     ) -> Result<Vec<JudgeOutcome>> {
         let _guard = self.write_lock.lock().await;
@@ -251,6 +291,8 @@ impl ReviewQueueStore {
             if item.status.is_open() {
                 item.status = decision.to_status();
                 item.decided_at = Some(now);
+                item.decided_by = Some(decided_by);
+                item.decision_reason = reason.clone();
                 dirty = true;
                 outcomes.push(JudgeOutcome {
                     item: item.clone(),
@@ -352,7 +394,7 @@ mod tests {
             .await
             .unwrap();
         let item_id = s.load("default").await.unwrap()[0].id;
-        s.judge("default", item_id, ReviewDecision::Dismissed, Utc::now())
+        s.judge("default", item_id, ReviewDecision::Dismissed, DecidedBy::Human, None, Utc::now())
             .await
             .unwrap();
         let added = s
@@ -388,7 +430,7 @@ mod tests {
         // 하나를 판단해 닫는다.
         let items = s.load("default").await.unwrap();
         let stale_id = items.iter().find(|i| i.kind == DetectorKind::Staleness).unwrap().id;
-        s.judge("default", stale_id, ReviewDecision::Valid, Utc::now())
+        s.judge("default", stale_id, ReviewDecision::Valid, DecidedBy::Human, None, Utc::now())
             .await
             .unwrap();
 
@@ -410,7 +452,7 @@ mod tests {
             .unwrap();
         let id = s.load("default").await.unwrap()[0].id;
 
-        let first = s.judge("default", id, ReviewDecision::Deleted, Utc::now()).await.unwrap().unwrap();
+        let first = s.judge("default", id, ReviewDecision::Deleted, DecidedBy::Human, None, Utc::now()).await.unwrap().unwrap();
         assert!(first.transitioned, "대기 → 판단은 전이");
         assert_eq!(first.item.status, ReviewStatus::Deleted);
         assert!(first.item.decided_at.is_some());
@@ -425,14 +467,14 @@ mod tests {
             .unwrap();
         let id = s.load("default").await.unwrap()[0].id;
 
-        s.judge("default", id, ReviewDecision::Valid, Utc::now()).await.unwrap();
+        s.judge("default", id, ReviewDecision::Valid, DecidedBy::Human, None, Utc::now()).await.unwrap();
         // 같은 판단 재제출 — 전이 없음, 상태 유지(멱등).
-        let again = s.judge("default", id, ReviewDecision::Valid, Utc::now()).await.unwrap().unwrap();
+        let again = s.judge("default", id, ReviewDecision::Valid, DecidedBy::Human, None, Utc::now()).await.unwrap().unwrap();
         assert!(!again.transitioned, "재제출은 전이하지 않는다");
         assert_eq!(again.item.status, ReviewStatus::Valid);
 
         // 다른 판단 재제출도 최초 판단을 덮어쓰지 않는다(보수적).
-        let diff = s.judge("default", id, ReviewDecision::Deleted, Utc::now()).await.unwrap().unwrap();
+        let diff = s.judge("default", id, ReviewDecision::Deleted, DecidedBy::Human, None, Utc::now()).await.unwrap().unwrap();
         assert!(!diff.transitioned);
         assert_eq!(diff.item.status, ReviewStatus::Valid, "최초 판단 유지");
     }
@@ -440,7 +482,7 @@ mod tests {
     #[tokio::test]
     async fn test_judge_missing_item_returns_none() {
         let (_t, s) = store().await;
-        let res = s.judge("default", Uuid::new_v4(), ReviewDecision::Valid, Utc::now()).await.unwrap();
+        let res = s.judge("default", Uuid::new_v4(), ReviewDecision::Valid, DecidedBy::Human, None, Utc::now()).await.unwrap();
         assert!(res.is_none());
     }
 
@@ -453,7 +495,7 @@ mod tests {
         s.enqueue("default", &cands, Utc::now(), 50).await.unwrap();
         let ids: Vec<Uuid> = s.load("default").await.unwrap().iter().map(|i| i.id).collect();
 
-        let outcomes = s.judge_many("default", &ids, ReviewDecision::Dismissed, Utc::now()).await.unwrap();
+        let outcomes = s.judge_many("default", &ids, ReviewDecision::Dismissed, DecidedBy::Human, None, Utc::now()).await.unwrap();
         assert_eq!(outcomes.len(), 3);
         assert!(outcomes.iter().all(|o| o.transitioned));
         assert_eq!(s.count_open("default").await.unwrap(), 0, "모두 닫혀야 한다");
@@ -468,7 +510,7 @@ mod tests {
         s.enqueue("default", &cands, Utc::now(), 50).await.unwrap();
         assert_eq!(s.count_open("default").await.unwrap(), 3);
         let id = s.load("default").await.unwrap()[0].id;
-        s.judge("default", id, ReviewDecision::Valid, Utc::now()).await.unwrap();
+        s.judge("default", id, ReviewDecision::Valid, DecidedBy::Human, None, Utc::now()).await.unwrap();
         assert_eq!(s.count_open("default").await.unwrap(), 2);
     }
 
@@ -480,5 +522,58 @@ mod tests {
             .unwrap();
         assert_eq!(s.load("personal").await.unwrap().len(), 1);
         assert!(s.load("work").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_judge_records_decided_by_and_reason() {
+        // auto 판정은 주체(auto)·근거를 항목에 영구 각인해야 한다(감사 추적).
+        let (_t, s) = store().await;
+        let doc = Uuid::new_v4();
+        s.enqueue("default", &[candidate(doc, DetectorKind::Staleness)], Utc::now(), 50)
+            .await
+            .unwrap();
+        let id = s.load("default").await.unwrap()[0].id;
+
+        let out = s
+            .judge(
+                "default",
+                id,
+                ReviewDecision::Deleted,
+                DecidedBy::Auto,
+                Some("LLM: 1년 이상 미사용·대체 문서 존재".to_string()),
+                Utc::now(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(out.transitioned);
+        assert_eq!(out.item.decided_by, Some(DecidedBy::Auto));
+        assert_eq!(out.item.decision_reason.as_deref(), Some("LLM: 1년 이상 미사용·대체 문서 존재"));
+
+        // 재로드해도 영속되어 있어야 한다.
+        let reloaded = &s.load("default").await.unwrap()[0];
+        assert_eq!(reloaded.decided_by, Some(DecidedBy::Auto));
+        assert!(reloaded.decision_reason.is_some());
+    }
+
+    #[test]
+    fn test_review_item_deserialize_legacy_without_decided_by() {
+        // decided_by/decision_reason 없는 기존 큐 파일 항목도 로드되어야 한다(하위호환).
+        // 이 불변식이 깨지면 auto 배포 후 기존 review_queue.json 로드가 실패한다.
+        let json = r#"[{
+            "id": "00000000-0000-0000-0000-000000000001",
+            "workspace": "default",
+            "document_id": "00000000-0000-0000-0000-000000000002",
+            "kind": "orphan",
+            "reason": "연결된 문서 없음",
+            "evidence": {"edge_count": 0},
+            "status": "pending",
+            "created_at": "2026-04-01T00:00:00Z"
+        }]"#;
+        let items: Vec<ReviewItem> = serde_json::from_str(json).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].decided_by, None, "누락 decided_by는 None");
+        assert_eq!(items[0].decision_reason, None, "누락 decision_reason은 None");
+        assert_eq!(items[0].status, ReviewStatus::Pending);
     }
 }

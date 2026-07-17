@@ -3,7 +3,7 @@ mod connector_config;
 mod manager;
 
 pub use config::{
-    validate_workspace_id, ParsingConfig, PatrolConfig, SearchConfig, WorkspaceConfig,
+    validate_workspace_id, ParsingConfig, PatrolConfig, ReviewMode, SearchConfig, WorkspaceConfig,
     WorkspaceTemplate,
 };
 pub use connector_config::{ConnectorInstance, ConnectorSpec, LocalDirectoryConfig};

@@ -276,6 +276,8 @@ mod tests {
             status,
             created_at: Utc::now(),
             decided_at: None,
+            decided_by: None,
+            decision_reason: None,
         }
     }
 
