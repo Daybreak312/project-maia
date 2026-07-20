@@ -7,9 +7,13 @@ import type {
   Permission,
   CreateKeyResponse,
   ConnectorView,
+  UserInfo,
 } from '../api/types';
 
 type Toast = (message: string, type: 'success' | 'error') => void;
+
+/** 백엔드 검증 규칙과 동일 (auth/users.rs MIN_PASSWORD_LEN) — 사전 안내용. */
+const MIN_PASSWORD_LEN = 8;
 
 // ─────────────────────────────────────────────────────────────────────
 // Web UI 인증 키 — admin 작업에 사용할 Bearer 토큰 (localStorage 영속)
@@ -583,6 +587,225 @@ export function ConnectorsSection({
           Local directory connector: scans registered dirs for changed markdown/text and ingests
           them (incremental, de-duplicated by source path).
         </p>
+      </div>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// 계정 관리 (글로벌 admin 전용) — 목록 / 생성 / 삭제 / 비밀번호 변경
+// ─────────────────────────────────────────────────────────────────────
+function UserRow({
+  user,
+  isSelf,
+  showToast,
+  onDeleted,
+}: {
+  user: UserInfo;
+  isSelf: boolean;
+  showToast: Toast;
+  onDeleted: () => void;
+}) {
+  const [showPasswordForm, setShowPasswordForm] = useState(false);
+  const [password, setPassword] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  const changePassword = async () => {
+    if (password.length < MIN_PASSWORD_LEN) return;
+    setBusy(true);
+    try {
+      await api.changePassword(user.user_id, password);
+      showToast(`'${user.username}'의 비밀번호가 변경되었습니다`, 'success');
+      setPassword('');
+      setShowPasswordForm(false);
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : '비밀번호 변경 실패', 'error');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const remove = async () => {
+    if (
+      !confirm(
+        `계정 '${user.username}'을(를) 삭제할까요? 소유 API 키·세션·모든 워크스페이스 멤버십이 함께 제거됩니다 (개인 워크스페이스 데이터는 보존됩니다).`,
+      )
+    )
+      return;
+    try {
+      await api.deleteUser(user.user_id);
+      showToast(`계정 '${user.username}'이(가) 삭제되었습니다`, 'success');
+      onDeleted();
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : '계정 삭제 실패', 'error');
+    }
+  };
+
+  return (
+    <div className="bg-bg border border-border rounded px-3 py-2">
+      <div className="flex justify-between items-center gap-2">
+        <div className="text-sm min-w-0">
+          <span className="text-gray-200 font-medium">{user.display_name}</span>{' '}
+          <span className="text-muted font-mono">({user.username})</span>{' '}
+          {user.is_admin && (
+            <span className="text-xs bg-primary/20 text-primary px-2 py-0.5 rounded ml-1">
+              admin
+            </span>
+          )}
+          {isSelf && (
+            <span className="text-xs bg-border text-muted px-2 py-0.5 rounded ml-1">나</span>
+          )}
+          <div className="text-xs text-muted font-mono">{user.user_id}</div>
+        </div>
+        <div className="flex gap-2 shrink-0">
+          <button
+            className="px-3 py-1 bg-border text-gray-200 text-xs rounded hover:bg-muted transition-colors"
+            onClick={() => setShowPasswordForm((v) => !v)}
+          >
+            비밀번호 변경
+          </button>
+          {!isSelf && (
+            <button
+              className="px-3 py-1 bg-error text-white text-xs rounded hover:bg-red-700 transition-colors"
+              onClick={remove}
+            >
+              삭제
+            </button>
+          )}
+        </div>
+      </div>
+      {showPasswordForm && (
+        <div className="flex gap-2 mt-2 pt-2 border-t border-border">
+          <input
+            type="password"
+            className="flex-1 bg-card border border-border rounded px-3 py-2 text-sm text-gray-200 focus:outline-none focus:border-primary"
+            placeholder={`새 비밀번호 (${MIN_PASSWORD_LEN}자 이상)`}
+            autoComplete="new-password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+          />
+          <button
+            className="px-4 py-2 bg-primary text-white text-sm rounded hover:bg-primary-hover transition-colors disabled:opacity-50"
+            onClick={changePassword}
+            disabled={busy || password.length < MIN_PASSWORD_LEN}
+          >
+            {busy ? '변경 중...' : '변경'}
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+export function UsersSection({
+  showToast,
+  currentUserId,
+  onWorkspacesChanged,
+}: {
+  showToast: Toast;
+  currentUserId: string | undefined;
+  /** 계정 생성은 개인 워크스페이스를 함께 만든다 — 상위(Workspaces 등) 목록도 갱신한다. */
+  onWorkspacesChanged: () => void;
+}) {
+  const [users, setUsers] = useState<UserInfo[]>([]);
+  const [username, setUsername] = useState('');
+  const [displayName, setDisplayName] = useState('');
+  const [password, setPassword] = useState('');
+  const [isAdmin, setIsAdmin] = useState(false);
+  const [creating, setCreating] = useState(false);
+
+  const load = useCallback(async () => {
+    try {
+      setUsers(await api.listUsers());
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : '계정 목록 조회 실패', 'error');
+    }
+  }, [showToast]);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  const create = async () => {
+    if (!username.trim() || password.length < MIN_PASSWORD_LEN) return;
+    setCreating(true);
+    try {
+      const res = await api.createUser({
+        username: username.trim(),
+        password,
+        display_name: displayName.trim() || undefined,
+        is_admin: isAdmin,
+      });
+      showToast(
+        `계정 '${res.user.username}'이(가) 생성되었습니다 (개인 워크스페이스: ${res.personal_workspace})`,
+        'success',
+      );
+      setUsername('');
+      setDisplayName('');
+      setPassword('');
+      setIsAdmin(false);
+      await load();
+      onWorkspacesChanged();
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : '계정 생성 실패', 'error');
+    } finally {
+      setCreating(false);
+    }
+  };
+
+  return (
+    <div className="bg-card border border-border rounded-lg p-6">
+      <h3 className="text-lg font-semibold text-gray-200 mb-4">계정 관리</h3>
+
+      <div className="flex flex-col gap-2 mb-4">
+        {users.length === 0 && <p className="text-sm text-muted">등록된 계정이 없습니다.</p>}
+        {users.map((u) => (
+          <UserRow
+            key={u.user_id}
+            user={u}
+            isSelf={u.user_id === currentUserId}
+            showToast={showToast}
+            onDeleted={load}
+          />
+        ))}
+      </div>
+
+      <div className="flex flex-wrap gap-2 items-center border-t border-border pt-4">
+        <input
+          className="w-32 bg-bg border border-border rounded px-3 py-2 text-sm text-gray-200 focus:outline-none focus:border-primary"
+          placeholder="아이디"
+          value={username}
+          onChange={(e) => setUsername(e.target.value)}
+        />
+        <input
+          className="w-40 bg-bg border border-border rounded px-3 py-2 text-sm text-gray-200 focus:outline-none focus:border-primary"
+          placeholder="표시 이름 (선택)"
+          value={displayName}
+          onChange={(e) => setDisplayName(e.target.value)}
+        />
+        <input
+          type="password"
+          className="w-44 bg-bg border border-border rounded px-3 py-2 text-sm text-gray-200 focus:outline-none focus:border-primary"
+          placeholder={`초기 비밀번호 (${MIN_PASSWORD_LEN}자 이상)`}
+          autoComplete="new-password"
+          value={password}
+          onChange={(e) => setPassword(e.target.value)}
+        />
+        <label className="flex items-center gap-1 text-sm text-muted cursor-pointer">
+          <input
+            type="checkbox"
+            checked={isAdmin}
+            onChange={(e) => setIsAdmin(e.target.checked)}
+          />
+          admin
+        </label>
+        <button
+          className="px-4 py-2 bg-primary text-white text-sm rounded hover:bg-primary-hover transition-colors disabled:opacity-50"
+          onClick={create}
+          disabled={creating || !username.trim() || password.length < MIN_PASSWORD_LEN}
+        >
+          {creating ? '생성 중...' : '계정 생성'}
+        </button>
       </div>
     </div>
   );

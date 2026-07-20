@@ -148,6 +148,7 @@ function App() {
                 path="/admin"
                 element={
                   <AdminPage
+                    me={me}
                     showToast={showToast}
                     onWorkspacesChanged={refreshWorkspaces}
                   />

@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback } from 'react';
 import type {
   CodexStatus,
   LocalStatus,
+  MeResponse,
   ProviderInfo,
   SettingsResponse,
   WorkspaceSummary,
@@ -11,11 +12,13 @@ import { ConfirmModal } from '../components/ConfirmModal';
 import {
   WebUiKeySection,
   WorkspacesSection,
+  UsersSection,
   ApiKeysSection,
   ConnectorsSection,
 } from '../components/AdminManagement';
 
 interface AdminPageProps {
+  me: MeResponse;
   showToast: (message: string, type: 'success' | 'error') => void;
   /** 워크스페이스 생성/삭제 시 상위(App/Navbar) 목록을 갱신하기 위한 콜백 */
   onWorkspacesChanged: () => void;
@@ -360,7 +363,7 @@ function LocalEmbeddingCard({
 /** 임베딩 provider별 차원 — 전환 시 reindex 필요 여부 판정용(백엔드 dimension()과 일치). */
 const EMBED_DIM: Record<string, number> = { gemini: 3072, openai: 1536, local: 384 };
 
-export function AdminPage({ showToast, onWorkspacesChanged }: AdminPageProps) {
+export function AdminPage({ me, showToast, onWorkspacesChanged }: AdminPageProps) {
   const [settings, setSettings] = useState<SettingsResponse | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [showReindexModal, setShowReindexModal] = useState(false);
@@ -496,6 +499,13 @@ export function AdminPage({ showToast, onWorkspacesChanged }: AdminPageProps) {
           workspaces={workspaces}
           onChanged={handleWorkspacesChanged}
         />
+        {me.is_admin && (
+          <UsersSection
+            showToast={showToast}
+            currentUserId={me.user?.user_id}
+            onWorkspacesChanged={handleWorkspacesChanged}
+          />
+        )}
         <ConnectorsSection showToast={showToast} workspaces={workspaces} />
         <ApiKeysSection showToast={showToast} workspaces={workspaces} />
       </div>
