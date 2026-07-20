@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { api, getAuthKey, setAuthKey } from '../api/client';
 import type {
   WorkspaceSummary,
@@ -8,6 +8,10 @@ import type {
   CreateKeyResponse,
   ConnectorView,
   UserInfo,
+  MeResponse,
+  MemberView,
+  MembersResponse,
+  WorkspaceVisibility,
 } from '../api/types';
 
 type Toast = (message: string, type: 'success' | 'error') => void;
@@ -807,6 +811,358 @@ export function UsersSection({
           {creating ? '생성 중...' : '계정 생성'}
         </button>
       </div>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// 워크스페이스 멤버십 · 공개 설정 (글로벌 admin 또는 해당 워크스페이스 role=admin)
+// ─────────────────────────────────────────────────────────────────────
+const ROLE_OPTIONS: Permission[] = ['read_only', 'read_write', 'admin'];
+// public_permission은 admin을 지정할 수 없다 (백엔드가 400으로 거부).
+const PUBLIC_PERMISSION_OPTIONS: Permission[] = ['read_only', 'read_write'];
+
+function MemberRow({
+  member,
+  workspaceId,
+  showToast,
+  onChanged,
+}: {
+  member: MemberView;
+  workspaceId: string;
+  showToast: Toast;
+  onChanged: () => void;
+}) {
+  const [busy, setBusy] = useState(false);
+
+  const changeRole = async (role: Permission) => {
+    setBusy(true);
+    try {
+      await api.upsertMember(workspaceId, member.user_id, role);
+      showToast('역할이 변경되었습니다', 'success');
+      await onChanged();
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : '역할 변경 실패', 'error');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const remove = async () => {
+    if (!confirm(`'${member.username ?? member.user_id}'을(를) 이 워크스페이스에서 제거할까요?`))
+      return;
+    setBusy(true);
+    try {
+      await api.removeMember(workspaceId, member.user_id);
+      showToast('멤버가 제거되었습니다', 'success');
+      await onChanged();
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : '멤버 제거 실패', 'error');
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="flex justify-between items-center bg-bg border border-border rounded px-3 py-2">
+      <div className="text-sm">
+        {member.username ? (
+          <>
+            <span className="text-gray-200 font-medium">{member.display_name}</span>{' '}
+            <span className="text-muted font-mono">({member.username})</span>
+          </>
+        ) : (
+          <span className="text-muted italic">(삭제된 계정 · {member.user_id})</span>
+        )}
+      </div>
+      <div className="flex gap-2 items-center">
+        <select
+          className="bg-card border border-border rounded px-2 py-1.5 text-sm text-gray-200 focus:outline-none focus:border-primary disabled:opacity-50"
+          value={member.role}
+          onChange={(e) => changeRole(e.target.value as Permission)}
+          disabled={busy}
+        >
+          {ROLE_OPTIONS.map((r) => (
+            <option key={r} value={r}>
+              {r}
+            </option>
+          ))}
+        </select>
+        <button
+          className="px-3 py-1 bg-error text-white text-xs rounded hover:bg-red-700 transition-colors disabled:opacity-50"
+          onClick={remove}
+          disabled={busy}
+        >
+          제거
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/** 멤버 추가 폼. 계정 목록 조회 권한(글로벌 admin)이 있으면 검색 드롭다운을,
+ * 없으면(워크스페이스-레벨 admin) user_id 직접 입력을 제공한다. */
+function AddMemberForm({
+  workspaceId,
+  existingMemberIds,
+  allUsers,
+  showToast,
+  onAdded,
+}: {
+  workspaceId: string;
+  existingMemberIds: Set<string>;
+  allUsers: UserInfo[] | null;
+  showToast: Toast;
+  onAdded: () => void;
+}) {
+  const candidates = allUsers?.filter((u) => !existingMemberIds.has(u.user_id)) ?? [];
+  const [selectedUserId, setSelectedUserId] = useState('');
+  const [manualUserId, setManualUserId] = useState('');
+  const [role, setRole] = useState<Permission>('read_write');
+  const [busy, setBusy] = useState(false);
+
+  const targetUserId = allUsers !== null ? selectedUserId : manualUserId.trim();
+
+  const add = async () => {
+    if (!targetUserId) return;
+    setBusy(true);
+    try {
+      await api.upsertMember(workspaceId, targetUserId, role);
+      showToast('멤버가 추가되었습니다', 'success');
+      setSelectedUserId('');
+      setManualUserId('');
+      await onAdded();
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : '멤버 추가 실패', 'error');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="flex flex-wrap gap-2 items-center">
+      {allUsers !== null ? (
+        <select
+          className="bg-bg border border-border rounded px-3 py-2 text-sm text-gray-200 focus:outline-none focus:border-primary"
+          value={selectedUserId}
+          onChange={(e) => setSelectedUserId(e.target.value)}
+        >
+          <option value="">계정 선택...</option>
+          {candidates.map((u) => (
+            <option key={u.user_id} value={u.user_id}>
+              {u.display_name} ({u.username})
+            </option>
+          ))}
+        </select>
+      ) : (
+        <input
+          className="w-56 bg-bg border border-border rounded px-3 py-2 text-sm text-gray-200 font-mono focus:outline-none focus:border-primary"
+          placeholder="user_id 직접 입력"
+          value={manualUserId}
+          onChange={(e) => setManualUserId(e.target.value)}
+        />
+      )}
+      <select
+        className="bg-bg border border-border rounded px-3 py-2 text-sm text-gray-200 focus:outline-none focus:border-primary"
+        value={role}
+        onChange={(e) => setRole(e.target.value as Permission)}
+      >
+        {ROLE_OPTIONS.map((r) => (
+          <option key={r} value={r}>
+            {r}
+          </option>
+        ))}
+      </select>
+      <button
+        className="px-4 py-2 bg-primary text-white text-sm rounded hover:bg-primary-hover transition-colors disabled:opacity-50"
+        onClick={add}
+        disabled={busy || !targetUserId}
+      >
+        {busy ? '추가 중...' : '멤버 추가'}
+      </button>
+      {allUsers === null && (
+        <span className="text-xs text-muted">
+          (계정 목록 조회 권한이 없어 user_id를 직접 입력해야 합니다 — 대상 계정의 "내 계정"
+          페이지에서 확인할 수 있습니다)
+        </span>
+      )}
+    </div>
+  );
+}
+
+export function MembersSection({
+  showToast,
+  me,
+  workspaces,
+}: {
+  showToast: Toast;
+  me: MeResponse;
+  workspaces: WorkspaceSummary[];
+}) {
+  // 관리 가능한 워크스페이스 = 글로벌 admin이 볼 수 있는 전체 목록(이름 포함) ∪
+  // 워크스페이스-레벨 admin으로 소속된 항목(이름 미상 — id만). 글로벌 admin이
+  // 아니면 `workspaces`는 항상 비어있으므로(403) 자연히 후자만 남는다.
+  const options = useMemo(() => {
+    const byId = new Map<string, string | null>();
+    workspaces.forEach((w) => byId.set(w.id, w.name));
+    me.workspaces
+      .filter((w) => w.permission === 'admin')
+      .forEach((w) => {
+        if (!byId.has(w.id)) byId.set(w.id, null);
+      });
+    return Array.from(byId.entries()).map(([id, name]) => ({ id, name }));
+  }, [workspaces, me.workspaces]);
+
+  const [selectedWs, setSelectedWs] = useState('');
+  const [data, setData] = useState<MembersResponse | null>(null);
+  const [allUsers, setAllUsers] = useState<UserInfo[] | null>(null);
+  const [changingVisibility, setChangingVisibility] = useState(false);
+
+  // selectedWs는 "사용자가 드롭다운에서 고른 값"의 의도만 담는다. 실제로 쓰는
+  // 워크스페이스는 렌더 중 즉시 파생한다 — 옵션이 바뀌어 선택값이 무효해지는
+  // 경우(초기 로드·워크스페이스 삭제 등)를 effect로 동기화하면 selectedWs
+  // 갱신이 load-effect의 재실행을 유발하는 체이닝(cascading render)이 생긴다.
+  const activeWs = options.some((o) => o.id === selectedWs) ? selectedWs : (options[0]?.id ?? '');
+
+  // 계정 검색 드롭다운은 글로벌 admin만 (워크스페이스-레벨 admin은 /api/users가 403).
+  useEffect(() => {
+    if (!me.is_admin) return;
+    api
+      .listUsers()
+      .then(setAllUsers)
+      .catch(() => setAllUsers(null));
+  }, [me.is_admin]);
+
+  const load = useCallback(async () => {
+    // activeWs가 빈 값이면(options.length === 0) JSX가 "관리 권한 없음" 분기를
+    // 먼저 렌더링하므로 data는 참조되지 않는다 — 굳이 정리할 필요가 없다.
+    if (!activeWs) return;
+    try {
+      setData(await api.listMembers(activeWs));
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : '멤버 목록 조회 실패', 'error');
+      setData(null);
+    }
+  }, [activeWs, showToast]);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  // setVisibility 응답은 username/display_name을 채우지 않으므로(백엔드가 role만
+  // 재매핑) 항상 listMembers로 다시 불러와 멤버 표시 정보를 온전히 유지한다.
+  const changeVisibility = async (visibility: WorkspaceVisibility) => {
+    setChangingVisibility(true);
+    try {
+      await api.setVisibility(activeWs, { visibility });
+      showToast(
+        `공개 설정이 ${visibility === 'public' ? '공개' : '비공개'}로 변경되었습니다`,
+        'success',
+      );
+      await load();
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : '공개 설정 변경 실패', 'error');
+    } finally {
+      setChangingVisibility(false);
+    }
+  };
+
+  const changePublicPermission = async (permission: Permission) => {
+    setChangingVisibility(true);
+    try {
+      await api.setVisibility(activeWs, { visibility: 'public', public_permission: permission });
+      showToast('비멤버 권한이 변경되었습니다', 'success');
+      await load();
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : '비멤버 권한 변경 실패', 'error');
+    } finally {
+      setChangingVisibility(false);
+    }
+  };
+
+  return (
+    <div className="bg-card border border-border rounded-lg p-6">
+      <div className="flex justify-between items-center mb-4">
+        <h3 className="text-lg font-semibold text-gray-200">멤버 · 공개 설정</h3>
+        {options.length > 0 && (
+          <select
+            className="bg-bg border border-border rounded px-3 py-1.5 text-sm text-gray-200 focus:outline-none focus:border-primary"
+            value={activeWs}
+            onChange={(e) => setSelectedWs(e.target.value)}
+          >
+            {options.map((o) => (
+              <option key={o.id} value={o.id}>
+                {o.name ? `${o.name} (${o.id})` : o.id}
+              </option>
+            ))}
+          </select>
+        )}
+      </div>
+
+      {options.length === 0 ? (
+        <p className="text-sm text-muted">관리 권한이 있는 워크스페이스가 없습니다.</p>
+      ) : !data ? (
+        <p className="text-sm text-muted">불러오는 중...</p>
+      ) : (
+        <>
+          {/* 공개 설정 */}
+          <div className="flex flex-wrap gap-3 items-center mb-4 pb-4 border-b border-border">
+            <span className="text-sm text-muted">공개 범위:</span>
+            <select
+              className="bg-bg border border-border rounded px-3 py-1.5 text-sm text-gray-200 focus:outline-none focus:border-primary disabled:opacity-50"
+              value={data.visibility}
+              disabled={changingVisibility}
+              onChange={(e) => changeVisibility(e.target.value as WorkspaceVisibility)}
+            >
+              <option value="private">private</option>
+              <option value="public">public</option>
+            </select>
+            {data.visibility === 'public' && (
+              <>
+                <span className="text-sm text-muted">비멤버 권한:</span>
+                <select
+                  className="bg-bg border border-border rounded px-3 py-1.5 text-sm text-gray-200 focus:outline-none focus:border-primary disabled:opacity-50"
+                  value={data.public_permission}
+                  disabled={changingVisibility}
+                  onChange={(e) => changePublicPermission(e.target.value as Permission)}
+                >
+                  {PUBLIC_PERMISSION_OPTIONS.map((p) => (
+                    <option key={p} value={p}>
+                      {p}
+                    </option>
+                  ))}
+                </select>
+              </>
+            )}
+          </div>
+
+          {/* 멤버 목록 */}
+          <div className="flex flex-col gap-2 mb-4">
+            {data.members.length === 0 && (
+              <p className="text-sm text-muted">멤버가 없습니다.</p>
+            )}
+            {data.members.map((m) => (
+              <MemberRow
+                key={m.user_id}
+                member={m}
+                workspaceId={activeWs}
+                showToast={showToast}
+                onChanged={load}
+              />
+            ))}
+          </div>
+
+          {/* 멤버 추가 */}
+          <div className="border-t border-border pt-4">
+            <AddMemberForm
+              workspaceId={activeWs}
+              existingMemberIds={new Set(data.members.map((m) => m.user_id))}
+              allUsers={allUsers}
+              showToast={showToast}
+              onAdded={load}
+            />
+          </div>
+        </>
+      )}
     </div>
   );
 }
