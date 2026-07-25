@@ -13,16 +13,51 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { MaiaClient } from "./maia-client.js";
+import {
+  describeServerArg,
+  loadServerRegistry,
+  resolveServer,
+  type ResolvedServer,
+  type ServerRegistry,
+} from "./servers.js";
 
-const MAIA_URL = process.env.MAIA_URL ?? "http://localhost:8080";
-const MAIA_API_KEY = process.env.MAIA_API_KEY;
-/** 기본 워크스페이스. 미설정 시 서버가 API 키에 바인딩된 기본 워크스페이스를 사용한다. */
-const MAIA_WORKSPACE = process.env.MAIA_WORKSPACE;
-const client = new MaiaClient(MAIA_URL, MAIA_API_KEY);
+/** 설정 오류 시 즉시 종료 — 잘못된 서버로의 조용한 접속보다 명시적 기동 실패가 낫다. */
+function fatal(message: string): never {
+  console.error(`[maia-mcp] configuration error: ${message}`);
+  process.exit(1);
+}
 
-/** tool 인자로 받은 workspace가 없으면 환경변수 기본값을 사용한다. */
-function resolveWorkspace(workspace?: string): string | undefined {
-  return workspace ?? MAIA_WORKSPACE;
+// 서버 레지스트리 로드. 소스 우선순위·문서 형식은 servers.ts 상단 주석 참조.
+// stderr 로그는 STDIO transport(stdout)와 분리되어 프로토콜을 오염시키지 않는다.
+let registry: ServerRegistry;
+try {
+  registry = loadServerRegistry();
+} catch (err) {
+  fatal(err instanceof Error ? err.message : String(err));
+}
+
+// alias → REST 클라이언트. 기동 시 전부 생성해 호출 시점의 실패 요인을 줄인다.
+const clients = new Map<string, MaiaClient>(
+  [...registry.servers.values()].map((s) => [s.alias, new MaiaClient(s.url, s.apiKey)]),
+);
+
+console.error(
+  `[maia-mcp] loaded ${clients.size} server(s) from ${registry.source}: ` +
+    [...registry.servers.values()]
+      .map((s) => `${s.alias}${s.alias === registry.defaultAlias ? " (default)" : ""} → ${s.url}`)
+      .join(", "),
+);
+
+/** tool의 `server` 인자를 대상 서버·클라이언트로 해석한다. 미등록 alias는 에러. */
+function resolveTarget(server?: string): { client: MaiaClient; info: ResolvedServer } {
+  const info = resolveServer(registry, server);
+  // resolveServer가 성공한 alias는 반드시 clients에 있다 (동일 레지스트리에서 생성).
+  return { client: clients.get(info.alias)!, info };
+}
+
+/** tool 인자로 받은 workspace가 없으면 대상 서버에 설정된 기본 워크스페이스를 사용한다. */
+function resolveWorkspace(server: ResolvedServer, workspace?: string): string | undefined {
+  return workspace ?? server.workspace;
 }
 
 /** 모든 tool에 공통으로 추가되는 선택적 workspace 인자 스키마. */
@@ -33,14 +68,17 @@ const workspaceArg = z
     "Target workspace ID (e.g. 'personal', 'work'). Omit to use the default workspace bound to the API key.",
   );
 
-const server = new McpServer({
+/** 모든 tool에 공통으로 추가되는 선택적 server 인자 스키마 — 설정된 alias 목록을 노출한다. */
+const serverArg = z.string().optional().describe(describeServerArg(registry));
+
+const mcp = new McpServer({
   name: "maia",
-  version: "1.0.0",
-  description: `Personal knowledge base (Maia). Stores the user's career history, interview experiences, project notes, memos, salary details, skills, and personal records. Use search_context FIRST when the user asks about their personal info. Use ingest_information when they ask to save something.`,
+  version: "1.1.0",
+  description: `Personal knowledge base (Maia). Stores the user's career history, interview experiences, project notes, memos, salary details, skills, and personal records. Use search_context FIRST when the user asks about their personal info. Use ingest_information when they ask to save something. Multiple Maia servers can be configured (e.g. personal / enterprise) — every tool accepts an optional 'server' alias argument.`,
 });
 
 // ─── Tool: search_context ────────────────────────────────────────────
-server.tool(
+mcp.tool(
   "search_context",
   `Search the user's personal knowledge base (Maia) for relevant information.
 
@@ -70,9 +108,11 @@ INTERPRETING RESULTS:
       .default("hybrid")
       .describe("Search mode: hybrid (recommended), vector (semantic), keyword (exact match)"),
     workspace: workspaceArg,
+    server: serverArg,
   },
-  async ({ query, limit, mode, workspace }) => {
-    const res = await client.search(query, limit, mode, resolveWorkspace(workspace));
+  async ({ query, limit, mode, workspace, server }) => {
+    const { client, info } = resolveTarget(server);
+    const res = await client.search(query, limit, mode, resolveWorkspace(info, workspace));
 
     if (res.results.length === 0) {
       return {
@@ -115,7 +155,7 @@ INTERPRETING RESULTS:
 );
 
 // ─── Tool: deep_search ───────────────────────────────────────────────
-server.tool(
+mcp.tool(
   "deep_search",
   `Deeply recall everything related to a topic from the user's knowledge base (Maia).
 
@@ -140,9 +180,11 @@ INTERPRETING RESULTS:
   {
     query: z.string().describe("Natural language topic to recall broadly"),
     workspace: workspaceArg,
+    server: serverArg,
   },
-  async ({ query, workspace }) => {
-    const res = await client.deepSearch(query, resolveWorkspace(workspace));
+  async ({ query, workspace, server }) => {
+    const { client, info } = resolveTarget(server);
+    const res = await client.deepSearch(query, resolveWorkspace(info, workspace));
     const meta = res.agent;
 
     // 탐색 과정 요약 라인 (관측성 — 어떻게 회상했는지).
@@ -211,7 +253,7 @@ INTERPRETING RESULTS:
 );
 
 // ─── Tool: ingest_information ────────────────────────────────────────
-server.tool(
+mcp.tool(
   "ingest_information",
   `Save new information to the user's personal knowledge base (Maia).
 
@@ -226,9 +268,11 @@ Input can be any natural language text. The system automatically extracts: summa
       .string()
       .describe("Information to store (natural language, no length limit)"),
     workspace: workspaceArg,
+    server: serverArg,
   },
-  async ({ content, workspace }) => {
-    const res = await client.ingest(content, resolveWorkspace(workspace));
+  async ({ content, workspace, server }) => {
+    const { client, info } = resolveTarget(server);
+    const res = await client.ingest(content, resolveWorkspace(info, workspace));
 
     const parts = [`Saved successfully (id: ${res.id})`];
 
@@ -275,7 +319,7 @@ Input can be any natural language text. The system automatically extracts: summa
 );
 
 // ─── Tool: get_neighbors ─────────────────────────────────────────────
-server.tool(
+mcp.tool(
   "get_neighbors",
   `Explore documents connected to a given document in the user's knowledge graph.
 
@@ -295,9 +339,11 @@ depth=1 returns direct neighbors; depth=2 walks two hops (e.g. interview note �
       .default(1)
       .describe("Traversal depth (1 = direct neighbors, capped at 5)"),
     workspace: workspaceArg,
+    server: serverArg,
   },
-  async ({ id, depth, workspace }) => {
-    const res = await client.neighbors(id, depth, resolveWorkspace(workspace));
+  async ({ id, depth, workspace, server }) => {
+    const { client, info } = resolveTarget(server);
+    const res = await client.neighbors(id, depth, resolveWorkspace(info, workspace));
 
     if (res.neighbors.length === 0) {
       return {
@@ -332,7 +378,7 @@ depth=1 returns direct neighbors; depth=2 walks two hops (e.g. interview note �
 );
 
 // ─── Tool: get_document ──────────────────────────────────────────────
-server.tool(
+mcp.tool(
   "get_document",
   `Retrieve the full original content of a specific document from Maia.
 
@@ -345,9 +391,11 @@ Requires the document UUID from a previous search result.`,
   {
     id: z.string().uuid().describe("Document UUID (from search results)"),
     workspace: workspaceArg,
+    server: serverArg,
   },
-  async ({ id, workspace }) => {
-    const doc = await client.getDocument(id, resolveWorkspace(workspace));
+  async ({ id, workspace, server }) => {
+    const { client, info } = resolveTarget(server);
+    const doc = await client.getDocument(id, resolveWorkspace(info, workspace));
 
     const parts = [
       `Document: ${doc.id}`,
@@ -369,7 +417,7 @@ Requires the document UUID from a previous search result.`,
 );
 
 // ─── Tool: list_recent_documents ─────────────────────────────────────
-server.tool(
+mcp.tool(
   "list_recent_documents",
   `List recently stored documents in Maia.
 
@@ -385,9 +433,11 @@ Use when:
       .default(10)
       .describe("Number of documents to retrieve"),
     workspace: workspaceArg,
+    server: serverArg,
   },
-  async ({ limit, workspace }) => {
-    const res = await client.listRecent(limit, resolveWorkspace(workspace));
+  async ({ limit, workspace, server }) => {
+    const { client, info } = resolveTarget(server);
+    const res = await client.listRecent(limit, resolveWorkspace(info, workspace));
 
     if (res.documents.length === 0) {
       return {
@@ -418,7 +468,7 @@ Use when:
 // ─── 서버 시작 ───────────────────────────────────────────────────────
 async function main() {
   const transport = new StdioServerTransport();
-  await server.connect(transport);
+  await mcp.connect(transport);
 }
 
 main().catch((err) => {
