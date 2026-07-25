@@ -297,10 +297,12 @@ async fn main() -> anyhow::Result<()> {
 
     // SPA 폴백: 실제 파일이 없는 경로(/admin, /account 등 클라이언트 라우트)는
     // index.html을 돌려 브라우저 라우터가 처리하게 한다. ServeDir는 GET/HEAD 외
-    // 요청을 not_found_service로 넘기지 않으므로 이 폴백은 정적 조회 전용이다.
+    // 요청을 폴백으로 넘기지 않으므로 이 폴백은 정적 조회 전용이다.
+    // not_found_service가 아니라 fallback이어야 한다 — 전자는 SetStatus로
+    // 응답을 404로 강제해 클라이언트 라우트가 "본문은 SPA, 상태는 404"가 된다.
     let spa_static = ServeDir::new(&static_dir)
         .append_index_html_on_directories(true)
-        .not_found_service(ServeFile::new(format!("{}/index.html", static_dir)));
+        .fallback(ServeFile::new(format!("{}/index.html", static_dir)));
 
     let app = Router::new()
         .merge(api_routes)
