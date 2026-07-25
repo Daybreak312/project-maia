@@ -15,7 +15,7 @@ use std::sync::Arc;
 use axum::{
     http::StatusCode,
     middleware,
-    routing::{any, delete, get, patch, post, put},
+    routing::{any, delete, get, get_service, patch, post, put},
     Router,
 };
 use tower_http::cors::{Any, CorsLayer};
@@ -307,6 +307,14 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .merge(api_routes)
         .merge(public_routes)
+        // 클라이언트 라우트 /search는 레거시 API 경로 POST /search와 겹친다.
+        // 경로가 매칭되면 메서드가 달라도 route_layer 인증이 먼저 걸리므로,
+        // GET을 SPA 엔트리로 명시 등록해 새로고침이 401로 새지 않게 한다.
+        // (새 클라이언트 라우트는 무프리픽스 API 경로와 겹치지 않게 할 것)
+        .route(
+            "/search",
+            get_service(ServeFile::new(format!("{}/index.html", static_dir))),
+        )
         .fallback_service(spa_static)
         .layer(
             CorsLayer::new()
@@ -331,6 +339,50 @@ async fn main() -> anyhow::Result<()> {
 /// 미등록 API 경로 폴백 — SPA index.html 대신 명시적 404를 돌려준다.
 async fn api_not_found_handler() -> StatusCode {
     StatusCode::NOT_FOUND
+}
+
+#[cfg(test)]
+mod router_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use axum::response::{IntoResponse, Response};
+    use tower::ServiceExt;
+
+    /// require_auth처럼 매칭된 라우트 앞단에서 무조건 거부하는 가짜 인증.
+    async fn deny(_req: axum::extract::Request, _next: middleware::Next) -> Response {
+        StatusCode::UNAUTHORIZED.into_response()
+    }
+
+    /// /search 이중 등록의 전제 검증 — 같은 경로에 메서드가 다른 라우트를
+    /// 겹쳐 등록해도 폴딩되며, route_layer는 원래 라우터의 메서드에만 남는다.
+    /// (깨지면 서버가 기동 시 패닉하거나 /search 새로고침이 401로 돌아간다)
+    #[tokio::test]
+    async fn test_search_method_split_get_spa_post_auth() {
+        let api = Router::new()
+            .route("/search", post(|| async { "api" }))
+            .route_layer(middleware::from_fn(deny));
+        let app: Router = api.route("/search", get(|| async { "spa" }));
+
+        let get_res = app
+            .clone()
+            .oneshot(Request::builder().uri("/search").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(get_res.status(), StatusCode::OK);
+
+        let post_res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/search")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(post_res.status(), StatusCode::UNAUTHORIZED);
+    }
 }
 
 async fn health_handler() -> &'static str {

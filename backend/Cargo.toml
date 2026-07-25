@@ -58,5 +58,7 @@ dotenvy = "0.15"
 
 [dev-dependencies]
 tempfile = "3"
+# 라우터 폴딩 시맨틱 테스트 (main.rs router_tests — oneshot)
+tower = { version = "0.4", features = ["util"] }
 # 외부 HTTP mock (Claude OAuth·Codex refresh/responses 상태머신 테스트 — 라이브 토큰 금지)
 wiremock = "0.6"
