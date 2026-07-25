@@ -59,6 +59,12 @@ RUN apt-get update && apt-get install -y \
 COPY --from=backend /app/target/release/maia /usr/local/bin/
 COPY --from=frontend /frontend/dist /app/static
 
+# MCP 클라이언트 소스 번들 — `GET /mcp/client.tar.gz`로 서빙된다 (api/mcp.rs).
+# 온프레미스 환경이 외부 저장소 접근 없이 서버에서 직접 브릿지를 받게 하기 위함.
+COPY mcp/package.json mcp/package-lock.json mcp/tsconfig.json /tmp/mcp-pack/maia-mcp/
+COPY mcp/src /tmp/mcp-pack/maia-mcp/src
+RUN tar -czf /app/mcp-client.tar.gz -C /tmp/mcp-pack maia-mcp && rm -rf /tmp/mcp-pack
+
 ENV SERVER_PORT=8080
 ENV DATA_DIR=/data
 ENV QDRANT_URL=http://qdrant:6333

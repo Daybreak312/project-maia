@@ -279,7 +279,12 @@ async fn main() -> anyhow::Result<()> {
     let public_routes = Router::new()
         .route("/health", get(health_handler))
         .route("/api/auth/login", post(api::login_handler))
-        .route("/api/auth/logout", post(api::logout_handler));
+        .route("/api/auth/logout", post(api::logout_handler))
+        // MCP 클라이언트 셀프 배포 — 설치 안내·매니페스트·소스 번들.
+        // 비밀이 없고, 자격증명 획득 이전 단계의 문서이므로 공개 (api/mcp.rs 참조).
+        .route("/mcp", get(api::mcp_guide_handler))
+        .route("/mcp/install.json", get(api::mcp_manifest_handler))
+        .route("/mcp/client.tar.gz", get(api::mcp_client_tarball_handler));
 
     // 정적 파일 서빙 (환경변수 우선, 없으면 기본 경로)
     let static_dir = std::env::var("STATIC_DIR")

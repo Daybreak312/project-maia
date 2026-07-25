@@ -3,6 +3,7 @@ mod ingest;
 mod search;
 mod documents;
 mod graph;
+mod mcp;
 mod workspaces;
 mod connectors;
 mod keys;
@@ -24,6 +25,7 @@ pub use connectors::{
     register_connector_handler, trigger_connector_handler,
 };
 pub use auth::{login_handler, logout_handler, me_handler};
+pub use mcp::{mcp_client_tarball_handler, mcp_guide_handler, mcp_manifest_handler};
 pub use members::{
     list_members_handler, remove_member_handler, set_visibility_handler, upsert_member_handler,
 };
