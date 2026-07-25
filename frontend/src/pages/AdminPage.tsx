@@ -10,7 +10,6 @@ import type {
 import { api } from '../api/client';
 import { ConfirmModal } from '../components/ConfirmModal';
 import {
-  WebUiKeySection,
   WorkspacesSection,
   UsersSection,
   MembersSection,
@@ -494,7 +493,6 @@ export function AdminPage({ me, showToast, onWorkspacesChanged }: AdminPageProps
 
       {/* 워크스페이스 · 키 관리 (Qdrant 불가용 시에도 파일 기반으로 동작) */}
       <div className="flex flex-col gap-4 mb-8">
-        <WebUiKeySection showToast={showToast} />
         <WorkspacesSection
           showToast={showToast}
           workspaces={workspaces}

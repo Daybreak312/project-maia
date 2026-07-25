@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
-import { api } from '../api/client';
+import { api, getAuthKey, setAuthKey } from '../api/client';
 import type {
   ApiKeyInfo,
   CreateKeyResponse,
@@ -23,6 +23,83 @@ const AUTH_SOURCE_LABEL: Record<MeResponse['auth_source'], string> = {
   master: '마스터키',
   dev: '개발 모드 (인증 비활성)',
 };
+
+// ─────────────────────────────────────────────────────────────────────
+// 브라우저 API 키 — 키 모드에서 이 웹 UI가 요청에 싣는 Bearer 키.
+// localStorage에만 저장되며, 세션(쿠키) 모드 요청에는 실리지 않는다.
+// ─────────────────────────────────────────────────────────────────────
+function WebUiKeySection({ showToast }: { showToast: AccountPageProps['showToast'] }) {
+  const [key, setKey] = useState(getAuthKey());
+  const [editing, setEditing] = useState(false);
+
+  const save = () => {
+    setAuthKey(key.trim());
+    setEditing(false);
+    showToast('키가 저장되었습니다 — 새로고침하면 모든 요청에 적용됩니다.', 'success');
+  };
+
+  const masked = getAuthKey() ? '••••••••' + getAuthKey().slice(-4) : '없음';
+
+  return (
+    <div className="bg-card border border-border rounded-lg p-6">
+      <h3 className="text-lg font-semibold text-gray-200 mb-2">
+        브라우저 API 키 (Web UI Authentication)
+      </h3>
+      <p className="text-sm text-muted mb-4">
+        API 키 모드에서 이 웹 UI가 요청에 사용하는 키입니다 (마스터키 또는 발급
+        키). 이 브라우저의 localStorage에만 저장되며, 로그인 세션 인증과는
+        별개입니다. 현재: <span className="font-mono">{masked}</span>
+      </p>
+      {editing ? (
+        <div className="flex gap-2">
+          <input
+            type="password"
+            className="flex-1 bg-bg border border-border rounded px-3 py-2 text-sm text-gray-200 focus:outline-none focus:border-primary"
+            placeholder="API 키 붙여넣기..."
+            value={key}
+            onChange={(e) => setKey(e.target.value)}
+          />
+          <button
+            className="px-4 py-2 bg-primary text-white text-sm rounded hover:bg-primary-hover transition-colors"
+            onClick={save}
+          >
+            저장
+          </button>
+          <button
+            className="px-4 py-2 bg-border text-gray-200 text-sm rounded hover:bg-muted transition-colors"
+            onClick={() => {
+              setKey(getAuthKey());
+              setEditing(false);
+            }}
+          >
+            취소
+          </button>
+        </div>
+      ) : (
+        <div className="flex gap-2">
+          <button
+            className="px-4 py-2 bg-border text-gray-200 text-sm rounded hover:bg-muted transition-colors"
+            onClick={() => setEditing(true)}
+          >
+            {getAuthKey() ? '키 변경' : '키 설정'}
+          </button>
+          {getAuthKey() && (
+            <button
+              className="px-4 py-2 bg-error text-white text-sm rounded hover:bg-red-700 transition-colors"
+              onClick={() => {
+                setAuthKey('');
+                setKey('');
+                showToast('저장된 키를 지웠습니다', 'success');
+              }}
+            >
+              삭제
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
 
 // ─────────────────────────────────────────────────────────────────────
 // 비밀번호 변경 — 본인 세션 전용. 성공 시 서버가 이 계정의 모든 세션을
@@ -289,44 +366,51 @@ export function AccountPage({ me, showToast, onAuthChanged }: AccountPageProps) 
       <h2 className="text-xl font-semibold text-gray-200 mb-6">내 계정</h2>
 
       <div className="flex flex-col gap-4">
-        {/* 계정 정보 */}
+        {/* 인증 정보 — 인증 방식·admin 여부는 계정 유무와 무관하게 항상 표시 */}
         <div className="bg-card border border-border rounded-lg p-6">
-          <h3 className="text-lg font-semibold text-gray-200 mb-4">계정 정보</h3>
-          {me.user ? (
-            <div className="text-sm text-gray-200 flex flex-col gap-1">
-              <div>
-                <span className="text-muted">이름:</span> {me.user.display_name}{' '}
-                {me.user.is_admin && (
-                  <span className="text-xs bg-primary/20 text-primary px-2 py-0.5 rounded ml-1">
-                    admin
-                  </span>
-                )}
-              </div>
-              <div>
-                <span className="text-muted">아이디:</span>{' '}
-                <span className="font-mono">{me.user.username}</span>{' '}
-                <span className="text-xs text-muted font-mono">({me.user.user_id})</span>
-              </div>
-              <div>
-                <span className="text-muted">가입일:</span>{' '}
-                {new Date(me.user.created_at).toLocaleString()}
-              </div>
-              <div>
-                <span className="text-muted">인증 방식:</span>{' '}
-                {AUTH_SOURCE_LABEL[me.auth_source]}
-              </div>
+          <h3 className="text-lg font-semibold text-gray-200 mb-4">인증 정보</h3>
+          <div className="text-sm text-gray-200 flex flex-col gap-1">
+            <div>
+              <span className="text-muted">인증 방식:</span>{' '}
+              {AUTH_SOURCE_LABEL[me.auth_source]}
+              {me.auth_source === 'api_key' && (
+                <span className="text-xs text-muted ml-1">
+                  {me.user ? '(계정 소유 키)' : '(시스템 키 — 계정 미연결)'}
+                </span>
+              )}
+              {me.is_admin && (
+                <span className="text-xs bg-primary/20 text-primary px-2 py-0.5 rounded ml-2">
+                  전역 admin
+                </span>
+              )}
             </div>
-          ) : (
-            <p className="text-sm text-muted">
-              {AUTH_SOURCE_LABEL[me.auth_source]} 인증 중 — 연결된 계정이 없습니다.
-              계정 기능(비밀번호·개인 키)은 ID/PW 로그인 세션에서 제공됩니다.
-            </p>
-          )}
+            {me.user ? (
+              <>
+                <div>
+                  <span className="text-muted">이름:</span> {me.user.display_name}
+                </div>
+                <div>
+                  <span className="text-muted">아이디:</span>{' '}
+                  <span className="font-mono">{me.user.username}</span>{' '}
+                  <span className="text-xs text-muted font-mono">({me.user.user_id})</span>
+                </div>
+                <div>
+                  <span className="text-muted">가입일:</span>{' '}
+                  {new Date(me.user.created_at).toLocaleString()}
+                </div>
+              </>
+            ) : (
+              <p className="text-muted">
+                이 인증에 연결된 계정이 없습니다. 계정 기능(비밀번호·개인 키)은
+                ID/PW 로그인 세션에서 제공됩니다.
+              </p>
+            )}
+          </div>
 
-          {/* 접근 가능 워크스페이스 요약 */}
-          {me.workspaces.length > 0 && (
-            <div className="mt-4 pt-4 border-t border-border">
-              <p className="text-sm text-muted mb-2">접근 가능한 워크스페이스</p>
+          {/* 접근 가능 워크스페이스 — 서버가 산출한 유효 권한 목록 */}
+          <div className="mt-4 pt-4 border-t border-border">
+            <p className="text-sm text-muted mb-2">접근 가능한 워크스페이스</p>
+            {me.workspaces.length > 0 ? (
               <div className="flex flex-wrap gap-2">
                 {me.workspaces.map((ws) => (
                   <span
@@ -338,8 +422,10 @@ export function AccountPage({ me, showToast, onAuthChanged }: AccountPageProps) 
                   </span>
                 ))}
               </div>
-            </div>
-          )}
+            ) : (
+              <p className="text-sm text-muted">접근 가능한 워크스페이스가 없습니다.</p>
+            )}
+          </div>
         </div>
 
         {isSession && me.user ? (
@@ -361,6 +447,8 @@ export function AccountPage({ me, showToast, onAuthChanged }: AccountPageProps) 
             </div>
           )
         )}
+
+        <WebUiKeySection showToast={showToast} />
       </div>
     </div>
   );

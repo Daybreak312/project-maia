@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
-import { api, getAuthKey, setAuthKey } from '../api/client';
+import { api } from '../api/client';
 import type {
   WorkspaceSummary,
   WorkspaceTemplate,
@@ -18,79 +18,6 @@ type Toast = (message: string, type: 'success' | 'error') => void;
 
 /** 백엔드 검증 규칙과 동일 (auth/users.rs MIN_PASSWORD_LEN) — 사전 안내용. */
 const MIN_PASSWORD_LEN = 8;
-
-// ─────────────────────────────────────────────────────────────────────
-// Web UI 인증 키 — admin 작업에 사용할 Bearer 토큰 (localStorage 영속)
-// ─────────────────────────────────────────────────────────────────────
-export function WebUiKeySection({ showToast }: { showToast: Toast }) {
-  const [key, setKey] = useState(getAuthKey());
-  const [editing, setEditing] = useState(false);
-
-  const save = () => {
-    setAuthKey(key.trim());
-    setEditing(false);
-    showToast('Web UI key saved. Reload to apply to all requests.', 'success');
-  };
-
-  const masked = getAuthKey() ? '••••••••' + getAuthKey().slice(-4) : 'not set';
-
-  return (
-    <div className="bg-card border border-border rounded-lg p-6">
-      <h3 className="text-lg font-semibold text-gray-200 mb-2">Web UI Authentication</h3>
-      <p className="text-sm text-muted mb-4">
-        API key used by this web UI for authenticated requests (master key or an admin key).
-        Stored locally in your browser. Current: <span className="font-mono">{masked}</span>
-      </p>
-      {editing ? (
-        <div className="flex gap-2">
-          <input
-            type="password"
-            className="flex-1 bg-bg border border-border rounded px-3 py-2 text-sm text-gray-200 focus:outline-none focus:border-primary"
-            placeholder="Paste API key..."
-            value={key}
-            onChange={(e) => setKey(e.target.value)}
-          />
-          <button
-            className="px-4 py-2 bg-primary text-white text-sm rounded hover:bg-primary-hover transition-colors"
-            onClick={save}
-          >
-            Save
-          </button>
-          <button
-            className="px-4 py-2 bg-border text-gray-200 text-sm rounded hover:bg-muted transition-colors"
-            onClick={() => {
-              setKey(getAuthKey());
-              setEditing(false);
-            }}
-          >
-            Cancel
-          </button>
-        </div>
-      ) : (
-        <div className="flex gap-2">
-          <button
-            className="px-4 py-2 bg-border text-gray-200 text-sm rounded hover:bg-muted transition-colors"
-            onClick={() => setEditing(true)}
-          >
-            {getAuthKey() ? 'Update Key' : 'Set Key'}
-          </button>
-          {getAuthKey() && (
-            <button
-              className="px-4 py-2 bg-error text-white text-sm rounded hover:bg-red-700 transition-colors"
-              onClick={() => {
-                setAuthKey('');
-                setKey('');
-                showToast('Web UI key cleared', 'success');
-              }}
-            >
-              Clear
-            </button>
-          )}
-        </div>
-      )}
-    </div>
-  );
-}
 
 // ─────────────────────────────────────────────────────────────────────
 // 워크스페이스 관리 (목록 / 생성 / 삭제)

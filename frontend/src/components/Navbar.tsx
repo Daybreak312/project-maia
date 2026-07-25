@@ -100,14 +100,28 @@ export function Navbar({
           <NavLink
             to="/account"
             className={({ isActive }) =>
-              `px-3 py-2 rounded-md text-sm transition-colors ${
+              `flex items-center gap-1.5 px-3 py-2 border rounded-md text-sm transition-colors ${
                 isActive
-                  ? 'text-primary bg-primary/10'
-                  : 'text-muted hover:text-gray-200 hover:bg-border'
+                  ? 'text-primary bg-primary/10 border-primary/40'
+                  : 'text-muted border-border hover:text-gray-200 hover:bg-border'
               }`
             }
-            title="내 계정"
+            title="내 계정 — 인증 정보"
           >
+            <svg
+              className="h-4 w-4"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.8"
+              aria-hidden="true"
+            >
+              <path
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                d="M15.75 6a3.75 3.75 0 1 1-7.5 0 3.75 3.75 0 0 1 7.5 0ZM4.5 20.25a7.5 7.5 0 0 1 15 0"
+              />
+            </svg>
             {identityLabel}
           </NavLink>
           <button
