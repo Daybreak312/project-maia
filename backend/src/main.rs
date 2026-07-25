@@ -13,12 +13,13 @@ mod workspace;
 use std::sync::Arc;
 
 use axum::{
+    http::StatusCode,
     middleware,
-    routing::{delete, get, patch, post, put},
+    routing::{any, delete, get, patch, post, put},
     Router,
 };
 use tower_http::cors::{Any, CorsLayer};
-use tower_http::services::ServeDir;
+use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -268,6 +269,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/review/judge", post(api::judge_reviews_handler))
         .route("/api/feedback", post(api::submit_feedback_handler))
         .route("/api/metrics", get(api::metrics_handler))
+        // 미등록 /api/* 경로가 SPA 폴백(200 + HTML)으로 새지 않게 404를 유지한다.
+        // require_auth 뒤에 있으므로 비인증 프로브는 등록 여부와 무관하게 401 —
+        // 경로 열거로 API 표면이 드러나지 않는다.
+        .route("/api/*rest", any(api_not_found_handler))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_auth,
@@ -290,10 +295,17 @@ async fn main() -> anyhow::Result<()> {
     let static_dir = std::env::var("STATIC_DIR")
         .unwrap_or_else(|_| format!("{}/static", env!("CARGO_MANIFEST_DIR")));
 
+    // SPA 폴백: 실제 파일이 없는 경로(/admin, /account 등 클라이언트 라우트)는
+    // index.html을 돌려 브라우저 라우터가 처리하게 한다. ServeDir는 GET/HEAD 외
+    // 요청을 not_found_service로 넘기지 않으므로 이 폴백은 정적 조회 전용이다.
+    let spa_static = ServeDir::new(&static_dir)
+        .append_index_html_on_directories(true)
+        .not_found_service(ServeFile::new(format!("{}/index.html", static_dir)));
+
     let app = Router::new()
         .merge(api_routes)
         .merge(public_routes)
-        .fallback_service(ServeDir::new(&static_dir).append_index_html_on_directories(true))
+        .fallback_service(spa_static)
         .layer(
             CorsLayer::new()
                 .allow_origin(Any)
@@ -312,6 +324,11 @@ async fn main() -> anyhow::Result<()> {
     axum::serve(listener, app).await?;
 
     Ok(())
+}
+
+/// 미등록 API 경로 폴백 — SPA index.html 대신 명시적 404를 돌려준다.
+async fn api_not_found_handler() -> StatusCode {
+    StatusCode::NOT_FOUND
 }
 
 async fn health_handler() -> &'static str {
