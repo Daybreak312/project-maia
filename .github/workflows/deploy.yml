@@ -1,0 +1,53 @@
+name: deploy
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - '**.md'
+
+concurrency:
+  group: deploy-main
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set image ref
+        run: echo "IMAGE_REF=ghcr.io/daybreak312/project-maia-app:sha-${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ env.IMAGE_REF }}
+
+      # 배포: forced-command 제한 SSH — 이 키로는 서버의 ci-deploy.sh만 실행된다.
+      # 원격 명령 인자("deploy")는 forced command에 의해 무시되는 더미.
+      # 토큰과 이미지 ref는 stdin으로 전달한다(스크립트 주석 참조).
+      - name: Deploy to oracle
+        env:
+          SSH_KEY: ${{ secrets.MAIA_DEPLOY_SSH_KEY }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' 'minecraft-legendary.daybreak.cloud ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAk8SJ/5zekUWaZJ5mvrdoKb7cAYOMBjimgoNuFuHRGF' > ~/.ssh/known_hosts
+          echo "$GH_TOKEN $IMAGE_REF" | ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes ubuntu@minecraft-legendary.daybreak.cloud deploy
